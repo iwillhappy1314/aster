@@ -10,7 +10,7 @@ use crate::ui::root::RootView;
 use camino::Utf8PathBuf;
 use gpui::{
     App, AppContext, Application, Bounds, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, px, size,
+    TitlebarOptions, Window, WindowBounds, WindowOptions, point, px, size,
 };
 use gpui_component::notification::NotificationList;
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
@@ -201,7 +201,8 @@ fn open_window(cx: &mut App, initial_path: Option<Utf8PathBuf>) -> anyhow::Resul
             titlebar: Some(TitlebarOptions {
                 title: None,
                 appears_transparent: true,
-                traffic_light_position: None,
+                // Center the 14px traffic-light buttons within Aster's 38px custom title bar.
+                traffic_light_position: Some(point(px(12.), px(12.))),
             }),
             ..Default::default()
         },
