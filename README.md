@@ -81,6 +81,7 @@ Pre-built macOS applications are available for direct download:
 
 ### View
 
+- `Shift+Cmd+O`: Show or hide the document outline
 - `Cmd+=`: Increase font size
 - `Cmd+-`: Decrease font size
 - `Cmd+0`: Reset font size

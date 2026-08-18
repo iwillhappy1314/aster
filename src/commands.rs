@@ -21,6 +21,7 @@ actions!(
         SaveFile,
         SaveFileAs,
         SelectAll,
+        ToggleOutline,
         Undo,
     ]
 );

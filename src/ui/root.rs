@@ -1,6 +1,6 @@
 use crate::commands::{
     CloseWindow, FontSizeDecrease, FontSizeIncrease, FontSizeReset, NewFile, OpenFile, SaveFile,
-    SaveFileAs,
+    SaveFileAs, ToggleOutline,
 };
 use crate::model::document::DocumentState;
 use crate::model::inline_markdown::InlineMarkdownState;
@@ -15,6 +15,7 @@ use crate::ui::file_explorer::FileExplorerView;
 use crate::ui::theme::Theme;
 
 use camino::Utf8PathBuf;
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
     Context, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
     ParentElement, Render, Styled, Window, div, px,
@@ -42,6 +43,8 @@ pub struct RootView {
     sidebar_width: f32,
     /// Whether we're currently resizing the sidebar
     resizing_sidebar: bool,
+    /// Whether the optional document outline is visible.
+    outline_visible: bool,
 }
 
 impl RootView {
@@ -64,6 +67,7 @@ impl RootView {
             font_size: settings::get_font_size(),
             sidebar_width: 200.0,
             resizing_sidebar: false,
+            outline_visible: false,
         }
     }
 
@@ -284,7 +288,12 @@ impl RootView {
     }
 
     pub fn confirm_before_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        self.confirm_can_discard_changes(window, cx, "Save changes before quitting?")
+        let can_quit =
+            self.confirm_can_discard_changes(window, cx, "Save changes before quitting?");
+        if can_quit {
+            self.persist_window_bounds(window);
+        }
+        can_quit
     }
 
     fn action_save(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -299,7 +308,20 @@ impl RootView {
         if !self.confirm_can_discard_changes(window, cx, "Save changes before closing?") {
             return;
         }
+        self.persist_window_bounds(window);
         window.remove_window();
+    }
+
+    /// Persists the current window geometry before an application-initiated close.
+    fn persist_window_bounds(&self, window: &Window) {
+        settings::set_window_bounds(window.bounds());
+    }
+
+    /// Toggles the optional outline sidebar without changing the document state.
+    fn toggle_outline(&mut self, cx: &mut Context<Self>) {
+        self.outline_visible = !self.outline_visible;
+        self.resizing_sidebar = false;
+        cx.notify();
     }
 }
 
@@ -426,6 +448,11 @@ impl Render for RootView {
         } else {
             Theme::border()
         };
+        let outline_toggle_color = if self.outline_visible {
+            Theme::accent()
+        } else {
+            Theme::muted()
+        };
 
         let bottom_bar = div()
             .flex()
@@ -438,7 +465,38 @@ impl Render for RootView {
             .border_color(Theme::border())
             .flex_shrink_0()
             .child(
-                div().w_full().flex().justify_end().child(
+                div()
+                    .id("outline-toggle")
+                    .p(px(5.))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .hover(|this| this.bg(Theme::panel_alt()).text_color(Theme::text()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            this.toggle_outline(cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .w(px(16.))
+                            .h(px(16.))
+                            .flex()
+                            .rounded(px(3.))
+                            .border_1()
+                            .border_color(outline_toggle_color)
+                            .child(
+                                div()
+                                    .w(px(5.))
+                                    .h_full()
+                                    .border_r_1()
+                                    .border_color(outline_toggle_color),
+                            )
+                            .child(div().flex_1()),
+                    ),
+            )
+            .child(
+                div().flex_1().flex().justify_end().child(
                     div()
                         .text_sm()
                         .text_color(Theme::muted())
@@ -487,6 +545,9 @@ impl Render for RootView {
                 settings::set_font_size(this.font_size);
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &ToggleOutline, _window, cx| {
+                this.toggle_outline(cx);
+            }))
             // Handle sidebar resize drag at root level so we don't lose events
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 if !this.resizing_sidebar {
@@ -514,32 +575,33 @@ impl Render for RootView {
                     .min_w(px(0.))
                     .flex()
                     .flex_row()
-                    .child({
-                        // Keep the sidebar width in sync with the resize state
-                        let fe = self.file_explorer_view.clone();
-                        let width = self.sidebar_width;
-                        let _ = fe.update(cx, |view, cx| {
-                            view.set_width(width, cx);
-                        });
-                        fe
+                    .when(self.outline_visible, |this| {
+                        this.child({
+                            // Keep the sidebar width in sync with the resize state.
+                            let file_explorer = self.file_explorer_view.clone();
+                            let width = self.sidebar_width;
+                            let _ = file_explorer.update(cx, |view, cx| {
+                                view.set_width(width, cx);
+                            });
+                            file_explorer
+                        })
+                        .child(
+                            div()
+                                .id("sidebar-resize-handle")
+                                .w(px(1.))
+                                .h_full()
+                                .cursor_col_resize()
+                                .bg(resize_line_color)
+                                .hover(|s| s.bg(gpui::rgba(0x2d7fd24d)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                                        this.resizing_sidebar = true;
+                                        cx.notify();
+                                    }),
+                                ),
+                        )
                     })
-                    // Resize handle
-                    .child(
-                        div()
-                            .id("sidebar-resize-handle")
-                            .w(px(1.))
-                            .h_full()
-                            .cursor_col_resize()
-                            .bg(resize_line_color)
-                            .hover(|s| s.bg(gpui::rgba(0x2d7fd24d)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                                    this.resizing_sidebar = true;
-                                    cx.notify();
-                                }),
-                            ),
-                    )
                     .child(
                         div()
                             .flex_1()

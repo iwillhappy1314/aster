@@ -1,4 +1,5 @@
 use directories::ProjectDirs;
+use gpui::{Bounds, Pixels, point, px, size};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -10,6 +11,48 @@ pub struct Settings {
     /// Font size in points (8-32, default 14)
     #[serde(default = "default_font_size")]
     pub font_size: f32,
+    /// Last valid normal-window geometry, restored on the next launch.
+    #[serde(default)]
+    pub window_geometry: Option<WindowGeometry>,
+}
+
+/// Persisted normal-window position and size in screen pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WindowGeometry {
+    pub origin_x: f32,
+    pub origin_y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl WindowGeometry {
+    /// Creates persistable geometry from the window's current bounds.
+    pub fn from_bounds(bounds: Bounds<Pixels>) -> Self {
+        Self {
+            origin_x: bounds.origin.x.into(),
+            origin_y: bounds.origin.y.into(),
+            width: bounds.size.width.into(),
+            height: bounds.size.height.into(),
+        }
+    }
+
+    /// Converts persisted geometry back into GPUI window bounds.
+    pub fn to_bounds(self) -> Bounds<Pixels> {
+        Bounds::new(
+            point(px(self.origin_x), px(self.origin_y)),
+            size(px(self.width), px(self.height)),
+        )
+    }
+
+    /// Returns whether the geometry is safe to restore on a later launch.
+    pub fn is_valid(self) -> bool {
+        self.origin_x.is_finite()
+            && self.origin_y.is_finite()
+            && self.width.is_finite()
+            && self.height.is_finite()
+            && (640.0..=10_000.0).contains(&self.width)
+            && (480.0..=10_000.0).contains(&self.height)
+    }
 }
 
 fn default_font_size() -> f32 {
@@ -20,6 +63,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             font_size: default_font_size(),
+            window_geometry: None,
         }
     }
 }
@@ -117,5 +161,55 @@ pub fn set_font_size(size: f32) {
     let clamped = Settings::clamp_font_size(size);
     if let Ok(mut manager) = settings().lock() {
         manager.update(|s| s.font_size = clamped);
+    }
+}
+
+/// Returns the last valid normal-window bounds, if the user has closed the app before.
+pub fn get_window_bounds() -> Option<Bounds<Pixels>> {
+    settings().lock().ok().and_then(|manager| {
+        manager
+            .get()
+            .window_geometry
+            .filter(|geometry| geometry.is_valid())
+            .map(WindowGeometry::to_bounds)
+    })
+}
+
+/// Persists the current normal-window bounds for the next application launch.
+pub fn set_window_bounds(bounds: Bounds<Pixels>) {
+    let geometry = WindowGeometry::from_bounds(bounds);
+    if !geometry.is_valid() {
+        return;
+    }
+
+    if let Ok(mut manager) = settings().lock() {
+        manager.update(|settings| settings.window_geometry = Some(geometry));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WindowGeometry;
+    use gpui::{Bounds, point, px, size};
+
+    #[test]
+    fn window_geometry_round_trips_valid_bounds() {
+        let bounds = Bounds::new(point(px(120.), px(80.)), size(px(1180.), px(760.)));
+        let geometry = WindowGeometry::from_bounds(bounds);
+
+        assert!(geometry.is_valid());
+        assert_eq!(geometry.to_bounds(), bounds);
+    }
+
+    #[test]
+    fn window_geometry_rejects_invalid_sizes() {
+        let geometry = WindowGeometry {
+            origin_x: 0.,
+            origin_y: 0.,
+            width: 639.,
+            height: 480.,
+        };
+
+        assert!(!geometry.is_valid());
     }
 }

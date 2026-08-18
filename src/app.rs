@@ -1,15 +1,16 @@
 use crate::commands::{
     About, CloseWindow, Copy, Cut, Find, FindNext, FindPrevious, FontSizeDecrease,
     FontSizeIncrease, FontSizeReset, NewFile, OpenFile, Paste, Quit, Redo, SaveFile, SaveFileAs,
-    SelectAll, Undo,
+    SelectAll, ToggleOutline, Undo,
 };
 use crate::services::assets::AsterAssetSource;
 use crate::services::fs::{read_to_string, write_atomic};
+use crate::services::settings;
 use crate::ui::root::RootView;
 use camino::Utf8PathBuf;
 use gpui::{
-    App, AppContext, Application, Bounds, KeyBinding, Menu, MenuItem, OsAction, Pixels,
-    SystemMenuType, TitlebarOptions, Window, WindowBounds, WindowOptions,
+    App, AppContext, Application, Bounds, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType,
+    TitlebarOptions, Window, WindowBounds, WindowOptions, px, size,
 };
 use gpui_component::notification::NotificationList;
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
@@ -55,6 +56,7 @@ pub fn run() {
             KeyBinding::new("cmd-=", FontSizeIncrease, None),
             KeyBinding::new("cmd--", FontSizeDecrease, None),
             KeyBinding::new("cmd-0", FontSizeReset, None),
+            KeyBinding::new("shift-cmd-o", ToggleOutline, None),
         ]);
 
         cx.set_menus(vec![
@@ -100,6 +102,8 @@ pub fn run() {
             Menu {
                 name: "View".into(),
                 items: vec![
+                    MenuItem::action("Show or Hide Outline", ToggleOutline),
+                    MenuItem::separator(),
                     MenuItem::action("Increase Font Size", FontSizeIncrease),
                     MenuItem::action("Decrease Font Size", FontSizeDecrease),
                     MenuItem::action("Reset Font Size", FontSizeReset),
@@ -185,9 +189,13 @@ pub fn run() {
 }
 
 fn open_window(cx: &mut App, initial_path: Option<Utf8PathBuf>) -> anyhow::Result<()> {
+    let window_bounds = settings::get_window_bounds().unwrap_or_else(|| default_window_bounds(cx));
+
     cx.open_window(
         WindowOptions {
-            window_bounds: Some(WindowBounds::Maximized(Bounds::<Pixels>::default())),
+            // A regular window opens at its final bounds without macOS's zoom animation.
+            window_bounds: Some(WindowBounds::Windowed(window_bounds)),
+            window_min_size: Some(size(px(640.), px(480.))),
             titlebar: Some(TitlebarOptions {
                 title: None,
                 appears_transparent: true,
@@ -198,6 +206,17 @@ fn open_window(cx: &mut App, initial_path: Option<Utf8PathBuf>) -> anyhow::Resul
         |window, cx| build_root_view(window, cx, initial_path.clone()),
     )?;
     Ok(())
+}
+
+/// Returns a centered first-launch window that leaves visible desktop space around it.
+fn default_window_bounds(cx: &App) -> Bounds<gpui::Pixels> {
+    let display_bounds = Bounds::maximized(None, cx);
+    let display_width: f32 = display_bounds.size.width.into();
+    let display_height: f32 = display_bounds.size.height.into();
+    let width = (display_width - 80.0).clamp(640.0, 1180.0);
+    let height = (display_height - 80.0).clamp(480.0, 760.0);
+
+    Bounds::centered(None, size(px(width), px(height)), cx)
 }
 
 fn build_root_view(
@@ -240,9 +259,10 @@ fn install_should_close_prompt(
     document: gpui::Entity<crate::model::document::DocumentState>,
 ) {
     window.on_window_should_close(cx, {
-        move |_, cx| {
+        move |window, cx| {
             let is_dirty = document.read_with(cx, |d, _| d.dirty);
             if !is_dirty {
+                settings::set_window_bounds(window.bounds());
                 return true;
             }
 
@@ -296,7 +316,7 @@ fn install_should_close_prompt(
                 }
             };
 
-            match choice {
+            let should_close = match choice {
                 MessageDialogResult::Ok | MessageDialogResult::Yes => save(),
                 MessageDialogResult::No => true,
                 MessageDialogResult::Custom(label) => match label.as_str() {
@@ -305,7 +325,13 @@ fn install_should_close_prompt(
                     _ => false,
                 },
                 _ => false,
+            };
+
+            if should_close {
+                settings::set_window_bounds(window.bounds());
             }
+
+            should_close
         }
     });
 }

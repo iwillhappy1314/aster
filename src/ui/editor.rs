@@ -17,6 +17,8 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
+const EDITOR_CONTENT_MAX_WIDTH: f32 = 800.0;
+
 struct SearchCache {
     revision: u64,
     query: String,
@@ -955,46 +957,53 @@ impl Render for EditorView {
                 })
             })
             .child(
-                div().relative().child(styled).child(
-                    canvas(
-                        move |_, _, _| {},
-                        move |_bounds: Bounds<_>, (), window: &mut Window, _cx: &mut App| {
-                            if !draw_caret {
-                                return;
-                            }
+                div()
+                    .relative()
+                    .w_full()
+                    .max_w(px(EDITOR_CONTENT_MAX_WIDTH))
+                    .mx_auto()
+                    .child(styled)
+                    .child(
+                        canvas(
+                            move |_, _, _| {},
+                            move |_bounds: Bounds<_>, (), window: &mut Window, _cx: &mut App| {
+                                if !draw_caret {
+                                    return;
+                                }
 
-                            let caret_pos = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                text_layout.position_for_index(cursor_display_byte)
-                            }))
-                            .ok()
-                            .flatten();
-                            let Some(caret_pos) = caret_pos else {
-                                return;
-                            };
+                                let caret_pos = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                    text_layout.position_for_index(cursor_display_byte)
+                                }))
+                                .ok()
+                                .flatten();
+                                let Some(caret_pos) = caret_pos else {
+                                    return;
+                                };
 
-                            let line_height = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                text_layout.line_height()
-                            }))
-                            .ok()
-                            .unwrap_or(px(0.));
-                            if line_height <= px(0.) {
-                                return;
-                            }
+                                let line_height =
+                                    std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                        text_layout.line_height()
+                                    }))
+                                    .ok()
+                                    .unwrap_or(px(0.));
+                                if line_height <= px(0.) {
+                                    return;
+                                }
 
-                            window.paint_quad(fill(
-                                Bounds {
-                                    origin: point(caret_pos.x, caret_pos.y),
-                                    size: size(px(1.), line_height),
-                                },
-                                Theme::accent(),
-                            ));
-                        },
-                    )
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full(),
-                ),
+                                window.paint_quad(fill(
+                                    Bounds {
+                                        origin: point(caret_pos.x, caret_pos.y),
+                                        size: size(px(1.), line_height),
+                                    },
+                                    Theme::accent(),
+                                ));
+                            },
+                        )
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                    ),
             )
             .when(self.search_active, |this| {
                 this.child(
