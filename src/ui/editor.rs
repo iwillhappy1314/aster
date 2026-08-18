@@ -17,7 +17,6 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
-const EDITOR_CONTENT_MAX_WIDTH: f32 = 800.0;
 const CARET_WIDTH: f32 = 2.0;
 
 struct SearchCache {
@@ -186,8 +185,6 @@ pub struct EditorView {
     cached_search: Option<SearchCache>,
     /// Byte offset that should be revealed after next layout.
     pending_scroll_to_byte: Option<usize>,
-    /// Whether input is disabled while rendering the document preview.
-    preview_mode: bool,
 }
 
 impl EditorView {
@@ -208,14 +205,7 @@ impl EditorView {
             search_current_match: 0,
             cached_search: None,
             pending_scroll_to_byte: None,
-            preview_mode: true,
         }
-    }
-
-    /// Enables or disables the read-only document preview interaction mode.
-    pub fn set_preview_mode(&mut self, preview_mode: bool, cx: &mut Context<Self>) {
-        self.preview_mode = preview_mode;
-        cx.notify();
     }
 
     fn start_cursor_blink(&mut self, cx: &mut Context<Self>) {
@@ -540,8 +530,7 @@ impl Render for EditorView {
         let doc = self.document.read(cx);
         let cursor_source_byte = doc.char_to_byte(doc.cursor);
         let show_caret = doc.selection.is_none();
-        let draw_caret = show_caret && is_focused && self.caret_visible && !self.preview_mode;
-        let preview_mode = self.preview_mode;
+        let draw_caret = show_caret && is_focused && self.caret_visible;
         let inline_spans = {
             let inline = self.inline_markdown.read(cx);
             inline.spans.clone()
@@ -583,6 +572,8 @@ impl Render for EditorView {
 
         let text_layout = styled.layout().clone();
         self.reveal_pending_byte(&text_layout, projection.as_ref(), window);
+        let has_multiple_lines = text_owned.lines().nth(1).is_some();
+        let editor_scroll_handle = self.scroll_handle.clone();
 
         let search_match_display = if search_match_count == 0 {
             0
@@ -591,390 +582,271 @@ impl Render for EditorView {
         };
 
         div()
-            .id("editor_scroll")
             .relative()
             .flex_1()
             .min_w(px(0.))
             .min_h(px(0.))
-            .bg(Theme::panel())
-            .p(px(18.))
-            .text_size(px(settings::get_font_size()))
-            .text_color(Theme::text())
-            .font_family("Menlo")
-            .overflow_y_scroll()
-            .overflow_x_hidden()
-            .scrollbar_width(px(10.))
-            .track_scroll(&self.scroll_handle)
-            .track_focus(&focus_handle)
-            .on_action({
-                let doc_handle = self.document.clone();
-                move |_: &SelectAll, _window: &mut Window, cx_app: &mut App| {
-                    let _ = doc_handle.update(cx_app, |doc, cx| {
-                        doc.select_all();
-                        cx.notify();
-                    });
-                }
-            })
-            .on_action({
-                let doc_handle = self.document.clone();
-                move |_: &Copy, _window: &mut Window, cx_app: &mut App| {
-                    if let Some(selection) =
-                        doc_handle.read_with(cx_app, |d, _| d.selection_range())
-                    {
-                        let text = doc_handle.read_with(cx_app, |d, _| d.slice_chars(selection));
-                        cx_app.write_to_clipboard(ClipboardItem::new_string(text));
-                    }
-                }
-            })
-            .on_action({
-                let doc_handle = self.document.clone();
-                move |_: &Cut, _window: &mut Window, cx_app: &mut App| {
-                    if preview_mode {
-                        return;
-                    }
-                    let selection = doc_handle
-                        .read_with(cx_app, |d, _| d.selection_range())
-                        .unwrap_or_else(|| 0..0);
-                    if selection.start == selection.end {
-                        return;
-                    }
-
-                    let text =
-                        doc_handle.read_with(cx_app, |d, _| d.slice_chars(selection.clone()));
-                    cx_app.write_to_clipboard(ClipboardItem::new_string(text));
-                    let _ = doc_handle.update(cx_app, |doc, cx| {
-                        doc.begin_edit();
-                        doc.delete_selection();
-                        doc.commit_edit();
-                        cx.notify();
-                    });
-                }
-            })
-            .on_action({
-                let doc_handle = self.document.clone();
-                move |_: &Paste, _window: &mut Window, cx_app: &mut App| {
-                    if preview_mode {
-                        return;
-                    }
-                    let Some(item) = cx_app.read_from_clipboard() else {
-                        return;
-                    };
-                    let Some(text) = item.text() else {
-                        return;
-                    };
-                    let _ = doc_handle.update(cx_app, |doc, cx| {
-                        doc.begin_edit();
-                        doc.delete_selection();
-                        let insert_at = doc.cursor;
-                        doc.insert(insert_at, &text);
-                        doc.cursor = insert_at.saturating_add(text.chars().count());
-                        doc.commit_edit();
-                        cx.notify();
-                    });
-                }
-            })
-            .on_action({
-                let doc_handle = self.document.clone();
-                move |_: &Undo, _window: &mut Window, cx_app: &mut App| {
-                    if preview_mode {
-                        return;
-                    }
-                    let _ = doc_handle.update(cx_app, |doc, cx| {
-                        if doc.undo() {
-                            cx.notify();
+            .child(
+                div()
+                    .id("editor_scroll")
+                    .relative()
+                    .size_full()
+                    .bg(Theme::panel())
+                    .p(px(18.))
+                    .text_size(px(settings::get_font_size()))
+                    .text_color(Theme::text())
+                    .font_family("Menlo")
+                    .overflow_y_scroll()
+                    .overflow_x_hidden()
+                    .scrollbar_width(px(10.))
+                    .track_scroll(&self.scroll_handle)
+                    .track_focus(&focus_handle)
+                    .on_action({
+                        let doc_handle = self.document.clone();
+                        move |_: &SelectAll, _window: &mut Window, cx_app: &mut App| {
+                            let _ = doc_handle.update(cx_app, |doc, cx| {
+                                doc.select_all();
+                                cx.notify();
+                            });
                         }
-                    });
-                }
-            })
-            .on_action({
-                let doc_handle = self.document.clone();
-                move |_: &Redo, _window: &mut Window, cx_app: &mut App| {
-                    if preview_mode {
-                        return;
-                    }
-                    let _ = doc_handle.update(cx_app, |doc, cx| {
-                        if doc.redo() {
-                            cx.notify();
-                        }
-                    });
-                }
-            })
-            .on_action({
-                let focus_handle = focus_handle.clone();
-                cx.listener(move |this, _: &Find, window, cx| {
-                    focus_handle.focus(window);
-                    this.activate_search(cx);
-                })
-            })
-            .on_action(cx.listener(|this, _: &FindNext, _window, cx| {
-                if !this.search_active {
-                    this.activate_search(cx);
-                } else {
-                    this.jump_search(cx, true);
-                }
-            }))
-            .on_action(cx.listener(|this, _: &FindPrevious, _window, cx| {
-                if !this.search_active {
-                    this.activate_search(cx);
-                } else {
-                    this.jump_search(cx, false);
-                }
-            }))
-            .on_mouse_down(MouseButton::Left, {
-                let focus_handle = focus_handle.clone();
-                let doc_handle = self.document.clone();
-                let layout_for_event = text_layout.clone();
-                let projection_for_event = projection.clone();
-                move |event: &MouseDownEvent, window: &mut Window, cx_app: &mut App| {
-                    if preview_mode {
-                        return;
-                    }
-                    focus_handle.focus(window);
-                    let _ = doc_handle.update(cx_app, |doc, cx| {
-                        let byte_idx = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                            layout_for_event.index_for_position(event.position)
-                        }))
-                        .ok()
-                        .map(|res| match res {
-                            Ok(ix) => ix,
-                            Err(ix) => ix,
-                        });
-                        let source_byte =
-                            byte_idx.map(|b| projection_for_event.display_to_source_byte(b));
-                        if let Some(byte_idx) = source_byte.map(|b| doc.byte_to_char(b)) {
-                            if event.modifiers.shift {
-                                let anchor = doc.selection_anchor.unwrap_or(doc.cursor);
-                                doc.set_selection(anchor, byte_idx);
-                            } else {
-                                doc.set_cursor(byte_idx);
+                    })
+                    .on_action({
+                        let doc_handle = self.document.clone();
+                        move |_: &Copy, _window: &mut Window, cx_app: &mut App| {
+                            if let Some(selection) =
+                                doc_handle.read_with(cx_app, |d, _| d.selection_range())
+                            {
+                                let text =
+                                    doc_handle.read_with(cx_app, |d, _| d.slice_chars(selection));
+                                cx_app.write_to_clipboard(ClipboardItem::new_string(text));
                             }
-                            cx.notify();
                         }
-                    });
-                }
-            })
-            .on_mouse_move({
-                let doc_handle = self.document.clone();
-                let layout_for_event = text_layout.clone();
-                let projection_for_event = projection.clone();
-                move |event: &MouseMoveEvent, _window: &mut Window, cx_app: &mut App| {
-                    if preview_mode {
-                        return;
-                    }
-                    if !event.dragging() {
-                        return;
-                    }
-                    let _ = doc_handle.update(cx_app, |doc, cx| {
-                        let byte_idx = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                            layout_for_event.index_for_position(event.position)
-                        }))
-                        .ok()
-                        .map(|res| match res {
-                            Ok(ix) => ix,
-                            Err(ix) => ix,
-                        });
-                        let source_byte =
-                            byte_idx.map(|b| projection_for_event.display_to_source_byte(b));
-                        if let Some(byte_idx) = source_byte.map(|b| doc.byte_to_char(b)) {
-                            let anchor = doc.selection_anchor.unwrap_or(doc.cursor);
-                            doc.set_selection(anchor, byte_idx);
-                            cx.notify();
+                    })
+                    .on_action({
+                        let doc_handle = self.document.clone();
+                        move |_: &Cut, _window: &mut Window, cx_app: &mut App| {
+                            let selection = doc_handle
+                                .read_with(cx_app, |d, _| d.selection_range())
+                                .unwrap_or_else(|| 0..0);
+                            if selection.start == selection.end {
+                                return;
+                            }
+
+                            let text = doc_handle
+                                .read_with(cx_app, |d, _| d.slice_chars(selection.clone()));
+                            cx_app.write_to_clipboard(ClipboardItem::new_string(text));
+                            let _ = doc_handle.update(cx_app, |doc, cx| {
+                                doc.begin_edit();
+                                doc.delete_selection();
+                                doc.commit_edit();
+                                cx.notify();
+                            });
                         }
-                    });
-                }
-            })
-            .on_key_down({
-                let focus = focus_handle.clone();
-                cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                    if this.preview_mode {
-                        return;
-                    }
-                    if !focus.is_focused(window) {
-                        return;
-                    }
-
-                    let key = event.keystroke.key.to_lowercase();
-                    let modifiers = event.keystroke.modifiers;
-                    let is_cmd = modifiers.platform || modifiers.control;
-                    let shift = modifiers.shift;
-
-                    if is_cmd && key == "f" {
-                        this.activate_search(cx);
-                        return;
-                    }
-
-                    if is_cmd && key == "g" {
+                    })
+                    .on_action({
+                        let doc_handle = self.document.clone();
+                        move |_: &Paste, _window: &mut Window, cx_app: &mut App| {
+                            let Some(item) = cx_app.read_from_clipboard() else {
+                                return;
+                            };
+                            let Some(text) = item.text() else {
+                                return;
+                            };
+                            let _ = doc_handle.update(cx_app, |doc, cx| {
+                                doc.begin_edit();
+                                doc.delete_selection();
+                                let insert_at = doc.cursor;
+                                doc.insert(insert_at, &text);
+                                doc.cursor = insert_at.saturating_add(text.chars().count());
+                                doc.commit_edit();
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .on_action({
+                        let doc_handle = self.document.clone();
+                        move |_: &Undo, _window: &mut Window, cx_app: &mut App| {
+                            let _ = doc_handle.update(cx_app, |doc, cx| {
+                                if doc.undo() {
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    })
+                    .on_action({
+                        let doc_handle = self.document.clone();
+                        move |_: &Redo, _window: &mut Window, cx_app: &mut App| {
+                            let _ = doc_handle.update(cx_app, |doc, cx| {
+                                if doc.redo() {
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    })
+                    .on_action({
+                        let focus_handle = focus_handle.clone();
+                        cx.listener(move |this, _: &Find, window, cx| {
+                            focus_handle.focus(window);
+                            this.activate_search(cx);
+                        })
+                    })
+                    .on_action(cx.listener(|this, _: &FindNext, _window, cx| {
                         if !this.search_active {
                             this.activate_search(cx);
                         } else {
-                            this.jump_search(cx, !shift);
+                            this.jump_search(cx, true);
                         }
-                        return;
-                    }
-
-                    if this.search_active {
-                        this.handle_search_key(event, cx);
-                        return;
-                    }
-
-                    if is_cmd {
-                        return;
-                    }
-
-                    if key == "pageup" || key == "pagedown" {
-                        let max = this.scroll_handle.max_offset();
-                        let offset = this.scroll_handle.offset();
-                        let bounds = this.scroll_handle.bounds();
-                        let page = bounds.size.height;
-                        if page > px(0.) {
-                            let amount = page * 0.9;
-                            let delta = if key == "pagedown" { -amount } else { amount };
-                            let mut new_offset = offset;
-                            new_offset.y = (new_offset.y + delta).clamp(-max.height, px(0.));
-                            this.scroll_handle
-                                .set_offset(point(new_offset.x, new_offset.y));
-                            window.refresh();
+                    }))
+                    .on_action(cx.listener(|this, _: &FindPrevious, _window, cx| {
+                        if !this.search_active {
+                            this.activate_search(cx);
+                        } else {
+                            this.jump_search(cx, false);
                         }
-                        return;
-                    }
-
-                    let _ = this.document.update(cx, |doc, cx_doc| {
-                        let len = doc.rope.len_chars();
-                        match key.as_str() {
-                            "backspace" => {
-                                doc.begin_edit();
-                                if doc.delete_selection().is_some() {
-                                    doc.commit_edit();
-                                    cx_doc.notify();
-                                    return;
-                                }
-                                if doc.cursor > 0 && len > 0 {
-                                    let start = doc.cursor.saturating_sub(1);
-                                    doc.delete_range(start..doc.cursor);
-                                    doc.cursor = start;
-                                    doc.commit_edit();
-                                    cx_doc.notify();
-                                }
-                            }
-                            "delete" => {
-                                doc.begin_edit();
-                                if doc.delete_selection().is_some() {
-                                    doc.commit_edit();
-                                    cx_doc.notify();
-                                    return;
-                                }
-                                if doc.cursor < len {
-                                    let end = (doc.cursor + 1).min(len);
-                                    doc.delete_range(doc.cursor..end);
-                                    doc.commit_edit();
-                                    cx_doc.notify();
-                                }
-                            }
-                            "enter" | "return" => {
-                                doc.begin_edit();
-                                doc.delete_selection();
-                                doc.insert(doc.cursor, "\n");
-                                doc.cursor += 1;
-                                doc.commit_edit();
-                                cx_doc.notify();
-                            }
-                            "left" | "arrowleft" => {
-                                if shift {
-                                    let anchor = doc.selection_anchor.unwrap_or(doc.cursor);
-                                    if doc.cursor > 0 {
-                                        doc.set_selection(anchor, doc.cursor - 1);
-                                        cx_doc.notify();
+                    }))
+                    .on_mouse_down(MouseButton::Left, {
+                        let focus_handle = focus_handle.clone();
+                        let doc_handle = self.document.clone();
+                        let layout_for_event = text_layout.clone();
+                        let projection_for_event = projection.clone();
+                        move |event: &MouseDownEvent, window: &mut Window, cx_app: &mut App| {
+                            focus_handle.focus(window);
+                            let _ = doc_handle.update(cx_app, |doc, cx| {
+                                let byte_idx = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                    layout_for_event.index_for_position(event.position)
+                                }))
+                                .ok()
+                                .map(|res| match res {
+                                    Ok(ix) => ix,
+                                    Err(ix) => ix,
+                                });
+                                let source_byte = byte_idx
+                                    .map(|b| projection_for_event.display_to_source_byte(b));
+                                if let Some(byte_idx) = source_byte.map(|b| doc.byte_to_char(b)) {
+                                    if event.modifiers.shift {
+                                        let anchor = doc.selection_anchor.unwrap_or(doc.cursor);
+                                        doc.set_selection(anchor, byte_idx);
+                                    } else {
+                                        doc.set_cursor(byte_idx);
                                     }
-                                } else if doc.cursor > 0 {
-                                    doc.cursor -= 1;
-                                    doc.clear_selection();
-                                    cx_doc.notify();
+                                    cx.notify();
                                 }
+                            });
+                        }
+                    })
+                    .on_mouse_move({
+                        let doc_handle = self.document.clone();
+                        let layout_for_event = text_layout.clone();
+                        let projection_for_event = projection.clone();
+                        move |event: &MouseMoveEvent, _window: &mut Window, cx_app: &mut App| {
+                            if !event.dragging() {
+                                return;
                             }
-                            "right" | "arrowright" => {
-                                if shift {
+                            let _ = doc_handle.update(cx_app, |doc, cx| {
+                                let byte_idx = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                    layout_for_event.index_for_position(event.position)
+                                }))
+                                .ok()
+                                .map(|res| match res {
+                                    Ok(ix) => ix,
+                                    Err(ix) => ix,
+                                });
+                                let source_byte = byte_idx
+                                    .map(|b| projection_for_event.display_to_source_byte(b));
+                                if let Some(byte_idx) = source_byte.map(|b| doc.byte_to_char(b)) {
                                     let anchor = doc.selection_anchor.unwrap_or(doc.cursor);
-                                    if doc.cursor < len {
-                                        doc.set_selection(anchor, doc.cursor + 1);
-                                        cx_doc.notify();
+                                    doc.set_selection(anchor, byte_idx);
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    })
+                    .on_key_down({
+                        let focus = focus_handle.clone();
+                        cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                            if !focus.is_focused(window) {
+                                return;
+                            }
+
+                            let key = event.keystroke.key.to_lowercase();
+                            let modifiers = event.keystroke.modifiers;
+                            let is_cmd = modifiers.platform || modifiers.control;
+                            let shift = modifiers.shift;
+
+                            if is_cmd && key == "f" {
+                                this.activate_search(cx);
+                                return;
+                            }
+
+                            if is_cmd && key == "g" {
+                                if !this.search_active {
+                                    this.activate_search(cx);
+                                } else {
+                                    this.jump_search(cx, !shift);
+                                }
+                                return;
+                            }
+
+                            if this.search_active {
+                                this.handle_search_key(event, cx);
+                                return;
+                            }
+
+                            if is_cmd {
+                                return;
+                            }
+
+                            if key == "pageup" || key == "pagedown" {
+                                let max = this.scroll_handle.max_offset();
+                                let offset = this.scroll_handle.offset();
+                                let bounds = this.scroll_handle.bounds();
+                                let page = bounds.size.height;
+                                if page > px(0.) {
+                                    let amount = page * 0.9;
+                                    let delta = if key == "pagedown" { -amount } else { amount };
+                                    let mut new_offset = offset;
+                                    new_offset.y =
+                                        (new_offset.y + delta).clamp(-max.height, px(0.));
+                                    this.scroll_handle
+                                        .set_offset(point(new_offset.x, new_offset.y));
+                                    window.refresh();
+                                }
+                                return;
+                            }
+
+                            let _ = this.document.update(cx, |doc, cx_doc| {
+                                let len = doc.rope.len_chars();
+                                match key.as_str() {
+                                    "backspace" => {
+                                        doc.begin_edit();
+                                        if doc.delete_selection().is_some() {
+                                            doc.commit_edit();
+                                            cx_doc.notify();
+                                            return;
+                                        }
+                                        if doc.cursor > 0 && len > 0 {
+                                            let start = doc.cursor.saturating_sub(1);
+                                            doc.delete_range(start..doc.cursor);
+                                            doc.cursor = start;
+                                            doc.commit_edit();
+                                            cx_doc.notify();
+                                        }
                                     }
-                                } else if doc.cursor < len {
-                                    doc.cursor += 1;
-                                    doc.clear_selection();
-                                    cx_doc.notify();
-                                }
-                            }
-                            "up" | "arrowup" => {
-                                let cursor = doc.cursor.min(len);
-                                let line_idx = doc.rope.char_to_line(cursor);
-                                if line_idx == 0 {
-                                    return;
-                                }
-                                let line_start = doc.rope.line_to_char(line_idx);
-                                let col = cursor.saturating_sub(line_start);
-                                let target_line = line_idx - 1;
-                                let target_start = doc.rope.line_to_char(target_line);
-                                let target_len = doc.rope.line(target_line).len_chars();
-                                let max_col = if target_line + 1 < doc.rope.len_lines() {
-                                    target_len.saturating_sub(1)
-                                } else {
-                                    target_len
-                                };
-                                let new_cursor = target_start + col.min(max_col);
-
-                                if shift {
-                                    let anchor = doc.selection_anchor.unwrap_or(cursor);
-                                    doc.set_selection(anchor, new_cursor);
-                                } else {
-                                    doc.cursor = new_cursor;
-                                    doc.clear_selection();
-                                }
-                                cx_doc.notify();
-                            }
-                            "down" | "arrowdown" => {
-                                let cursor = doc.cursor.min(len);
-                                let line_idx = doc.rope.char_to_line(cursor);
-                                if line_idx + 1 >= doc.rope.len_lines() {
-                                    return;
-                                }
-                                let line_start = doc.rope.line_to_char(line_idx);
-                                let col = cursor.saturating_sub(line_start);
-                                let target_line = line_idx + 1;
-                                let target_start = doc.rope.line_to_char(target_line);
-                                let target_len = doc.rope.line(target_line).len_chars();
-                                let max_col = if target_line + 1 < doc.rope.len_lines() {
-                                    target_len.saturating_sub(1)
-                                } else {
-                                    target_len
-                                };
-                                let new_cursor = target_start + col.min(max_col);
-
-                                if shift {
-                                    let anchor = doc.selection_anchor.unwrap_or(cursor);
-                                    doc.set_selection(anchor, new_cursor);
-                                } else {
-                                    doc.cursor = new_cursor;
-                                    doc.clear_selection();
-                                }
-                                cx_doc.notify();
-                            }
-                            _ => {
-                                if let Some(ch) = event
-                                    .keystroke
-                                    .key_char
-                                    .as_ref()
-                                    .and_then(|s| s.chars().next())
-                                {
-                                    let insert = ch.to_string();
-                                    doc.begin_edit();
-                                    doc.delete_selection();
-                                    doc.insert(doc.cursor, &insert);
-                                    doc.cursor =
-                                        (doc.cursor).saturating_add(insert.chars().count());
-                                    doc.commit_edit();
-                                    cx_doc.notify();
-                                } else if let Some(raw) = &event.keystroke.key_char {
-                                    if raw == "\n" {
+                                    "delete" => {
+                                        doc.begin_edit();
+                                        if doc.delete_selection().is_some() {
+                                            doc.commit_edit();
+                                            cx_doc.notify();
+                                            return;
+                                        }
+                                        if doc.cursor < len {
+                                            let end = (doc.cursor + 1).min(len);
+                                            doc.delete_range(doc.cursor..end);
+                                            doc.commit_edit();
+                                            cx_doc.notify();
+                                        }
+                                    }
+                                    "enter" | "return" => {
                                         doc.begin_edit();
                                         doc.delete_selection();
                                         doc.insert(doc.cursor, "\n");
@@ -982,103 +854,248 @@ impl Render for EditorView {
                                         doc.commit_edit();
                                         cx_doc.notify();
                                     }
+                                    "left" | "arrowleft" => {
+                                        if shift {
+                                            let anchor = doc.selection_anchor.unwrap_or(doc.cursor);
+                                            if doc.cursor > 0 {
+                                                doc.set_selection(anchor, doc.cursor - 1);
+                                                cx_doc.notify();
+                                            }
+                                        } else if doc.cursor > 0 {
+                                            doc.cursor -= 1;
+                                            doc.clear_selection();
+                                            cx_doc.notify();
+                                        }
+                                    }
+                                    "right" | "arrowright" => {
+                                        if shift {
+                                            let anchor = doc.selection_anchor.unwrap_or(doc.cursor);
+                                            if doc.cursor < len {
+                                                doc.set_selection(anchor, doc.cursor + 1);
+                                                cx_doc.notify();
+                                            }
+                                        } else if doc.cursor < len {
+                                            doc.cursor += 1;
+                                            doc.clear_selection();
+                                            cx_doc.notify();
+                                        }
+                                    }
+                                    "up" | "arrowup" => {
+                                        let cursor = doc.cursor.min(len);
+                                        let line_idx = doc.rope.char_to_line(cursor);
+                                        if line_idx == 0 {
+                                            return;
+                                        }
+                                        let line_start = doc.rope.line_to_char(line_idx);
+                                        let col = cursor.saturating_sub(line_start);
+                                        let target_line = line_idx - 1;
+                                        let target_start = doc.rope.line_to_char(target_line);
+                                        let target_len = doc.rope.line(target_line).len_chars();
+                                        let max_col = if target_line + 1 < doc.rope.len_lines() {
+                                            target_len.saturating_sub(1)
+                                        } else {
+                                            target_len
+                                        };
+                                        let new_cursor = target_start + col.min(max_col);
+
+                                        if shift {
+                                            let anchor = doc.selection_anchor.unwrap_or(cursor);
+                                            doc.set_selection(anchor, new_cursor);
+                                        } else {
+                                            doc.cursor = new_cursor;
+                                            doc.clear_selection();
+                                        }
+                                        cx_doc.notify();
+                                    }
+                                    "down" | "arrowdown" => {
+                                        let cursor = doc.cursor.min(len);
+                                        let line_idx = doc.rope.char_to_line(cursor);
+                                        if line_idx + 1 >= doc.rope.len_lines() {
+                                            return;
+                                        }
+                                        let line_start = doc.rope.line_to_char(line_idx);
+                                        let col = cursor.saturating_sub(line_start);
+                                        let target_line = line_idx + 1;
+                                        let target_start = doc.rope.line_to_char(target_line);
+                                        let target_len = doc.rope.line(target_line).len_chars();
+                                        let max_col = if target_line + 1 < doc.rope.len_lines() {
+                                            target_len.saturating_sub(1)
+                                        } else {
+                                            target_len
+                                        };
+                                        let new_cursor = target_start + col.min(max_col);
+
+                                        if shift {
+                                            let anchor = doc.selection_anchor.unwrap_or(cursor);
+                                            doc.set_selection(anchor, new_cursor);
+                                        } else {
+                                            doc.cursor = new_cursor;
+                                            doc.clear_selection();
+                                        }
+                                        cx_doc.notify();
+                                    }
+                                    _ => {
+                                        if let Some(ch) = event
+                                            .keystroke
+                                            .key_char
+                                            .as_ref()
+                                            .and_then(|s| s.chars().next())
+                                        {
+                                            let insert = ch.to_string();
+                                            doc.begin_edit();
+                                            doc.delete_selection();
+                                            doc.insert(doc.cursor, &insert);
+                                            doc.cursor =
+                                                (doc.cursor).saturating_add(insert.chars().count());
+                                            doc.commit_edit();
+                                            cx_doc.notify();
+                                        } else if let Some(raw) = &event.keystroke.key_char {
+                                            if raw == "\n" {
+                                                doc.begin_edit();
+                                                doc.delete_selection();
+                                                doc.insert(doc.cursor, "\n");
+                                                doc.cursor += 1;
+                                                doc.commit_edit();
+                                                cx_doc.notify();
+                                            }
+                                        }
+                                    }
                                 }
-                            }
-                        }
-                    });
-                })
-            })
-            .child(
-                div()
-                    .relative()
-                    .w_full()
-                    .max_w(px(EDITOR_CONTENT_MAX_WIDTH))
-                    .mx_auto()
-                    .child(styled)
+                            });
+                        })
+                    })
                     .child(
-                        canvas(
-                            move |_, _, _| {},
-                            move |_bounds: Bounds<_>, (), window: &mut Window, _cx: &mut App| {
-                                if !draw_caret {
-                                    return;
-                                }
+                        div().relative().w_full().child(styled).child(
+                            canvas(
+                                move |_, _, _| {},
+                                move |_bounds: Bounds<_>,
+                                      (),
+                                      window: &mut Window,
+                                      _cx: &mut App| {
+                                    if !draw_caret {
+                                        return;
+                                    }
 
-                                let caret_pos = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                    text_layout.position_for_index(cursor_display_byte)
-                                }))
-                                .ok()
-                                .flatten();
-                                let Some(caret_pos) = caret_pos else {
-                                    return;
-                                };
+                                    let caret_pos =
+                                        std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                            text_layout.position_for_index(cursor_display_byte)
+                                        }))
+                                        .ok()
+                                        .flatten();
+                                    let Some(caret_pos) = caret_pos else {
+                                        return;
+                                    };
 
-                                let line_height =
-                                    std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                        text_layout.line_height()
-                                    }))
-                                    .ok()
-                                    .unwrap_or(px(0.));
-                                if line_height <= px(0.) {
-                                    return;
-                                }
+                                    let line_height =
+                                        std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                            text_layout.line_height()
+                                        }))
+                                        .ok()
+                                        .unwrap_or(px(0.));
+                                    if line_height <= px(0.) {
+                                        return;
+                                    }
 
-                                window.paint_quad(fill(
-                                    Bounds {
-                                        origin: point(caret_pos.x, caret_pos.y),
-                                        size: size(px(CARET_WIDTH), line_height),
-                                    },
-                                    Theme::accent(),
-                                ));
-                            },
-                        )
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .size_full(),
-                    ),
-            )
-            .when(self.search_active, |this| {
-                this.child(
-                    div()
-                        .absolute()
-                        .top(px(8.))
-                        .right(px(12.))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px(px(10.))
-                        .py(px(6.))
-                        .rounded(px(6.))
-                        .bg(Theme::panel_alt())
-                        .border_1()
-                        .border_color(Theme::border())
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(Theme::muted())
-                                .child("FIND"),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .max_w(px(300.))
-                                .overflow_hidden()
-                                .text_color(Theme::text())
-                                .child(if self.search_query.is_empty() {
-                                    "Type to search".to_string()
-                                } else {
-                                    ellipsize_chars(&self.search_query, 80)
-                                }),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(Theme::muted())
-                                .child(format!("{}/{}", search_match_display, search_match_count)),
+                                    window.paint_quad(fill(
+                                        Bounds {
+                                            origin: point(caret_pos.x, caret_pos.y),
+                                            size: size(px(CARET_WIDTH), line_height),
+                                        },
+                                        Theme::accent(),
+                                    ));
+                                },
+                            )
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full(),
                         ),
+                    )
+                    .when(self.search_active, |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .top(px(8.))
+                                .right(px(12.))
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px(px(10.))
+                                .py(px(6.))
+                                .rounded(px(6.))
+                                .bg(Theme::panel_alt())
+                                .border_1()
+                                .border_color(Theme::border())
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(Theme::muted())
+                                        .child("FIND"),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .max_w(px(300.))
+                                        .overflow_hidden()
+                                        .text_color(Theme::text())
+                                        .child(if self.search_query.is_empty() {
+                                            "Type to search".to_string()
+                                        } else {
+                                            ellipsize_chars(&self.search_query, 80)
+                                        }),
+                                )
+                                .child(div().text_xs().text_color(Theme::muted()).child(format!(
+                                    "{}/{}",
+                                    search_match_display, search_match_count
+                                ))),
+                        )
+                    }),
+            )
+            // Draw the indicator in the non-scrolling parent, so it cannot be clipped or
+            // translated along with document content.
+            .child(
+                canvas(
+                    move |_, _, _| {},
+                    move |bounds: Bounds<_>, (), window: &mut Window, _cx: &mut App| {
+                        let viewport_height = editor_scroll_handle.bounds().size.height;
+                        let max_offset = editor_scroll_handle.max_offset().height;
+                        if viewport_height <= px(0.)
+                            || (max_offset <= px(0.) && !has_multiple_lines)
+                        {
+                            return;
+                        }
+
+                        let content_height = viewport_height + max_offset;
+                        let thumb_height = if max_offset > px(0.) {
+                            (viewport_height / content_height * bounds.size.height)
+                                .max(px(48.))
+                                .min(bounds.size.height)
+                        } else {
+                            px(48.).min(bounds.size.height)
+                        };
+                        let travel = bounds.size.height - thumb_height;
+                        let progress = if max_offset > px(0.) {
+                            (-editor_scroll_handle.offset().y / max_offset).clamp(0., 1.)
+                        } else {
+                            0.
+                        };
+                        let top = bounds.origin.y + travel * progress;
+
+                        window.paint_quad(fill(
+                            Bounds {
+                                origin: point(bounds.right() - px(8.), top),
+                                size: size(px(6.), thumb_height),
+                            },
+                            Theme::muted(),
+                        ));
+                    },
                 )
-            })
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
     }
 }
 

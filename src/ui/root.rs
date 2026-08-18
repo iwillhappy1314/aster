@@ -17,10 +17,11 @@ use crate::ui::theme::Theme;
 use camino::Utf8PathBuf;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Context, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement, Render, Styled, Window, div, px,
+    App, Bounds, Context, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    MouseMoveEvent, ParentElement, Render, ScrollHandle, StatefulInteractiveElement, Styled,
+    Window, canvas, div, fill, point, px, size,
 };
-use gpui_component::notification::NotificationList;
+use gpui_component::{notification::NotificationList, text::TextView};
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use std::time::Duration;
 
@@ -47,6 +48,8 @@ pub struct RootView {
     outline_visible: bool,
     /// Whether the document is currently shown in read-only preview mode.
     preview_visible: bool,
+    /// Scroll state shared by the preview content and its right-edge indicator.
+    preview_scroll_handle: ScrollHandle,
 }
 
 impl RootView {
@@ -71,6 +74,7 @@ impl RootView {
             resizing_sidebar: false,
             outline_visible: false,
             preview_visible: true,
+            preview_scroll_handle: ScrollHandle::new(),
         }
     }
 
@@ -327,13 +331,9 @@ impl RootView {
         cx.notify();
     }
 
-    /// Switches between the read-only preview and editable document views.
+    /// Switches between the rendered preview and the editable Markdown source view.
     fn toggle_preview(&mut self, cx: &mut Context<Self>) {
         self.preview_visible = !self.preview_visible;
-        let preview_visible = self.preview_visible;
-        let _ = self.editor_view.update(cx, |editor, cx| {
-            editor.set_preview_mode(preview_visible, cx);
-        });
         cx.notify();
     }
 }
@@ -466,6 +466,11 @@ impl Render for RootView {
         } else {
             Theme::muted()
         };
+        let mode_toggle_color = if self.preview_visible {
+            Theme::accent()
+        } else {
+            Theme::muted()
+        };
 
         let bottom_bar = div()
             .flex()
@@ -506,6 +511,38 @@ impl Render for RootView {
                                     .border_color(outline_toggle_color),
                             )
                             .child(div().flex_1()),
+                    ),
+            )
+            .child(
+                div()
+                    .id("preview-toggle")
+                    .p(px(5.))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .hover(|this| this.bg(Theme::panel_alt()).text_color(Theme::text()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            this.toggle_preview(cx);
+                        }),
+                    )
+                    // Use native geometry instead of an asset-backed SVG so the control is
+                    // always visible in the packaged application.
+                    .child(
+                        div()
+                            .w(px(16.))
+                            .h(px(16.))
+                            .rounded(px(3.))
+                            .border_1()
+                            .border_color(mode_toggle_color)
+                            .px(px(3.))
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .gap(px(2.))
+                            .child(div().w_full().h(px(1.)).bg(mode_toggle_color))
+                            .child(div().w_full().h(px(1.)).bg(mode_toggle_color))
+                            .child(div().w(px(6.)).h(px(1.)).bg(mode_toggle_color)),
                     ),
             )
             .child(
@@ -618,36 +655,94 @@ impl Render for RootView {
                                 ),
                         )
                     })
-                    .child(
+                    .child(if self.preview_visible {
+                        let preview_scroll_handle = self.preview_scroll_handle.clone();
+                        let has_multiple_lines = doc_text.lines().nth(1).is_some();
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .min_w(px(0.))
+                            .child(
+                                div()
+                                    .id("preview-scroll")
+                                    .size_full()
+                                    .overflow_y_scroll()
+                                    .overflow_x_hidden()
+                                    .track_scroll(&self.preview_scroll_handle)
+                                    .child(
+                                        TextView::markdown(
+                                            "markdown-preview",
+                                            doc_text,
+                                            window,
+                                            cx,
+                                        )
+                                        .h_auto()
+                                        .pl(px(32.))
+                                        .pr(px(32.))
+                                        .py(px(24.))
+                                        .selectable(true),
+                                    ),
+                            )
+                            // Match the editor's indicator: it is rendered above the scrolling
+                            // content and fixed to the view's right edge.
+                            .child(
+                                canvas(
+                                    move |_, _, _| {},
+                                    move |bounds: Bounds<_>,
+                                          (),
+                                          window: &mut Window,
+                                          _cx: &mut App| {
+                                        let viewport_height =
+                                            preview_scroll_handle.bounds().size.height;
+                                        let max_offset = preview_scroll_handle.max_offset().height;
+                                        if viewport_height <= px(0.)
+                                            || (max_offset <= px(0.) && !has_multiple_lines)
+                                        {
+                                            return;
+                                        }
+
+                                        let content_height = viewport_height + max_offset;
+                                        let thumb_height = if max_offset > px(0.) {
+                                            (viewport_height / content_height * bounds.size.height)
+                                                .max(px(48.))
+                                                .min(bounds.size.height)
+                                        } else {
+                                            px(48.).min(bounds.size.height)
+                                        };
+                                        let travel = bounds.size.height - thumb_height;
+                                        let progress = if max_offset > px(0.) {
+                                            (-preview_scroll_handle.offset().y / max_offset)
+                                                .clamp(0., 1.)
+                                        } else {
+                                            0.
+                                        };
+                                        let top = bounds.origin.y + travel * progress;
+
+                                        window.paint_quad(fill(
+                                            Bounds {
+                                                origin: point(bounds.right() - px(8.), top),
+                                                size: size(px(6.), thumb_height),
+                                            },
+                                            Theme::muted(),
+                                        ));
+                                    },
+                                )
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .size_full(),
+                            )
+                            .into_any_element()
+                    } else {
                         div()
                             .flex_1()
                             .min_h(px(0.))
                             .min_w(px(0.))
                             .flex()
                             .flex_col()
-                            .child(self.editor_view.clone()),
-                    ),
-            )
-            .child(
-                div()
-                    .id("preview-toggle")
-                    .px(px(8.))
-                    .py(px(3.))
-                    .rounded(px(4.))
-                    .cursor_pointer()
-                    .text_sm()
-                    .text_color(Theme::muted())
-                    .hover(|this| this.bg(Theme::panel_alt()).text_color(Theme::text()))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                            this.toggle_preview(cx);
-                        }),
-                    )
-                    .child(if self.preview_visible {
-                        "Edit"
-                    } else {
-                        "Preview"
+                            .child(self.editor_view.clone())
+                            .into_any_element()
                     }),
             )
             .child(bottom_bar)
