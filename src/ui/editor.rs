@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const EDITOR_CONTENT_MAX_WIDTH: f32 = 800.0;
+const CARET_WIDTH: f32 = 2.0;
 
 struct SearchCache {
     revision: u64,
@@ -185,6 +186,8 @@ pub struct EditorView {
     cached_search: Option<SearchCache>,
     /// Byte offset that should be revealed after next layout.
     pending_scroll_to_byte: Option<usize>,
+    /// Whether input is disabled while rendering the document preview.
+    preview_mode: bool,
 }
 
 impl EditorView {
@@ -205,7 +208,14 @@ impl EditorView {
             search_current_match: 0,
             cached_search: None,
             pending_scroll_to_byte: None,
+            preview_mode: true,
         }
+    }
+
+    /// Enables or disables the read-only document preview interaction mode.
+    pub fn set_preview_mode(&mut self, preview_mode: bool, cx: &mut Context<Self>) {
+        self.preview_mode = preview_mode;
+        cx.notify();
     }
 
     fn start_cursor_blink(&mut self, cx: &mut Context<Self>) {
@@ -530,7 +540,8 @@ impl Render for EditorView {
         let doc = self.document.read(cx);
         let cursor_source_byte = doc.char_to_byte(doc.cursor);
         let show_caret = doc.selection.is_none();
-        let draw_caret = show_caret && is_focused && self.caret_visible;
+        let draw_caret = show_caret && is_focused && self.caret_visible && !self.preview_mode;
+        let preview_mode = self.preview_mode;
         let inline_spans = {
             let inline = self.inline_markdown.read(cx);
             inline.spans.clone()
@@ -618,6 +629,9 @@ impl Render for EditorView {
             .on_action({
                 let doc_handle = self.document.clone();
                 move |_: &Cut, _window: &mut Window, cx_app: &mut App| {
+                    if preview_mode {
+                        return;
+                    }
                     let selection = doc_handle
                         .read_with(cx_app, |d, _| d.selection_range())
                         .unwrap_or_else(|| 0..0);
@@ -639,6 +653,9 @@ impl Render for EditorView {
             .on_action({
                 let doc_handle = self.document.clone();
                 move |_: &Paste, _window: &mut Window, cx_app: &mut App| {
+                    if preview_mode {
+                        return;
+                    }
                     let Some(item) = cx_app.read_from_clipboard() else {
                         return;
                     };
@@ -659,6 +676,9 @@ impl Render for EditorView {
             .on_action({
                 let doc_handle = self.document.clone();
                 move |_: &Undo, _window: &mut Window, cx_app: &mut App| {
+                    if preview_mode {
+                        return;
+                    }
                     let _ = doc_handle.update(cx_app, |doc, cx| {
                         if doc.undo() {
                             cx.notify();
@@ -669,6 +689,9 @@ impl Render for EditorView {
             .on_action({
                 let doc_handle = self.document.clone();
                 move |_: &Redo, _window: &mut Window, cx_app: &mut App| {
+                    if preview_mode {
+                        return;
+                    }
                     let _ = doc_handle.update(cx_app, |doc, cx| {
                         if doc.redo() {
                             cx.notify();
@@ -703,6 +726,9 @@ impl Render for EditorView {
                 let layout_for_event = text_layout.clone();
                 let projection_for_event = projection.clone();
                 move |event: &MouseDownEvent, window: &mut Window, cx_app: &mut App| {
+                    if preview_mode {
+                        return;
+                    }
                     focus_handle.focus(window);
                     let _ = doc_handle.update(cx_app, |doc, cx| {
                         let byte_idx = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -732,6 +758,9 @@ impl Render for EditorView {
                 let layout_for_event = text_layout.clone();
                 let projection_for_event = projection.clone();
                 move |event: &MouseMoveEvent, _window: &mut Window, cx_app: &mut App| {
+                    if preview_mode {
+                        return;
+                    }
                     if !event.dragging() {
                         return;
                     }
@@ -757,6 +786,9 @@ impl Render for EditorView {
             .on_key_down({
                 let focus = focus_handle.clone();
                 cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                    if this.preview_mode {
+                        return;
+                    }
                     if !focus.is_focused(window) {
                         return;
                     }
@@ -993,7 +1025,7 @@ impl Render for EditorView {
                                 window.paint_quad(fill(
                                     Bounds {
                                         origin: point(caret_pos.x, caret_pos.y),
-                                        size: size(px(1.), line_height),
+                                        size: size(px(CARET_WIDTH), line_height),
                                     },
                                     Theme::accent(),
                                 ));

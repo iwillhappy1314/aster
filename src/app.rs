@@ -1,7 +1,7 @@
 use crate::commands::{
     About, CloseWindow, Copy, Cut, Find, FindNext, FindPrevious, FontSizeDecrease,
     FontSizeIncrease, FontSizeReset, NewFile, OpenFile, Paste, Quit, Redo, SaveFile, SaveFileAs,
-    SelectAll, ToggleOutline, Undo,
+    SelectAll, ToggleOutline, TogglePreview, Undo,
 };
 use crate::services::assets::AsterAssetSource;
 use crate::services::fs::{read_to_string, write_atomic};
@@ -57,6 +57,7 @@ pub fn run() {
             KeyBinding::new("cmd--", FontSizeDecrease, None),
             KeyBinding::new("cmd-0", FontSizeReset, None),
             KeyBinding::new("shift-cmd-o", ToggleOutline, None),
+            KeyBinding::new("shift-cmd-p", TogglePreview, None),
         ]);
 
         cx.set_menus(vec![
@@ -103,6 +104,7 @@ pub fn run() {
                 name: "View".into(),
                 items: vec![
                     MenuItem::action("Show or Hide Outline", ToggleOutline),
+                    MenuItem::action("Toggle Preview", TogglePreview),
                     MenuItem::separator(),
                     MenuItem::action("Increase Font Size", FontSizeIncrease),
                     MenuItem::action("Decrease Font Size", FontSizeDecrease),

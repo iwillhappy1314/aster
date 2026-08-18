@@ -2,4 +2,4 @@
 tickets.md
 *.zip
 *.dmg
-
+.DS_Store

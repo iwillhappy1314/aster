@@ -1,6 +1,6 @@
 use crate::commands::{
     CloseWindow, FontSizeDecrease, FontSizeIncrease, FontSizeReset, NewFile, OpenFile, SaveFile,
-    SaveFileAs, ToggleOutline,
+    SaveFileAs, ToggleOutline, TogglePreview,
 };
 use crate::model::document::DocumentState;
 use crate::model::inline_markdown::InlineMarkdownState;
@@ -45,6 +45,8 @@ pub struct RootView {
     resizing_sidebar: bool,
     /// Whether the optional document outline is visible.
     outline_visible: bool,
+    /// Whether the document is currently shown in read-only preview mode.
+    preview_visible: bool,
 }
 
 impl RootView {
@@ -68,6 +70,7 @@ impl RootView {
             sidebar_width: 200.0,
             resizing_sidebar: false,
             outline_visible: false,
+            preview_visible: true,
         }
     }
 
@@ -323,6 +326,16 @@ impl RootView {
         self.resizing_sidebar = false;
         cx.notify();
     }
+
+    /// Switches between the read-only preview and editable document views.
+    fn toggle_preview(&mut self, cx: &mut Context<Self>) {
+        self.preview_visible = !self.preview_visible;
+        let preview_visible = self.preview_visible;
+        let _ = self.editor_view.update(cx, |editor, cx| {
+            editor.set_preview_mode(preview_visible, cx);
+        });
+        cx.notify();
+    }
 }
 
 impl Render for RootView {
@@ -548,6 +561,9 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &ToggleOutline, _window, cx| {
                 this.toggle_outline(cx);
             }))
+            .on_action(cx.listener(|this, _: &TogglePreview, _window, cx| {
+                this.toggle_preview(cx);
+            }))
             // Handle sidebar resize drag at root level so we don't lose events
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 if !this.resizing_sidebar {
@@ -611,6 +627,28 @@ impl Render for RootView {
                             .flex_col()
                             .child(self.editor_view.clone()),
                     ),
+            )
+            .child(
+                div()
+                    .id("preview-toggle")
+                    .px(px(8.))
+                    .py(px(3.))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .text_sm()
+                    .text_color(Theme::muted())
+                    .hover(|this| this.bg(Theme::panel_alt()).text_color(Theme::text()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            this.toggle_preview(cx);
+                        }),
+                    )
+                    .child(if self.preview_visible {
+                        "Edit"
+                    } else {
+                        "Preview"
+                    }),
             )
             .child(bottom_bar)
             .child(self.notifications.clone())
