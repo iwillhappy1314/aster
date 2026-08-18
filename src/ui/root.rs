@@ -50,6 +50,10 @@ pub struct RootView {
     preview_visible: bool,
     /// Scroll state shared by the preview content and its right-edge indicator.
     preview_scroll_handle: ScrollHandle,
+    /// Whether the preview's right-edge scroll indicator is currently visible.
+    preview_scroll_indicator_visible: bool,
+    /// Monotonic revision used to prevent an older hide timer from hiding a newer scroll event.
+    preview_scroll_indicator_revision: u64,
 }
 
 impl RootView {
@@ -75,6 +79,8 @@ impl RootView {
             outline_visible: false,
             preview_visible: true,
             preview_scroll_handle: ScrollHandle::new(),
+            preview_scroll_indicator_visible: false,
+            preview_scroll_indicator_revision: 0,
         }
     }
 
@@ -334,6 +340,29 @@ impl RootView {
     /// Switches between the rendered preview and the editable Markdown source view.
     fn toggle_preview(&mut self, cx: &mut Context<Self>) {
         self.preview_visible = !self.preview_visible;
+        cx.notify();
+    }
+
+    /// Shows the preview scroll indicator briefly after a wheel-scroll event.
+    fn reveal_preview_scroll_indicator(&mut self, cx: &mut Context<Self>) {
+        self.preview_scroll_indicator_visible = true;
+        self.preview_scroll_indicator_revision =
+            self.preview_scroll_indicator_revision.wrapping_add(1);
+        let revision = self.preview_scroll_indicator_revision;
+        let entity = cx.entity();
+
+        cx.spawn(async move |_view, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1_200))
+                .await;
+            let _ = entity.update(cx, |view, cx| {
+                if view.preview_scroll_indicator_revision == revision {
+                    view.preview_scroll_indicator_visible = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
         cx.notify();
     }
 }
@@ -658,6 +687,7 @@ impl Render for RootView {
                     .child(if self.preview_visible {
                         let preview_scroll_handle = self.preview_scroll_handle.clone();
                         let has_multiple_lines = doc_text.lines().nth(1).is_some();
+                        let show_preview_scroll_indicator = self.preview_scroll_indicator_visible;
                         div()
                             .relative()
                             .flex_1()
@@ -670,6 +700,11 @@ impl Render for RootView {
                                     .overflow_y_scroll()
                                     .overflow_x_hidden()
                                     .track_scroll(&self.preview_scroll_handle)
+                                    .on_scroll_wheel(cx.listener(
+                                        |this, _: &gpui::ScrollWheelEvent, _, cx| {
+                                            this.reveal_preview_scroll_indicator(cx);
+                                        },
+                                    ))
                                     .child(
                                         TextView::markdown(
                                             "markdown-preview",
@@ -693,6 +728,9 @@ impl Render for RootView {
                                           (),
                                           window: &mut Window,
                                           _cx: &mut App| {
+                                        if !show_preview_scroll_indicator {
+                                            return;
+                                        }
                                         let viewport_height =
                                             preview_scroll_handle.bounds().size.height;
                                         let max_offset = preview_scroll_handle.max_offset().height;

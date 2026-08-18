@@ -176,6 +176,10 @@ pub struct EditorView {
     caret_visible: bool,
     blink_task: Option<gpui::Task<()>>,
     scroll_handle: ScrollHandle,
+    /// Whether the editor's right-edge scroll indicator is currently visible.
+    scroll_indicator_visible: bool,
+    /// Monotonic revision used to prevent an older hide timer from hiding a newer scroll event.
+    scroll_indicator_revision: u64,
     /// Cached text with revision to avoid repeated rope-to-string conversions
     cached_text: Option<(u64, String)>,
     /// Find panel state.
@@ -199,6 +203,8 @@ impl EditorView {
             caret_visible: true,
             blink_task: None,
             scroll_handle: ScrollHandle::new(),
+            scroll_indicator_visible: false,
+            scroll_indicator_revision: 0,
             cached_text: None,
             search_active: false,
             search_query: String::new(),
@@ -224,6 +230,28 @@ impl EditorView {
                 });
             }
         }));
+    }
+
+    /// Shows the scroll indicator briefly after a wheel-scroll event.
+    fn reveal_scroll_indicator(&mut self, cx: &mut Context<Self>) {
+        self.scroll_indicator_visible = true;
+        self.scroll_indicator_revision = self.scroll_indicator_revision.wrapping_add(1);
+        let revision = self.scroll_indicator_revision;
+        let entity = cx.entity();
+
+        cx.spawn(async move |_view, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1_200))
+                .await;
+            let _ = entity.update(cx, |view, cx| {
+                if view.scroll_indicator_revision == revision {
+                    view.scroll_indicator_visible = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn selection_highlights(&self, doc: &DocumentState) -> Vec<(Range<usize>, HighlightStyle)> {
@@ -574,6 +602,7 @@ impl Render for EditorView {
         self.reveal_pending_byte(&text_layout, projection.as_ref(), window);
         let has_multiple_lines = text_owned.lines().nth(1).is_some();
         let editor_scroll_handle = self.scroll_handle.clone();
+        let show_scroll_indicator = self.scroll_indicator_visible;
 
         let search_match_display = if search_match_count == 0 {
             0
@@ -601,6 +630,9 @@ impl Render for EditorView {
                     .scrollbar_width(px(10.))
                     .track_scroll(&self.scroll_handle)
                     .track_focus(&focus_handle)
+                    .on_scroll_wheel(cx.listener(|this, _: &gpui::ScrollWheelEvent, _, cx| {
+                        this.reveal_scroll_indicator(cx);
+                    }))
                     .on_action({
                         let doc_handle = self.document.clone();
                         move |_: &SelectAll, _window: &mut Window, cx_app: &mut App| {
@@ -1058,6 +1090,9 @@ impl Render for EditorView {
                 canvas(
                     move |_, _, _| {},
                     move |bounds: Bounds<_>, (), window: &mut Window, _cx: &mut App| {
+                        if !show_scroll_indicator {
+                            return;
+                        }
                         let viewport_height = editor_scroll_handle.bounds().size.height;
                         let max_offset = editor_scroll_handle.max_offset().height;
                         if viewport_height <= px(0.)
