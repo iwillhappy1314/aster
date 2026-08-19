@@ -53,6 +53,9 @@ impl FileExplorerView {
     pub fn set_active_outline(&mut self, ordinal: Option<usize>, cx: &mut Context<Self>) {
         if self.active_outline_ordinal != ordinal {
             self.active_outline_ordinal = ordinal;
+            if let Some(ordinal) = ordinal {
+                self.outline_scroll_handle.scroll_to_item(ordinal);
+            }
             cx.notify();
         }
     }
