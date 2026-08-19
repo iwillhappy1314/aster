@@ -26,5 +26,5 @@ pub use render::{
   RenderedMarkdownBlocks, render_markdown, render_markdown_blocks_cached, render_markdown_cached,
   render_parsed_markdown, render_parsed_markdown_blocks,
 };
-pub use typography::{BODY_FONT_SIZE_PX, heading_font_size_px, heading_font_weight};
+pub use typography::{heading_font_size, heading_font_weight};
 pub use types::ParsedMarkdown;
