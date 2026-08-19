@@ -195,8 +195,6 @@ pub struct EditorView {
     pending_outline_reveal_byte: Option<usize>,
     /// Reports the source byte crossing the editor viewport activation line.
     on_outline_viewport_change: Option<OutlineViewportCallback>,
-    /// Last viewport position reported, keyed by document revision.
-    last_outline_viewport_report: Option<(u64, usize)>,
 }
 
 impl EditorView {
@@ -221,7 +219,6 @@ impl EditorView {
             pending_scroll_to_byte: None,
             pending_outline_reveal_byte: None,
             on_outline_viewport_change: None,
-            last_outline_viewport_report: None,
         }
     }
 
@@ -284,14 +281,12 @@ impl EditorView {
 
     pub fn set_on_outline_viewport_change(&mut self, callback: OutlineViewportCallback) {
         self.on_outline_viewport_change = Some(callback);
-        self.last_outline_viewport_report = None;
     }
 
     fn sync_outline_viewport(
         &mut self,
         text_layout: &gpui::TextLayout,
         projection: &DisplayProjection,
-        doc_revision: u64,
         cx: &mut Context<Self>,
     ) {
         let Some(callback) = self.on_outline_viewport_change.clone() else {
@@ -317,12 +312,6 @@ impl EditorView {
         };
 
         let source_byte = projection.display_to_source_byte(display_byte);
-        let report = (doc_revision, source_byte);
-        if self.last_outline_viewport_report == Some(report) {
-            return;
-        }
-
-        self.last_outline_viewport_report = Some(report);
         callback(source_byte, cx);
     }
 
@@ -696,7 +685,7 @@ impl Render for EditorView {
             self.pending_outline_reveal_byte.is_some() || self.pending_scroll_to_byte.is_some();
         self.reveal_pending_byte(&text_layout, projection.as_ref(), window);
         if !had_pending_reveal {
-            self.sync_outline_viewport(&text_layout, projection.as_ref(), doc_revision, cx);
+            self.sync_outline_viewport(&text_layout, projection.as_ref(), cx);
         }
         let has_multiple_lines = text_owned.lines().nth(1).is_some();
         let editor_scroll_handle = self.scroll_handle.clone();
@@ -941,6 +930,7 @@ impl Render for EditorView {
                                         (new_offset.y + delta).clamp(-max.height, px(0.));
                                     this.scroll_handle
                                         .set_offset(point(new_offset.x, new_offset.y));
+                                    cx.notify();
                                     window.refresh();
                                 }
                                 return;
@@ -974,6 +964,7 @@ impl Render for EditorView {
                                         if doc.cursor < len {
                                             let end = (doc.cursor + 1).min(len);
                                             doc.delete_range(doc.cursor..end);
+                                            doc.cursor = doc.cursor;
                                             doc.commit_edit();
                                             cx_doc.notify();
                                         }
