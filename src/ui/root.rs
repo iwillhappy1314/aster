@@ -1,6 +1,6 @@
 use crate::commands::{
-    FontSizeDecrease, FontSizeIncrease, FontSizeReset, NewFile, OpenFile, SaveFile, SaveFileAs,
-    ToggleOutline, TogglePreview,
+    FontSizeDecrease, FontSizeIncrease, FontSizeReset, NewFile, OpenFile, OutlinePositionLeft,
+    OutlinePositionRight, SaveFile, SaveFileAs, ToggleOutline, TogglePreview,
 };
 use crate::model::document::DocumentState;
 use crate::model::inline_markdown::InlineMarkdownState;
@@ -8,7 +8,7 @@ use crate::services::fs::{
     pick_open_markdown_path_async, pick_save_path_async, read_to_string, write_atomic,
 };
 use crate::services::inline_markdown::compute_inline_spans;
-use crate::services::settings::{self, Settings};
+use crate::services::settings::{self, OutlinePosition, Settings};
 use crate::services::tasks::Debouncer;
 use crate::ui::editor::EditorView;
 use crate::ui::file_explorer::FileExplorerView;
@@ -86,7 +86,7 @@ impl RootView {
             cached_doc_text: None,
             outline_reveal_installed: false,
             font_size: settings::get_font_size(),
-            sidebar_width: 200.0,
+            sidebar_width: 300.0,
             resizing_sidebar: false,
             outline_visible: false,
             preview_visible: true,
@@ -542,6 +542,7 @@ impl Render for RootView {
         };
         window.set_window_title(&window_title);
 
+        let outline_position = settings::get_outline_position();
         let resize_line_color = if self.resizing_sidebar {
             gpui::rgba(0x2d7fd299)
         } else {
@@ -594,6 +595,9 @@ impl Render for RootView {
                             .w(px(16.))
                             .h(px(16.))
                             .flex()
+                            .when(outline_position == OutlinePosition::Right, |this| {
+                                this.flex_row_reverse()
+                            })
                             .rounded(px(3.))
                             .border_1()
                             .border_color(outline_toggle_color)
@@ -601,7 +605,12 @@ impl Render for RootView {
                                 div()
                                     .w(px(5.))
                                     .h_full()
-                                    .border_r_1()
+                                    .when(outline_position == OutlinePosition::Left, |this| {
+                                        this.border_r_1()
+                                    })
+                                    .when(outline_position == OutlinePosition::Right, |this| {
+                                        this.border_l_1()
+                                    })
                                     .border_color(outline_toggle_color),
                             )
                             .child(div().flex_1()),
@@ -677,6 +686,16 @@ impl Render for RootView {
                 settings::set_font_size(this.font_size);
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &OutlinePositionLeft, _window, cx| {
+                settings::set_outline_position(OutlinePosition::Left);
+                this.resizing_sidebar = false;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &OutlinePositionRight, _window, cx| {
+                settings::set_outline_position(OutlinePosition::Right);
+                this.resizing_sidebar = false;
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &ToggleOutline, _window, cx| {
                 this.toggle_outline(cx);
             }))
@@ -684,11 +703,18 @@ impl Render for RootView {
                 this.toggle_preview(cx);
             }))
             // Handle sidebar resize drag at root level so we don't lose events
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 if !this.resizing_sidebar {
                     return;
                 }
-                let new_width: f32 = event.position.x.into();
+                let pointer_x: f32 = event.position.x.into();
+                let new_width = match settings::get_outline_position() {
+                    OutlinePosition::Left => pointer_x,
+                    OutlinePosition::Right => {
+                        let window_width: f32 = window.bounds().size.width.into();
+                        window_width - pointer_x
+                    }
+                };
                 let clamped = new_width.clamp(100.0, 400.0);
                 this.sidebar_width = clamped;
                 cx.notify();
@@ -710,6 +736,9 @@ impl Render for RootView {
                     .min_w(px(0.))
                     .flex()
                     .flex_row()
+                    .when(outline_position == OutlinePosition::Right, |this| {
+                        this.flex_row_reverse()
+                    })
                     .when(self.outline_visible, |this| {
                         this.child({
                             // Keep the sidebar width in sync with the resize state.
