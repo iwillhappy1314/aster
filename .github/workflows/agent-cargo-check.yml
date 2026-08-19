@@ -22,7 +22,6 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          import re
 
           cargo = Path("Cargo.toml")
           cargo_text = cargo.read_text()
@@ -95,27 +94,19 @@ jobs:
               raise SystemExit(f"expected one preview block marker, found {text.count(marker)}")
           text = text.replace(marker, insertion, 1)
 
-          preview_pattern = re.compile(
-              r'''TextView::markdown\(\s*"markdown-preview",\s*doc_text,\s*window,\s*cx,\s*\)\s*
-                  \.h_auto\(\)\s*
-                  \.pl\(px\(32\.\)\)\s*
-                  \.pr\(px\(32\.\)\)\s*
-                  \.py\(px\(24\.\)\)\s*
-                  // Add breathing room above subsequent headings by\s*
-                  // increasing the block gap used by the Markdown renderer\.\s*
-                  \.style\(\s*TextViewStyle::default\(\)\.paragraph_gap\(gpui::rems\(1\.5\)\),\s*\)\s*
-                  \.selectable\(true\)''',
-              re.VERBOSE,
-          )
+          start_marker = "TextView::markdown("
+          end_marker = ".selectable(true)"
+          if text.count(start_marker) != 1:
+              raise SystemExit(f"expected one TextView::markdown call, found {text.count(start_marker)}")
+          start = text.index(start_marker)
+          end = text.index(end_marker, start) + len(end_marker)
           replacement = '''div()
                                           .h_auto()
                                           .pl(px(32.))
                                           .pr(px(32.))
                                           .py(px(24.))
                                           .child(markdown_content)'''
-          text, count = preview_pattern.subn(replacement, text, count=1)
-          if count != 1:
-              raise SystemExit(f"expected one TextView preview block, replaced {count}")
+          text = text[:start] + replacement + text[end:]
 
           root.write_text(text)
           PY
