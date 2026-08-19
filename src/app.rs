@@ -167,6 +167,12 @@ pub fn run() {
         cx.on_action(|_: &ThemeAyuLight, cx| apply_theme(ThemeName::AyuLight, cx));
         cx.on_action(|_: &ThemeAyuDark, cx| apply_theme(ThemeName::AyuDark, cx));
         cx.on_action(|_: &ThemeAyuMirage, cx| apply_theme(ThemeName::AyuMirage, cx));
+        cx.on_action(|_: &OutlinePositionLeft, cx| {
+            apply_outline_position(settings::OutlinePosition::Left, cx)
+        });
+        cx.on_action(|_: &OutlinePositionRight, cx| {
+            apply_outline_position(settings::OutlinePosition::Right, cx)
+        });
         cx.on_action(|_: &About, _cx| {
             MessageDialog::new()
                 .set_level(MessageLevel::Info)
@@ -227,6 +233,14 @@ fn apply_theme(name: ThemeName, cx: &mut App) {
     let is_dark = crate::ui::theme::set_theme(name);
     let mode = if is_dark { ThemeMode::Dark } else { ThemeMode::Light };
     ComponentTheme::change(mode, None, cx);
+    for window in cx.windows() {
+        let _ = window.update(cx, |_, window, _| window.refresh());
+    }
+}
+
+/// Persists the Outline side and repaints all open windows immediately.
+fn apply_outline_position(position: settings::OutlinePosition, cx: &mut App) {
+    settings::set_outline_position(position);
     for window in cx.windows() {
         let _ = window.update(cx, |_, window, _| window.refresh());
     }
