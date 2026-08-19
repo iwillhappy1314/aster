@@ -6,6 +6,7 @@ use gpui::{
     App, Context, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, Render, ScrollHandle, StatefulInteractiveElement, Styled, Window, div, px,
 };
+use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -171,62 +172,102 @@ impl Render for FileExplorerView {
 
 fn parse_outline_items(text: &str) -> Vec<OutlineItem> {
     let mut items = Vec::new();
-    let mut byte_offset = 0usize;
+    let mut current_heading: Option<(HeadingLevel, usize, String)> = None;
 
-    for raw_line in text.split_inclusive('\n') {
-        let line = raw_line.trim_end_matches('\n').trim_end_matches('\r');
-        if line.is_empty() {
-            byte_offset += raw_line.len();
-            continue;
-        }
-
-        let leading = leading_whitespace_bytes(line);
-        let content = &line[leading..];
-        if let Some((marker_len, level)) = heading_prefix(content) {
-            let heading_start = byte_offset + leading;
-            let text_start = heading_start + marker_len;
-            if text_start <= byte_offset + line.len() {
-                let title = text[text_start..(byte_offset + line.len())]
-                    .trim()
-                    .to_string();
-                if !title.is_empty() {
-                    items.push(OutlineItem {
-                        ordinal: items.len(),
-                        level: level as u32,
-                        title,
-                        byte_start: heading_start,
-                    });
+    for (event, source_range) in Parser::new(text).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                current_heading = Some((level, source_range.start, String::new()));
+            }
+            Event::Text(value) | Event::Code(value) => {
+                if let Some((_, _, title)) = current_heading.as_mut() {
+                    title.push_str(value.as_ref());
                 }
             }
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some((_, _, title)) = current_heading.as_mut()
+                    && !title.ends_with(' ')
+                {
+                    title.push(' ');
+                }
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                if let Some((level, byte_start, title)) = current_heading.take() {
+                    let title = title.trim().to_string();
+                    if !title.is_empty() {
+                        items.push(OutlineItem {
+                            ordinal: items.len(),
+                            level: heading_level_number(level),
+                            title,
+                            byte_start,
+                        });
+                    }
+                }
+            }
+            _ => {}
         }
-
-        byte_offset += raw_line.len();
     }
 
     items
 }
 
-fn leading_whitespace_bytes(line: &str) -> usize {
-    line.char_indices()
-        .find_map(|(idx, ch)| if ch.is_whitespace() { None } else { Some(idx) })
-        .unwrap_or(line.len())
+fn heading_level_number(level: HeadingLevel) -> u32 {
+    match level {
+        HeadingLevel::H1 => 1,
+        HeadingLevel::H2 => 2,
+        HeadingLevel::H3 => 3,
+        HeadingLevel::H4 => 4,
+        HeadingLevel::H5 => 5,
+        HeadingLevel::H6 => 6,
+    }
 }
 
-fn heading_prefix(content: &str) -> Option<(usize, usize)> {
-    let bytes = content.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() && bytes[i] == b'#' {
-        i += 1;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_multilevel_headings_in_document_order() {
+        let text = "# Top\n\n## Child\n\n### Leaf\n";
+        let items = parse_outline_items(text);
+
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].ordinal, 0);
+        assert_eq!(items[0].level, 1);
+        assert_eq!(items[0].title, "Top");
+        assert_eq!(items[0].byte_start, text.find("# Top").unwrap());
+        assert_eq!(items[1].ordinal, 1);
+        assert_eq!(items[1].level, 2);
+        assert_eq!(items[1].title, "Child");
+        assert_eq!(items[1].byte_start, text.find("## Child").unwrap());
+        assert_eq!(items[2].ordinal, 2);
+        assert_eq!(items[2].level, 3);
+        assert_eq!(items[2].title, "Leaf");
+        assert_eq!(items[2].byte_start, text.find("### Leaf").unwrap());
     }
-    let hash_count = i;
-    if hash_count == 0 || hash_count > 6 {
-        return None;
+
+    #[test]
+    fn ignores_heading_like_lines_inside_fenced_code() {
+        let text = "# Real\n\n```md\n## Not an outline heading\n```\n\n## Next\n";
+        let items = parse_outline_items(text);
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].title, "Real");
+        assert_eq!(items[1].title, "Next");
+        assert_eq!(items[1].ordinal, 1);
     }
-    if i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        return Some((i, hash_count));
+
+    #[test]
+    fn includes_setext_headings_without_shifting_following_ordinals() {
+        let text = "Document title\n==============\n\n## Section\n";
+        let items = parse_outline_items(text);
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].level, 1);
+        assert_eq!(items[0].title, "Document title");
+        assert_eq!(items[0].byte_start, 0);
+        assert_eq!(items[1].level, 2);
+        assert_eq!(items[1].title, "Section");
+        assert_eq!(items[1].ordinal, 1);
     }
-    None
 }
