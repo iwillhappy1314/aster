@@ -98,7 +98,10 @@ pub fn render_code_block(
   let code_id: SharedString = format!("md-code-{:x}", code as *const CodeBlock as usize).into();
   let code_font = Font {
     family: theme.code_font_family.clone(),
-    ..Default::default()
+    features: Default::default(),
+    fallbacks: None,
+    weight: Default::default(),
+    style: Default::default(),
   };
 
   let mut code_area = div()

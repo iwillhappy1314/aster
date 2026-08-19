@@ -42,9 +42,10 @@ pub fn render_code_reference_card(
   // Build snippet rows.
   let code_font = Font {
     family: theme.code_font_family.clone(),
+    features: Default::default(),
+    fallbacks: None,
     weight: FontWeight::NORMAL,
     style: FontStyle::Normal,
-    ..Default::default()
   };
 
   // Build snippet body: line-number gutter + code text (with optional indentation dots).

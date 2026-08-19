@@ -505,15 +505,18 @@ fn make_text_run(
     font: if ctx.code {
       Font {
         family: theme.code_font_family.clone(),
+        features: Default::default(),
+        fallbacks: None,
         weight: font_weight,
         style: font_style,
-        ..Default::default()
       }
     } else {
       Font {
+        family: ".SystemUIFont".into(),
+        features: Default::default(),
+        fallbacks: None,
         weight: font_weight,
         style: font_style,
-        ..Default::default()
       }
     },
     color,
