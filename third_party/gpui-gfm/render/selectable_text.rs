@@ -3,8 +3,9 @@
 //! When the user drags across the text the selected range is highlighted and
 //! copied to the system clipboard on mouse-up.
 
+use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use gpui::{
   App, ClipboardItem, CursorStyle, DispatchPhase, Element, ElementId, GlobalElementId, Hitbox,
@@ -25,6 +26,26 @@ pub struct LinkRange {
   /// Target URL.
   pub url: String,
 }
+
+#[derive(Clone, Debug)]
+struct CrossBlockSelection {
+  anchor_text_id: usize,
+  anchor: usize,
+  head_text_id: usize,
+  head: usize,
+  dragging: bool,
+  mode: SelectionMode,
+  initial_range: Option<Range<usize>>,
+}
+
+#[derive(Default)]
+struct CrossBlockState {
+  selection: Option<CrossBlockSelection>,
+  texts: HashMap<usize, String>,
+}
+
+static CROSS_BLOCK_SELECTIONS: LazyLock<Mutex<HashMap<usize, CrossBlockState>>> =
+  LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// A text element that supports click-drag selection and clipboard copy.
 ///
@@ -58,6 +79,7 @@ impl SelectableText {
     on_link: Option<Arc<LinkHandlerFn>>,
     text_id: usize,
   ) -> Self {
+    register_cross_block_text(&selection_state, text_id, text.as_ref());
     let styled_text = StyledText::new(text.clone()).with_runs(base_runs.clone());
     Self {
       text,
@@ -73,9 +95,11 @@ impl SelectableText {
 
   /// Rebuild the styled text runs if the selection changed.
   fn ensure_runs_up_to_date(&mut self) {
-    let selection = self
-      .selection_state
-      .selection_range_for(self.text_id, self.text.as_ref());
+    let selection = cross_block_selection_range(
+      &self.selection_state,
+      self.text_id,
+      self.text.as_ref(),
+    );
 
     if selection == self.last_selection {
       return;
@@ -186,112 +210,81 @@ impl Element for SelectableText {
           .unwrap_or_else(|ix| ix);
         let index = clamp_to_char_boundary(text_for_down.as_ref(), index.min(text_len));
 
-        match event.click_count {
+        let (anchor, head, mode, initial_range) = match event.click_count {
           2 => {
-            // Double click → select word.
             let range = word_range_at(text_for_down.as_ref(), index);
-            selection_state.update_with_mode(
-              text_id,
-              range.start,
-              range.end,
-              true,
-              SelectionMode::Word,
-              Some(range),
-            );
+            (range.start, range.end, SelectionMode::Word, Some(range))
           }
           3 => {
-            // Triple click → select line.
             let range = line_range_at(text_for_down.as_ref(), index);
-            selection_state.update_with_mode(
-              text_id,
-              range.start,
-              range.end,
-              true,
-              SelectionMode::Line,
-              Some(range),
-            );
+            (range.start, range.end, SelectionMode::Line, Some(range))
           }
-          _ => {
-            // Single click → character-level anchor.
-            selection_state.update_with_mode(
-              text_id,
-              index,
-              index,
-              true,
-              SelectionMode::Char,
-              None,
-            );
-          }
-        }
+          _ => (index, index, SelectionMode::Char, None),
+        };
 
+        begin_cross_block_selection(
+          &selection_state,
+          CrossBlockSelection {
+            anchor_text_id: text_id,
+            anchor,
+            head_text_id: text_id,
+            head,
+            dragging: true,
+            mode,
+            initial_range,
+          },
+        );
         window.refresh();
         cx.stop_propagation();
       }
     });
 
-    // Mouse-move: extend the selection while dragging.
-    // For word/line mode, extend to the full word/line at the cursor position
-    // while keeping the original anchor word/line intact.
+    // Mouse-move: extend the active selection into whichever text block is hovered.
     let text_for_move = text.clone();
     window.on_mouse_event({
+      let hitbox = hitbox.clone();
       let selection_state = selection_state.clone();
       let text_layout = text_layout.clone();
       move |event: &MouseMoveEvent, phase, window, _cx| {
-        if phase != DispatchPhase::Bubble {
+        if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
           return;
         }
 
-        if let Some(active) = selection_state.selection_for(text_id) {
-          if active.dragging {
-            let index = text_layout
-              .index_for_position(event.position)
-              .unwrap_or_else(|ix| ix);
-            let index = clamp_to_char_boundary(text_for_move.as_ref(), index.min(text_len));
-
-            let (new_anchor, new_head) = match active.mode {
-              SelectionMode::Word => {
-                let initial = active.initial_range.as_ref().unwrap();
-                let current_word = word_range_at(text_for_move.as_ref(), index);
-                if index < initial.start {
-                  // Dragging before initial word → anchor at end of initial, head at start of current.
-                  (initial.end, current_word.start)
-                } else {
-                  // Dragging after or within initial word → anchor at start of initial, head at end of current.
-                  (initial.start, current_word.end)
-                }
-              }
-              SelectionMode::Line => {
-                let initial = active.initial_range.as_ref().unwrap();
-                let current_line = line_range_at(text_for_move.as_ref(), index);
-                if index < initial.start {
-                  (initial.end, current_line.start)
-                } else {
-                  (initial.start, current_line.end)
-                }
-              }
-              SelectionMode::Char => (active.anchor, index),
-            };
-
-            selection_state.update(text_id, new_anchor, new_head, true);
-            window.refresh();
-          }
+        let Some(active) = active_cross_block_selection(&selection_state) else {
+          return;
+        };
+        if !active.dragging {
+          return;
         }
+
+        let index = text_layout
+          .index_for_position(event.position)
+          .unwrap_or_else(|ix| ix);
+        let index = clamp_to_char_boundary(text_for_move.as_ref(), index.min(text_len));
+        let updated = selection_with_head(
+          active,
+          text_id,
+          index,
+          text_for_move.as_ref(),
+          true,
+        );
+        set_cross_block_selection(&selection_state, updated);
+        window.refresh();
       }
     });
 
-    // Mouse-up: finalise selection → copy to clipboard, or handle link click.
+    // Mouse-up: finalise the selection in the text block under the pointer.
     let text_for_up = text.clone();
-    let text_for_copy = text.clone();
     window.on_mouse_event({
       let hitbox = hitbox.clone();
       let selection_state = selection_state.clone();
       let text_layout = text_layout.clone();
       move |event: &MouseUpEvent, phase, window, cx| {
-        if phase != DispatchPhase::Bubble {
+        if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
           return;
         }
 
-        let Some(active) = selection_state.selection_for(text_id) else {
+        let Some(active) = active_cross_block_selection(&selection_state) else {
           return;
         };
         if !active.dragging {
@@ -302,50 +295,22 @@ impl Element for SelectableText {
           .index_for_position(event.position)
           .unwrap_or_else(|ix| ix);
         let index = clamp_to_char_boundary(text_for_up.as_ref(), index.min(text_len));
+        let updated = selection_with_head(active, text_id, index, text_for_up.as_ref(), false);
+        set_cross_block_selection(&selection_state, updated);
 
-        // Snap to word/line boundaries — same logic as mouse-move.
-        let (final_anchor, final_head) = match active.mode {
-          SelectionMode::Word => {
-            let initial = active.initial_range.as_ref().unwrap();
-            let current_word = word_range_at(text_for_up.as_ref(), index);
-            if index < initial.start {
-              (initial.end, current_word.start)
-            } else {
-              (initial.start, current_word.end)
-            }
-          }
-          SelectionMode::Line => {
-            let initial = active.initial_range.as_ref().unwrap();
-            let current_line = line_range_at(text_for_up.as_ref(), index);
-            if index < initial.start {
-              (initial.end, current_line.start)
-            } else {
-              (initial.start, current_line.end)
-            }
-          }
-          SelectionMode::Char => (active.anchor, index),
-        };
-
-        // Stop dragging.
-        selection_state.update(text_id, final_anchor, final_head, false);
-
-        // Check if there's a non-empty selection.
-        if let Some(selected) = selection_state.selected_text(text_id, text_for_copy.as_ref()) {
+        if let Some(selected) = cross_block_selected_text(&selection_state) {
           if !selected.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(selected));
           }
-        } else if hitbox.is_hovered(window) {
-          // Empty selection (click) → handle link.
-          if let Some(link_url) = link_ranges
-            .iter()
-            .find(|lr| lr.range.contains(&index))
-            .map(|lr| lr.url.clone())
-          {
-            if let Some(handler) = &on_link {
-              handler(&link_url, window, cx);
-            } else {
-              cx.open_url(&link_url);
-            }
+        } else if let Some(link_url) = link_ranges
+          .iter()
+          .find(|lr| lr.range.contains(&index))
+          .map(|lr| lr.url.clone())
+        {
+          if let Some(handler) = &on_link {
+            handler(&link_url, window, cx);
+          } else {
+            cx.open_url(&link_url);
           }
         }
 
@@ -358,6 +323,156 @@ impl Element for SelectableText {
       .styled_text
       .paint(None, inspector_id, bounds, &mut (), &mut (), window, cx);
   }
+}
+
+fn selection_state_key(selection_state: &SelectionState) -> usize {
+  Arc::as_ptr(&selection_state.selection) as usize
+}
+
+fn register_cross_block_text(selection_state: &SelectionState, text_id: usize, text: &str) {
+  let key = selection_state_key(selection_state);
+  let mut all = CROSS_BLOCK_SELECTIONS.lock().unwrap();
+  let state = all.entry(key).or_default();
+  // Text IDs restart at zero on every render pass. Rebuild only the text registry;
+  // the logical selection can stay alive across repaints.
+  if text_id == 0 {
+    state.texts.clear();
+  }
+  state.texts.insert(text_id, text.to_string());
+}
+
+fn begin_cross_block_selection(selection_state: &SelectionState, selection: CrossBlockSelection) {
+  set_cross_block_selection(selection_state, selection);
+}
+
+fn set_cross_block_selection(selection_state: &SelectionState, selection: CrossBlockSelection) {
+  let key = selection_state_key(selection_state);
+  CROSS_BLOCK_SELECTIONS
+    .lock()
+    .unwrap()
+    .entry(key)
+    .or_default()
+    .selection = Some(selection);
+}
+
+fn active_cross_block_selection(selection_state: &SelectionState) -> Option<CrossBlockSelection> {
+  let key = selection_state_key(selection_state);
+  CROSS_BLOCK_SELECTIONS
+    .lock()
+    .unwrap()
+    .get(&key)
+    .and_then(|state| state.selection.clone())
+}
+
+fn selection_with_head(
+  mut active: CrossBlockSelection,
+  current_text_id: usize,
+  index: usize,
+  current_text: &str,
+  dragging: bool,
+) -> CrossBlockSelection {
+  match active.mode {
+    SelectionMode::Word => {
+      let initial = active
+        .initial_range
+        .as_ref()
+        .expect("word selection needs initial range");
+      let current = word_range_at(current_text, index);
+      let before_anchor = current_text_id < active.anchor_text_id
+        || (current_text_id == active.anchor_text_id && index < initial.start);
+      active.anchor = if before_anchor { initial.end } else { initial.start };
+      active.head = if before_anchor { current.start } else { current.end };
+    }
+    SelectionMode::Line => {
+      let initial = active
+        .initial_range
+        .as_ref()
+        .expect("line selection needs initial range");
+      let current = line_range_at(current_text, index);
+      let before_anchor = current_text_id < active.anchor_text_id
+        || (current_text_id == active.anchor_text_id && index < initial.start);
+      active.anchor = if before_anchor { initial.end } else { initial.start };
+      active.head = if before_anchor { current.start } else { current.end };
+    }
+    SelectionMode::Char => {
+      active.head = index;
+    }
+  }
+  active.head_text_id = current_text_id;
+  active.dragging = dragging;
+  active
+}
+
+fn cross_block_selection_range(
+  selection_state: &SelectionState,
+  text_id: usize,
+  text: &str,
+) -> Option<Range<usize>> {
+  let active = active_cross_block_selection(selection_state)?;
+  local_cross_block_range(&active, text_id, text)
+}
+
+fn local_cross_block_range(
+  active: &CrossBlockSelection,
+  text_id: usize,
+  text: &str,
+) -> Option<Range<usize>> {
+  let anchor_point = (active.anchor_text_id, active.anchor);
+  let head_point = (active.head_text_id, active.head);
+  if anchor_point == head_point {
+    return None;
+  }
+
+  let ((start_id, start_offset), (end_id, end_offset)) = if anchor_point <= head_point {
+    (anchor_point, head_point)
+  } else {
+    (head_point, anchor_point)
+  };
+  if text_id < start_id || text_id > end_id {
+    return None;
+  }
+
+  let text_len = text.len();
+  let (start, end) = if start_id == end_id {
+    (
+      clamp_to_char_boundary(text, start_offset.min(text_len)),
+      clamp_to_char_boundary(text, end_offset.min(text_len)),
+    )
+  } else if text_id == start_id {
+    (clamp_to_char_boundary(text, start_offset.min(text_len)), text_len)
+  } else if text_id == end_id {
+    (0, clamp_to_char_boundary(text, end_offset.min(text_len)))
+  } else {
+    (0, text_len)
+  };
+
+  (start < end).then_some(start..end)
+}
+
+fn cross_block_selected_text(selection_state: &SelectionState) -> Option<String> {
+  let key = selection_state_key(selection_state);
+  let all = CROSS_BLOCK_SELECTIONS.lock().unwrap();
+  let state = all.get(&key)?;
+  let active = state.selection.as_ref()?;
+  if active.anchor_text_id == active.head_text_id && active.anchor == active.head {
+    return None;
+  }
+
+  let start_id = active.anchor_text_id.min(active.head_text_id);
+  let end_id = active.anchor_text_id.max(active.head_text_id);
+  let mut parts = Vec::new();
+  for text_id in start_id..=end_id {
+    let Some(text) = state.texts.get(&text_id) else {
+      continue;
+    };
+    if let Some(range) = local_cross_block_range(active, text_id, text) {
+      if let Some(slice) = text.get(range) {
+        parts.push(slice.to_string());
+      }
+    }
+  }
+
+  if parts.is_empty() { None } else { Some(parts.join("\n")) }
 }
 
 impl IntoElement for SelectableText {

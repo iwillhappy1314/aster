@@ -49,14 +49,15 @@ pub(crate) fn render_top_level_blocks(
   let mut heading_child_indices = Vec::new();
 
   for (ix, block) in blocks.iter().enumerate() {
-    let mut element = render_block(block, options, 0, cx);
+    let element = render_block(block, options, 0, cx);
+    let mut wrapper = div().w_full().min_w_0().flex_shrink_0();
     if matches!(block, Block::Heading { .. }) {
       heading_child_indices.push(ix);
       if ix > 0 {
-        element = div().mt(px(10.0)).child(element).into_any_element();
+        wrapper = wrapper.mt(px(10.0));
       }
     }
-    elements.push(element);
+    elements.push(wrapper.child(element).into_any_element());
   }
 
   (elements, heading_child_indices)

@@ -97,19 +97,22 @@ impl DocumentState {
         self.clear_selection();
     }
 
-    pub fn set_selection(&mut self, start: usize, end: usize) {
-        let (start, end) = if start <= end {
-            (start, end)
+    pub fn set_selection(&mut self, anchor: usize, head: usize) {
+        let len = self.len_chars();
+        let anchor = anchor.min(len);
+        let head = head.min(len);
+        let (start, end) = if anchor <= head {
+            (anchor, head)
         } else {
-            (end, start)
+            (head, anchor)
         };
         self.selection = if start == end {
             None
         } else {
-            Some(start.min(self.len_chars())..end.min(self.len_chars()))
+            Some(start..end)
         };
-        self.cursor = end.min(self.len_chars());
-        self.selection_anchor = Some(start.min(self.len_chars()));
+        self.cursor = head;
+        self.selection_anchor = Some(anchor);
     }
 
     pub fn clear_selection(&mut self) {
@@ -275,7 +278,9 @@ impl DocumentState {
             self.rope = Rope::from_str(&op.old_text);
             self.cursor = op.old_cursor.min(self.rope.len_chars());
             self.selection = op.old_selection;
-            self.selection_anchor = self.selection.as_ref().map(|r| r.start);
+            self.selection_anchor = self.selection.as_ref().map(|r| {
+                if self.cursor <= r.start { r.end } else { r.start }
+            });
             self.bump_revision();
             self.word_count_cache = None;
             // Update dirty state: dirty if current content differs from saved
@@ -292,7 +297,9 @@ impl DocumentState {
             self.rope = Rope::from_str(&op.new_text);
             self.cursor = op.new_cursor.min(self.rope.len_chars());
             self.selection = op.new_selection;
-            self.selection_anchor = self.selection.as_ref().map(|r| r.start);
+            self.selection_anchor = self.selection.as_ref().map(|r| {
+                if self.cursor <= r.start { r.end } else { r.start }
+            });
             self.bump_revision();
             self.word_count_cache = None;
             // Update dirty state: dirty if current content differs from saved
@@ -319,5 +326,27 @@ impl DocumentState {
     #[allow(dead_code)]
     pub fn can_redo(&self) -> bool {
         self.undo_history.can_redo()
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_reverse_selection_direction() {
+        let mut doc = DocumentState::new_empty();
+        doc.set_text("abcdef");
+        doc.set_selection(5, 2);
+
+        assert_eq!(doc.selection_range(), Some(2..5));
+        assert_eq!(doc.selection_anchor, Some(5));
+        assert_eq!(doc.cursor, 2);
+
+        let anchor = doc.selection_anchor.unwrap();
+        doc.set_selection(anchor, 1);
+        assert_eq!(doc.selection_range(), Some(1..5));
+        assert_eq!(doc.selection_anchor, Some(5));
+        assert_eq!(doc.cursor, 1);
     }
 }
