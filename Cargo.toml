@@ -26,7 +26,8 @@ thiserror = "2.0.17"
 toml = "0.9.10"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.22"
-gpui-component = { path = "third_party/gpui-component-gfm" }
+gpui-component = "0.4.2"
+gpui-gfm = { path = "third_party/gpui-gfm" }
 url = "2.5.7"
 futures = "0.3.31"
 
