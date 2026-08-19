@@ -57,7 +57,10 @@ VERSION=$(grep '^version' "$ROOT_DIR/Cargo.toml" | head -1 | sed 's/.*"\(.*\)".*
 
 rustup target add "$RUST_TARGET" >/dev/null 2>&1 || true
 
-cargo build \
+# The Quick Look bridge is a standalone Cargo package. Force it to use the
+# same target directory as the main Aster build so the library path below is
+# deterministic and universal packaging can find both architecture outputs.
+CARGO_TARGET_DIR="$TARGET_DIR" cargo build \
     --release \
     --manifest-path "$RUST_MANIFEST" \
     --target "$RUST_TARGET"
