@@ -44,7 +44,7 @@ jobs:
 
       - name: Commit vendored renderer
         run: |
-          if ! git diff --quiet -- third_party/gpui-gfm; then
+          if [[ -n "$(git status --porcelain -- third_party/gpui-gfm)" ]]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add third_party/gpui-gfm
