@@ -1,9 +1,9 @@
 name: PR9 Layout Sync Fix
 
 on:
-  pull_request:
+  push:
     branches:
-      - main
+      - agent/editor-outline-active-sync
 
 permissions:
   contents: write
