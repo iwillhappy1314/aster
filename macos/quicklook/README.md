@@ -1,6 +1,6 @@
 # Aster Quick Look
 
-Aster ships a Finder Quick Look preview extension for Markdown files. The extension uses a small Swift `WKWebView` shell, but Markdown semantics stay in Rust:
+Aster ships a Finder Quick Look preview extension for Markdown files. Markdown semantics stay in Rust and Finder receives HTML through Quick Look's data-based preview API:
 
 ```text
 Markdown
@@ -8,10 +8,13 @@ Markdown
      -> GPUI renderer (Aster)
      -> HTML renderer (Quick Look)
         -> C ABI
-        -> WKWebView
+        -> QLPreviewProvider / QLPreviewReply(.html)
+        -> Finder Quick Look
 ```
 
 The `gpui-gfm` dependency is built with `default-features = false, features = ["html"]` for Quick Look, so the extension does not link GPUI or Metal.
+
+The data-based Quick Look API used by the extension requires macOS 12 or newer. This only changes the Quick Look extension deployment target; the containing Aster app keeps its own deployment configuration.
 
 ## Build the extension
 
@@ -35,7 +38,7 @@ ASTER_CODESIGN_IDENTITY="Developer ID Application: Example (TEAMID)" \
 
 ## Local images
 
-Quick Look gives the extension direct access to the selected Markdown file, but Markdown commonly references sibling assets. The current extension therefore carries a read-only temporary file exception so relative images work from the preview. This is appropriate for the current direct-distribution build; a future Mac App Store build should replace it with a narrower attachment/security-scoped asset strategy.
+The initial data-based preview returns self-contained HTML. Local relative Markdown images are not attached yet. They should be implemented with `QLPreviewReplyAttachment` and `cid:` references rather than broad filesystem access.
 
 ## Refresh during development
 
