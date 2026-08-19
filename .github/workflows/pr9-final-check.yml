@@ -1,0 +1,17 @@
+name: PR9 Final Check
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test Outline helpers
+        run: cargo test ui::file_explorer::tests --bin Aster
+      - name: Cargo check
+        run: cargo check
