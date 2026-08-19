@@ -87,11 +87,10 @@ xcrun swiftc \
     -application-extension \
     -module-name AsterQuickLook \
     -I "$SOURCE_DIR" \
-    "$SOURCE_DIR/PreviewViewController.swift" \
+    "$SOURCE_DIR/PreviewProvider.swift" \
     "$RUST_LIB" \
     -framework Cocoa \
-    -framework Quartz \
-    -framework WebKit \
+    -framework QuickLookUI \
     -Xlinker -e \
     -Xlinker _NSExtensionMain \
     -o "$EXECUTABLE"
