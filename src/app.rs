@@ -161,11 +161,13 @@ pub fn run() {
                     .and_then(|windows| windows.first().copied())
             });
 
-            if let Some(window) = target_window
-                && let Some(handle) = window.downcast::<RootView>()
-            {
-                let _ = handle.update(cx, |root, window, cx| {
-                    root.action_close_window(window, cx);
+            if let Some(window) = target_window {
+                cx.defer(move |cx| {
+                    if let Some(handle) = window.downcast::<RootView>() {
+                        let _ = handle.update(cx, |root, window, cx| {
+                            root.action_close_window(window, cx);
+                        });
+                    }
                 });
             }
         });
