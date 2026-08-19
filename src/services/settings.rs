@@ -6,6 +6,15 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+/// Side of the editor where the document Outline is displayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OutlinePosition {
+    Left,
+    #[default]
+    Right,
+}
+
 /// Application settings with persistence
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -15,6 +24,9 @@ pub struct Settings {
     /// Active color theme.
     #[serde(default = "default_theme_name")]
     pub theme_name: ThemeName,
+    /// Side of the editor where the Outline is displayed.
+    #[serde(default)]
+    pub outline_position: OutlinePosition,
     /// Last valid normal-window geometry, restored on the next launch.
     #[serde(default)]
     pub window_geometry: Option<WindowGeometry>,
@@ -72,6 +84,7 @@ impl Default for Settings {
         Self {
             font_size: default_font_size(),
             theme_name: default_theme_name(),
+            outline_position: OutlinePosition::default(),
             window_geometry: None,
         }
     }
@@ -157,6 +170,21 @@ pub fn settings() -> Arc<Mutex<SettingsManager>> {
     SETTINGS.clone()
 }
 
+/// Get the persisted Outline position.
+pub fn get_outline_position() -> OutlinePosition {
+    settings()
+        .lock()
+        .map(|s| s.get().outline_position)
+        .unwrap_or_default()
+}
+
+/// Persist the side where the Outline should be rendered.
+pub fn set_outline_position(position: OutlinePosition) {
+    if let Ok(mut manager) = settings().lock() {
+        manager.update(|s| s.outline_position = position);
+    }
+}
+
 /// Convenience function to get current font size
 pub fn get_font_size() -> f32 {
     settings()
@@ -213,8 +241,13 @@ pub fn set_window_bounds(bounds: Bounds<Pixels>) {
 
 #[cfg(test)]
 mod tests {
-    use super::WindowGeometry;
+    use super::{OutlinePosition, WindowGeometry};
     use gpui::{Bounds, point, px, size};
+
+    #[test]
+    fn outline_position_defaults_to_right() {
+        assert_eq!(OutlinePosition::default(), OutlinePosition::Right);
+    }
 
     #[test]
     fn window_geometry_round_trips_valid_bounds() {
