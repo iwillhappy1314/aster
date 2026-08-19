@@ -38,50 +38,31 @@ final class PreviewViewController: NSViewController, QLPreviewingController, WKN
         view.addSubview(webView)
     }
 
+    // Quick Look invokes this through the Objective-C QLPreviewingController
+    // selector. Export it explicitly because this extension is compiled with
+    // swiftc directly rather than through an Xcode target.
+    @objc(preparePreviewOfFileAtURL:completionHandler:)
     func preparePreviewOfFile(
         at url: URL,
         completionHandler handler: @escaping (Error?) -> Void
     ) {
-        NSLog("AsterQuickLook: preparing %@", url.path)
+        NSLog("AsterQuickLook: callback preparing %@", url.path)
 
         do {
-            // Accessing `view` forces NSViewController to load it on macOS 11+.
-            _ = view
-            removeTemporaryPreview()
-
-            let markdown = try String(contentsOf: url, encoding: .utf8)
-            let renderedHTML: String = try markdown.withCString { source in
-                guard let rendered = aster_markdown_to_html(source) else {
-                    throw PreviewError.renderFailed
-                }
-                defer { aster_string_free(rendered) }
-                return String(cString: rendered)
-            }
-
-            let documentDirectory = URL(
-                fileURLWithPath: url.deletingLastPathComponent().path,
-                isDirectory: true
-            )
-            let html = insertingBaseURL(documentDirectory, into: renderedHTML)
-            let htmlURL = try writeTemporaryHTML(html)
-            previewHTMLURL = htmlURL
-
-            // Loading a real file gives WebKit an explicit file read scope.
-            // Quick Look shows a spinner until the completion handler is called,
-            // so do not wait for WKNavigationDelegate.didFinish here. The view is
-            // ready once navigation has successfully been started; WebKit can
-            // finish painting after Quick Look presents the controller.
-            let readAccessRoot = URL(fileURLWithPath: "/", isDirectory: true)
-            guard webView.loadFileURL(htmlURL, allowingReadAccessTo: readAccessRoot) != nil else {
-                throw PreviewError.renderFailed
-            }
-
-            NSLog("AsterQuickLook: WebView navigation started")
+            try preparePreview(at: url)
             handler(nil)
         } catch {
-            NSLog("AsterQuickLook: prepare failed: %@", String(describing: error))
+            NSLog("AsterQuickLook: callback prepare failed: %@", String(describing: error))
             handler(error)
         }
+    }
+
+    // Newer SDKs also expose the protocol requirement as a Swift concurrency
+    // overlay. Implement it as well so either dispatch path reaches the same
+    // preparation logic.
+    func preparePreviewOfFile(at url: URL) async throws {
+        NSLog("AsterQuickLook: async preparing %@", url.path)
+        try preparePreview(at: url)
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -120,6 +101,37 @@ final class PreviewViewController: NSViewController, QLPreviewingController, WKN
 
         NSWorkspace.shared.open(url)
         decisionHandler(.cancel)
+    }
+
+    private func preparePreview(at url: URL) throws {
+        // Accessing `view` forces NSViewController to load it on macOS 11+.
+        _ = view
+        removeTemporaryPreview()
+
+        let markdown = try String(contentsOf: url, encoding: .utf8)
+        let renderedHTML: String = try markdown.withCString { source in
+            guard let rendered = aster_markdown_to_html(source) else {
+                throw PreviewError.renderFailed
+            }
+            defer { aster_string_free(rendered) }
+            return String(cString: rendered)
+        }
+
+        let documentDirectory = URL(
+            fileURLWithPath: url.deletingLastPathComponent().path,
+            isDirectory: true
+        )
+        let html = insertingBaseURL(documentDirectory, into: renderedHTML)
+        let htmlURL = try writeTemporaryHTML(html)
+        previewHTMLURL = htmlURL
+
+        // Loading a real file gives WebKit an explicit file read scope.
+        let readAccessRoot = URL(fileURLWithPath: "/", isDirectory: true)
+        guard webView.loadFileURL(htmlURL, allowingReadAccessTo: readAccessRoot) != nil else {
+            throw PreviewError.renderFailed
+        }
+
+        NSLog("AsterQuickLook: WebView navigation started")
     }
 
     private func writeTemporaryHTML(_ html: String) throws -> URL {
