@@ -19,6 +19,8 @@ use std::time::Duration;
 
 const CARET_WIDTH: f32 = 2.0;
 
+pub type OutlineViewportCallback = Arc<dyn Fn(usize, &mut App)>;
+
 struct SearchCache {
     revision: u64,
     query: String,
@@ -191,6 +193,10 @@ pub struct EditorView {
     pending_scroll_to_byte: Option<usize>,
     /// Outline target that should be aligned near the top after layout.
     pending_outline_reveal_byte: Option<usize>,
+    /// Reports the source byte crossing the editor viewport activation line.
+    on_outline_viewport_change: Option<OutlineViewportCallback>,
+    /// Last viewport position reported, keyed by document revision.
+    last_outline_viewport_report: Option<(u64, usize)>,
 }
 
 impl EditorView {
@@ -214,6 +220,8 @@ impl EditorView {
             cached_search: None,
             pending_scroll_to_byte: None,
             pending_outline_reveal_byte: None,
+            on_outline_viewport_change: None,
+            last_outline_viewport_report: None,
         }
     }
 
@@ -272,6 +280,50 @@ impl EditorView {
         self.pending_scroll_to_byte = None;
         self.pending_outline_reveal_byte = Some(byte);
         cx.notify();
+    }
+
+    pub fn set_on_outline_viewport_change(&mut self, callback: OutlineViewportCallback) {
+        self.on_outline_viewport_change = Some(callback);
+        self.last_outline_viewport_report = None;
+    }
+
+    fn sync_outline_viewport(
+        &mut self,
+        text_layout: &gpui::TextLayout,
+        projection: &DisplayProjection,
+        doc_revision: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(callback) = self.on_outline_viewport_change.clone() else {
+            return;
+        };
+
+        let viewport = self.scroll_handle.bounds();
+        if viewport.size.height <= px(0.) {
+            return;
+        }
+
+        let activation_point = point(viewport.left() + px(32.), viewport.top() + px(32.));
+        let display_byte = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            text_layout.index_for_position(activation_point)
+        }))
+        .ok()
+        .map(|result| match result {
+            Ok(index) => index,
+            Err(index) => index,
+        });
+        let Some(display_byte) = display_byte else {
+            return;
+        };
+
+        let source_byte = projection.display_to_source_byte(display_byte);
+        let report = (doc_revision, source_byte);
+        if self.last_outline_viewport_report == Some(report) {
+            return;
+        }
+
+        self.last_outline_viewport_report = Some(report);
+        callback(source_byte, cx);
     }
 
     fn selection_highlights(&self, doc: &DocumentState) -> Vec<(Range<usize>, HighlightStyle)> {
@@ -640,7 +692,12 @@ impl Render for EditorView {
         }
 
         let text_layout = styled.layout().clone();
+        let had_pending_reveal =
+            self.pending_outline_reveal_byte.is_some() || self.pending_scroll_to_byte.is_some();
         self.reveal_pending_byte(&text_layout, projection.as_ref(), window);
+        if !had_pending_reveal {
+            self.sync_outline_viewport(&text_layout, projection.as_ref(), doc_revision, cx);
+        }
         let has_multiple_lines = text_owned.lines().nth(1).is_some();
         let editor_scroll_handle = self.scroll_handle.clone();
         let show_scroll_indicator = self.scroll_indicator_visible;

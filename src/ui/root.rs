@@ -450,6 +450,17 @@ impl Render for RootView {
             let _ = self
                 .file_explorer_view
                 .update(cx, |view, _| view.set_on_reveal(callback));
+
+            let file_explorer = self.file_explorer_view.clone();
+            let viewport_callback: crate::ui::editor::OutlineViewportCallback =
+                std::sync::Arc::new(move |byte_start, cx: &mut App| {
+                    let _ = file_explorer.update(cx, |view, cx| {
+                        view.set_active_outline_for_byte(byte_start, cx);
+                    });
+                });
+            let _ = self.editor_view.update(cx, |view, _| {
+                view.set_on_outline_viewport_change(viewport_callback);
+            });
         }
 
         let (doc_path, doc_dirty, doc_revision) = {

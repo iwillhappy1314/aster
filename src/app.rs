@@ -217,7 +217,11 @@ pub fn run() {
 /// repaints every open window with the new palette.
 fn apply_theme(name: ThemeName, cx: &mut App) {
     let is_dark = crate::ui::theme::set_theme(name);
-    let mode = if is_dark { ThemeMode::Dark } else { ThemeMode::Light };
+    let mode = if is_dark {
+        ThemeMode::Dark
+    } else {
+        ThemeMode::Light
+    };
     ComponentTheme::change(mode, None, cx);
     for window in cx.windows() {
         let _ = window.update(cx, |_, window, _| window.refresh());
