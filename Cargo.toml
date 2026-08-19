@@ -30,13 +30,6 @@ gpui-component = { path = "third_party/gpui-component-gfm" }
 url = "2.5.7"
 futures = "0.3.31"
 
-# gpui-gfm was developed against this exact Zed/GPUI revision. Its package
-# version is still 0.2.2, but this revision contains API changes that are not
-# present in the crates.io 0.2.2 release. Patch every crates.io GPUI consumer
-# (Aster, gpui-component and the vendored gpui-gfm) to one identical source.
-[patch.crates-io]
-gpui = { git = "https://github.com/zed-industries/zed", rev = "ceb9d83dd73038246192be4bcdfffbecba457206" }
-
 [package.metadata.bundle]
 identifier = "com.kumarujjawal.aster"
 name = "Aster"
