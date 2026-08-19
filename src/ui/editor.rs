@@ -4,7 +4,7 @@ use crate::model::inline_markdown::InlineMarkdownState;
 use crate::services::settings;
 use crate::services::syntax::{SyntaxKind, SyntaxSpan};
 use crate::ui::text_utils::ellipsize_chars;
-use crate::ui::theme::Theme;
+use crate::ui::theme::{MarkdownStyle, Theme};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     App, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontStyle, FontWeight,
@@ -256,7 +256,10 @@ impl EditorView {
 
     /// Scrolls the editor so the current cursor is visible.
     pub fn reveal_cursor(&mut self, cx: &mut Context<Self>) {
-        let byte = self.document.read(cx).char_to_byte(self.document.read(cx).cursor);
+        let byte = self
+            .document
+            .read(cx)
+            .char_to_byte(self.document.read(cx).cursor);
         self.pending_scroll_to_byte = Some(byte);
         cx.notify();
     }
@@ -276,12 +279,16 @@ impl EditorView {
     fn inline_syntax_highlights(
         &self,
         spans: &[SyntaxSpan],
+        markdown_style: MarkdownStyle,
     ) -> Vec<(Range<usize>, HighlightStyle)> {
         spans
             .iter()
             .map(|span| {
                 let hide_markers = is_inline_hidden_kind(span.kind);
-                (span.range.clone(), syntax_style(span.kind, hide_markers))
+                (
+                    span.range.clone(),
+                    syntax_style(span.kind, hide_markers, markdown_style),
+                )
             })
             .collect()
     }
@@ -541,6 +548,7 @@ impl Render for EditorView {
             .clone();
 
         let is_focused = focus_handle.is_focused(window);
+        let markdown_style = Theme::markdown_style();
 
         // Use cached text if revision hasn't changed to avoid O(n) rope conversion.
         let (text_owned, doc_revision) = {
@@ -575,8 +583,9 @@ impl Render for EditorView {
             inline_spans.as_ref(),
         ));
         let cursor_display_byte = projection.source_to_display_byte(cursor_source_byte);
-        let syntax_highlights =
-            projection.project_highlights(self.inline_syntax_highlights(inline_spans.as_ref()));
+        let syntax_highlights = projection.project_highlights(
+            self.inline_syntax_highlights(inline_spans.as_ref(), markdown_style),
+        );
         let (search_highlights, search_match_count) =
             self.search_highlights(&text_owned, doc_revision);
         let search_highlights = projection.project_highlights(search_highlights);
@@ -632,7 +641,7 @@ impl Render for EditorView {
                     .pr(px(32.))
                     .py(px(24.))
                     .text_size(px(settings::get_font_size()))
-                    .text_color(Theme::text())
+                    .text_color(markdown_style.foreground)
                     .font_family("Menlo")
                     .overflow_y_scroll()
                     .overflow_x_hidden()
@@ -1143,14 +1152,18 @@ impl Render for EditorView {
     }
 }
 
-fn syntax_style(kind: SyntaxKind, hide_markers: bool) -> HighlightStyle {
+fn syntax_style(
+    kind: SyntaxKind,
+    hide_markers: bool,
+    markdown_style: MarkdownStyle,
+) -> HighlightStyle {
     if hide_markers {
         let hidden_color = match kind {
-            SyntaxKind::InlineCodeMarker => Theme::code_block_bg(),
+            SyntaxKind::InlineCodeMarker => markdown_style.code_background,
             _ => Theme::panel(),
         };
         let hidden_background = match kind {
-            SyntaxKind::InlineCodeMarker => Some(Theme::code_block_bg().into()),
+            SyntaxKind::InlineCodeMarker => Some(markdown_style.code_background.into()),
             _ => None,
         };
         return HighlightStyle {
@@ -1162,53 +1175,52 @@ fn syntax_style(kind: SyntaxKind, hide_markers: bool) -> HighlightStyle {
 
     match kind {
         SyntaxKind::HeadingMarker => HighlightStyle {
-            color: Some(Theme::muted().into()),
+            color: Some(markdown_style.muted_foreground.into()),
             font_weight: Some(FontWeight::BOLD),
             ..Default::default()
         },
         SyntaxKind::HeadingText => HighlightStyle {
-            color: Some(Theme::accent().into()),
+            color: Some(markdown_style.foreground.into()),
             font_weight: Some(FontWeight::BOLD),
             ..Default::default()
         },
         SyntaxKind::QuoteMarker => HighlightStyle {
-            color: Some(Theme::muted().into()),
+            color: Some(markdown_style.muted_foreground.into()),
             ..Default::default()
         },
         SyntaxKind::ListMarker | SyntaxKind::TaskMarker => HighlightStyle {
-            color: Some(Theme::accent().into()),
-            font_weight: Some(FontWeight::BOLD),
+            color: Some(markdown_style.foreground.into()),
             ..Default::default()
         },
         SyntaxKind::CodeFence => HighlightStyle {
-            color: Some(Theme::muted().into()),
+            color: Some(markdown_style.muted_foreground.into()),
             ..Default::default()
         },
         SyntaxKind::InlineCodeMarker | SyntaxKind::InlineCode => HighlightStyle {
-            color: Some(gpui::rgb(0x1f6f8b).into()),
-            background_color: Some(hsla_with_alpha(Theme::code_block_bg(), 1.0)),
+            color: Some(markdown_style.foreground.into()),
+            background_color: Some(markdown_style.code_background.into()),
             ..Default::default()
         },
         SyntaxKind::LinkTextDelimiter | SyntaxKind::LinkUrlDelimiter => HighlightStyle {
-            color: Some(Theme::muted().into()),
+            color: Some(markdown_style.muted_foreground.into()),
             ..Default::default()
         },
         SyntaxKind::LinkText => HighlightStyle {
-            color: Some(Theme::accent().into()),
+            color: Some(markdown_style.link.into()),
             underline: Some(UnderlineStyle {
                 thickness: px(1.),
-                color: Some(Theme::accent().into()),
+                color: Some(markdown_style.link.into()),
                 wavy: false,
             }),
             ..Default::default()
         },
         SyntaxKind::LinkUrl => HighlightStyle {
-            color: Some(Theme::muted().into()),
+            color: Some(markdown_style.muted_foreground.into()),
             font_style: Some(FontStyle::Italic),
             ..Default::default()
         },
         SyntaxKind::EmphasisMarker => HighlightStyle {
-            color: Some(Theme::muted().into()),
+            color: Some(markdown_style.muted_foreground.into()),
             ..Default::default()
         },
         SyntaxKind::EmphasisText => HighlightStyle {

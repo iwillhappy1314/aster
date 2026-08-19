@@ -87,6 +87,18 @@ pub struct ThemeColors {
     pub is_dark: bool,
 }
 
+/// Shared Markdown colors used by both the inline editor and rendered preview.
+#[derive(Debug, Clone, Copy)]
+pub struct MarkdownStyle {
+    pub foreground: Rgba,
+    pub muted_foreground: Rgba,
+    pub background: Rgba,
+    pub code_background: Rgba,
+    pub border: Rgba,
+    pub link: Rgba,
+    pub accent: Rgba,
+}
+
 /// Namespace for accessing the current theme's colors. The active theme is
 /// cached globally and refreshed by [`set_theme`], so these accessors can be
 /// called from any render path.
@@ -132,6 +144,20 @@ impl Theme {
     }
     pub fn selection_bg() -> Rgba {
         current_colors().selection_bg
+    }
+
+    /// Markdown colors shared by the editor's inline styling and the preview renderer.
+    pub fn markdown_style() -> MarkdownStyle {
+        let colors = current_colors();
+        MarkdownStyle {
+            foreground: colors.text,
+            muted_foreground: colors.muted,
+            background: colors.bg,
+            code_background: colors.code_block_bg,
+            border: colors.border,
+            link: colors.accent,
+            accent: colors.accent,
+        }
     }
 }
 

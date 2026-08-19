@@ -680,14 +680,15 @@ impl Render for RootView {
                         let preview_scroll_handle = self.preview_scroll_handle.clone();
                         let has_multiple_lines = doc_text.lines().nth(1).is_some();
                         let show_preview_scroll_indicator = self.preview_scroll_indicator_visible;
+                        let markdown_style = Theme::markdown_style();
                         let markdown_theme = MarkdownTheme {
-                            foreground: Theme::text().into(),
-                            muted_foreground: Theme::muted().into(),
-                            background: Theme::bg().into(),
-                            code_background: Theme::code_block_bg().into(),
-                            border: Theme::border().into(),
-                            link: Theme::accent().into(),
-                            accent: Theme::accent().into(),
+                            foreground: markdown_style.foreground.into(),
+                            muted_foreground: markdown_style.muted_foreground.into(),
+                            background: markdown_style.background.into(),
+                            code_background: markdown_style.code_background.into(),
+                            border: markdown_style.border.into(),
+                            link: markdown_style.link.into(),
+                            accent: markdown_style.accent.into(),
                             code_font_family: "Menlo".into(),
                             is_dark: Theme::is_dark(),
                         };
