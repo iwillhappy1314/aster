@@ -59,22 +59,17 @@ jobs:
               raise SystemExit("expected RootView preview fields not found")
           text = text.replace(old_fields, new_fields, 1)
 
-          old_init = '''            preview_scroll_indicator_visible: false,
-              preview_scroll_indicator_revision: 0,
-          }'''
-          new_init = '''            preview_scroll_indicator_visible: false,
-              preview_scroll_indicator_revision: 0,
-              preview_markdown_options: MarkdownRenderOptions::default(),
-              preview_markdown_cache: MarkdownCache::default(),
-          }'''
-          if old_init not in text:
-              raise SystemExit("expected RootView preview initialization not found")
-          text = text.replace(old_init, new_init, 1)
+          init_marker = "            preview_scroll_indicator_revision: 0,\n"
+          init_replacement = init_marker + (
+              "            preview_markdown_options: MarkdownRenderOptions::default(),\n"
+              "            preview_markdown_cache: MarkdownCache::default(),\n"
+          )
+          if text.count(init_marker) != 1:
+              raise SystemExit(f"expected one preview init marker, found {text.count(init_marker)}")
+          text = text.replace(init_marker, init_replacement, 1)
 
-          marker = '''                        let show_preview_scroll_indicator = self.preview_scroll_indicator_visible;
-          '''
-          insertion = '''                        let show_preview_scroll_indicator = self.preview_scroll_indicator_visible;
-                          let markdown_theme = MarkdownTheme {
+          marker = "                        let show_preview_scroll_indicator = self.preview_scroll_indicator_visible;\n"
+          insertion = marker + '''                        let markdown_theme = MarkdownTheme {
                               foreground: Theme::text().into(),
                               muted_foreground: Theme::muted().into(),
                               background: Theme::bg().into(),
@@ -96,8 +91,8 @@ jobs:
                               cx,
                           );
           '''
-          if marker not in text:
-              raise SystemExit("expected preview block marker not found")
+          if text.count(marker) != 1:
+              raise SystemExit(f"expected one preview block marker, found {text.count(marker)}")
           text = text.replace(marker, insertion, 1)
 
           preview_pattern = re.compile(
