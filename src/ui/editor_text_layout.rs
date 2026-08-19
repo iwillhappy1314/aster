@@ -1,8 +1,6 @@
 use crate::services::syntax::markdown_heading_level;
-use gpui::{
-    AnyElement, HighlightStyle, Pixels, Point, StyledText, div, prelude::*, px,
-};
-use gpui_gfm::{heading_font_size_px, heading_font_weight};
+use gpui::{AnyElement, HighlightStyle, Pixels, Point, StyledText, div, prelude::*, px};
+use gpui_gfm::{heading_font_size, heading_font_weight};
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 
@@ -135,18 +133,16 @@ pub fn render_editor_text(
 
         let layout = styled.layout().clone();
         let heading_level = heading_levels.get(line_index).copied().flatten();
-        let font_size = heading_level
-            .map(heading_font_size_px)
-            .unwrap_or(body_font_size);
 
-        let mut line = div()
-            .w_full()
-            .min_w_0()
-            .text_size(px(font_size))
-            .child(styled);
+        let mut line = div().w_full().min_w_0();
         if let Some(level) = heading_level {
-            line = line.font_weight(heading_font_weight(level));
+            line = line
+                .text_size(heading_font_size(level))
+                .font_weight(heading_font_weight(level));
+        } else {
+            line = line.text_size(px(body_font_size));
         }
+        line = line.child(styled);
 
         container = container.child(line);
         layouts.push(EditorLineLayout {
