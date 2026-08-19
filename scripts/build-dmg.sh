@@ -1,169 +1,202 @@
 #!/bin/bash
-# build-dmg.sh - Build DMG installer for Aster
+# build-dmg.sh - Build Aster and embed the Markdown Quick Look extension.
 # Usage: ./scripts/build-dmg.sh [arm64|x86_64|universal]
 
-set -e
+set -euo pipefail
 
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+BLUE='\033[1;34m'
+NC='\033[0m'
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT_DIR"
 
 APP_NAME="Aster"
-BUNDLE_ID="com.kumarujjawal.aster"
 VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+SIGN_IDENTITY="${ASTER_CODESIGN_IDENTITY:--}"
 
-echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BLUE}  Building ${APP_NAME} v${VERSION} DMG Installer${NC}"
-echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-
-# Get cargo target directory (respects CARGO_TARGET_DIR and .cargo/config.toml)
 get_target_dir() {
-    # Check if cargo can tell us
-    if command -v cargo &> /dev/null; then
-        local target_dir=$(cargo metadata --format-version=1 2>/dev/null | grep -o '"target_directory":"[^"]*"' | cut -d'"' -f4)
+    if command -v cargo >/dev/null 2>&1; then
+        local target_dir
+        target_dir=$(cargo metadata --format-version=1 2>/dev/null \
+            | grep -o '"target_directory":"[^"]*"' \
+            | head -1 \
+            | cut -d'"' -f4 || true)
         if [ -n "$target_dir" ]; then
             echo "$target_dir"
             return
         fi
     fi
-    # Fallback to default
-    echo "target"
+    echo "$ROOT_DIR/target"
 }
 
-TARGET_DIR=$(get_target_dir)
+TARGET_DIR="$(get_target_dir)"
+
+bundle_executable() {
+    local bundle="$1"
+    local name
+    name=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$bundle/Contents/Info.plist" 2>/dev/null || true)
+    if [ -z "$name" ]; then
+        name="$APP_NAME"
+    fi
+    echo "$bundle/Contents/MacOS/$name"
+}
+
+sign_app_bundle() {
+    local app="$1"
+    local appex="$app/Contents/PlugIns/AsterQuickLook.appex"
+    local sign_args=(--force --sign "$SIGN_IDENTITY")
+
+    if [ "$SIGN_IDENTITY" != "-" ]; then
+        sign_args+=(--options runtime --timestamp)
+    fi
+
+    if [ -d "$appex" ]; then
+        codesign \
+            "${sign_args[@]}" \
+            --entitlements "$ROOT_DIR/macos/quicklook/AsterQuickLook.entitlements" \
+            "$appex"
+    fi
+
+    codesign "${sign_args[@]}" "$app"
+    codesign --verify --deep --strict --verbose=1 "$app"
+}
+
+embed_quicklook() {
+    local app="$1"
+    local arch="$2"
+    local appex
+    appex=$("$ROOT_DIR/scripts/build-quicklook.sh" "$arch" | tail -1)
+
+    if [ ! -d "$appex" ]; then
+        echo -e "${RED}Quick Look extension not found: $appex${NC}" >&2
+        exit 1
+    fi
+
+    mkdir -p "$app/Contents/PlugIns"
+    rm -rf "$app/Contents/PlugIns/AsterQuickLook.appex"
+    cp -R "$appex" "$app/Contents/PlugIns/AsterQuickLook.appex"
+    sign_app_bundle "$app"
+}
+
+create_dmg() {
+    local app_dir="$1"
+    local suffix="$2"
+    local dmg_name="${APP_NAME}-${suffix}.dmg"
+    local app_path="${app_dir}/${APP_NAME}.app"
+    local dmg_temp="${TARGET_DIR}/dmg-temp-${suffix}"
+
+    echo -e "\n${BLUE}Creating DMG: ${dmg_name}...${NC}"
+
+    rm -rf "$dmg_temp"
+    mkdir -p "$dmg_temp"
+    cp -R "$app_path" "$dmg_temp/"
+    ln -s /Applications "$dmg_temp/Applications"
+    rm -f "$dmg_name"
+
+    hdiutil create \
+        -volname "$APP_NAME" \
+        -srcfolder "$dmg_temp" \
+        -ov \
+        -format UDZO \
+        "$dmg_name"
+
+    rm -rf "$dmg_temp"
+    echo -e "${GREEN}Created: ${dmg_name} ($(du -h "$dmg_name" | cut -f1))${NC}"
+}
+
+build_arch() {
+    local arch="$1"
+    local rust_target
+    local suffix
+
+    case "$arch" in
+        arm64|aarch64)
+            rust_target="aarch64-apple-darwin"
+            suffix="arm64"
+            ;;
+        x86_64|intel)
+            rust_target="x86_64-apple-darwin"
+            suffix="x86_64"
+            ;;
+        *)
+            echo -e "${RED}Unknown architecture: $arch${NC}" >&2
+            exit 1
+            ;;
+    esac
+
+    echo -e "\n${YELLOW}Building target: ${rust_target}${NC}"
+    rustup target add "$rust_target" >/dev/null 2>&1 || true
+    cargo build --release --target "$rust_target"
+    cargo bundle --release --target "$rust_target"
+
+    local bundle_dir
+    bundle_dir=$(find "$TARGET_DIR" -path "*${rust_target}/release/bundle/osx" -type d 2>/dev/null | head -1)
+    if [ -z "$bundle_dir" ] || [ ! -d "$bundle_dir/${APP_NAME}.app" ]; then
+        echo -e "${RED}Could not find ${APP_NAME}.app for ${rust_target}${NC}" >&2
+        exit 1
+    fi
+
+    embed_quicklook "$bundle_dir/${APP_NAME}.app" "$suffix"
+    echo "$bundle_dir"
+}
+
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BLUE}  Building ${APP_NAME} v${VERSION} DMG Installer${NC}"
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${YELLOW}Target directory: ${TARGET_DIR}${NC}"
 
-# Determine target architecture
-ARCH="${1:-$(uname -m)}"
-
-# Map architecture names
-case "$ARCH" in
-    arm64|aarch64)
-        RUST_TARGET="aarch64-apple-darwin"
-        DMG_SUFFIX="arm64"
-        ;;
-    x86_64|intel)
-        RUST_TARGET="x86_64-apple-darwin"
-        DMG_SUFFIX="x86_64"
-        ;;
-    universal)
-        echo -e "${YELLOW}Building universal binary...${NC}"
-        # Build both architectures
-        "$0" arm64
-        "$0" x86_64
-        
-        echo -e "\n${BLUE}Creating universal DMG...${NC}"
-        
-        # Find the app bundles
-        ARM_APP=$(find "$TARGET_DIR" -path "*aarch64-apple-darwin/release/bundle/osx/${APP_NAME}.app" -type d 2>/dev/null | head -1)
-        X86_APP=$(find "$TARGET_DIR" -path "*x86_64-apple-darwin/release/bundle/osx/${APP_NAME}.app" -type d 2>/dev/null | head -1)
-        
-        if [ -z "$ARM_APP" ] || [ -z "$X86_APP" ]; then
-            echo -e "${RED}Error: Could not find both architecture builds${NC}"
-            exit 1
-        fi
-        
-        UNIVERSAL_DIR="${TARGET_DIR}/universal"
-        UNIVERSAL_APP="${UNIVERSAL_DIR}/${APP_NAME}.app"
-        
-        rm -rf "$UNIVERSAL_DIR"
-        mkdir -p "$UNIVERSAL_DIR"
-        cp -R "$ARM_APP" "$UNIVERSAL_APP"
-        
-        # Create universal binary using lipo
-        lipo -create \
-            "$ARM_APP/Contents/MacOS/aster" \
-            "$X86_APP/Contents/MacOS/aster" \
-            -output "$UNIVERSAL_APP/Contents/MacOS/aster"
-        
-        # Create universal DMG
-        create_dmg "$UNIVERSAL_DIR" "universal"
-        exit 0
-        ;;
-    *)
-        echo -e "${RED}Error: Unknown architecture '$ARCH'${NC}"
-        echo "Usage: $0 [arm64|x86_64|universal]"
-        exit 1
-        ;;
-esac
-
-echo -e "\n${YELLOW}Target: ${RUST_TARGET}${NC}"
-
-# Check for cargo-bundle
-if ! command -v cargo-bundle &> /dev/null; then
+if ! command -v cargo-bundle >/dev/null 2>&1; then
     echo -e "${YELLOW}Installing cargo-bundle...${NC}"
     cargo install cargo-bundle
 fi
 
-# Ensure the toolchain target is installed
-echo -e "\n${BLUE}[1/4] Ensuring Rust target is installed...${NC}"
-rustup target add "$RUST_TARGET" 2>/dev/null || true
+ARCH="${1:-$(uname -m)}"
 
-# Build release binary
-echo -e "\n${BLUE}[2/4] Building release binary for ${RUST_TARGET}...${NC}"
-cargo build --release --target "$RUST_TARGET"
+case "$ARCH" in
+    arm64|aarch64|x86_64|intel)
+        BUNDLE_DIR=$(build_arch "$ARCH" | tail -1)
+        case "$ARCH" in
+            arm64|aarch64) SUFFIX="arm64" ;;
+            *) SUFFIX="x86_64" ;;
+        esac
+        create_dmg "$BUNDLE_DIR" "$SUFFIX"
+        ;;
 
-# Create app bundle
-echo -e "\n${BLUE}[3/4] Creating macOS app bundle...${NC}"
-cargo bundle --release --target "$RUST_TARGET"
+    universal)
+        echo -e "${YELLOW}Building both architectures for a universal bundle...${NC}"
+        ARM_DIR=$(build_arch arm64 | tail -1)
+        X86_DIR=$(build_arch x86_64 | tail -1)
+        ARM_APP="$ARM_DIR/${APP_NAME}.app"
+        X86_APP="$X86_DIR/${APP_NAME}.app"
 
-# Function to create DMG
-create_dmg() {
-    local APP_DIR="$1"
-    local SUFFIX="$2"
-    local DMG_NAME="${APP_NAME}-${SUFFIX}.dmg"
-    local APP_PATH="${APP_DIR}/${APP_NAME}.app"
-    local DMG_TEMP="${TARGET_DIR}/dmg-temp"
-    
-    echo -e "\n${BLUE}[4/4] Creating DMG: ${DMG_NAME}...${NC}"
-    
-    # Clean up any previous temp directory
-    rm -rf "$DMG_TEMP"
-    mkdir -p "$DMG_TEMP"
-    
-    # Copy app to temp directory
-    cp -R "$APP_PATH" "$DMG_TEMP/"
-    
-    # Create symbolic link to Applications folder
-    ln -s /Applications "$DMG_TEMP/Applications"
-    
-    # Remove any existing DMG
-    rm -f "$DMG_NAME"
-    
-    # Create the DMG
-    hdiutil create \
-        -volname "$APP_NAME" \
-        -srcfolder "$DMG_TEMP" \
-        -ov \
-        -format UDZO \
-        "$DMG_NAME"
-    
-    # Clean up temp directory
-    rm -rf "$DMG_TEMP"
-    
-    # Get DMG size
-    DMG_SIZE=$(du -h "$DMG_NAME" | cut -f1)
-    
-    echo -e "${GREEN}✓ Created: ${DMG_NAME} (${DMG_SIZE})${NC}"
-}
+        UNIVERSAL_DIR="${TARGET_DIR}/universal"
+        UNIVERSAL_APP="${UNIVERSAL_DIR}/${APP_NAME}.app"
+        rm -rf "$UNIVERSAL_DIR"
+        mkdir -p "$UNIVERSAL_DIR"
+        cp -R "$ARM_APP" "$UNIVERSAL_APP"
 
-# Find the bundle directory (handles custom CARGO_TARGET_DIR)
-BUNDLE_DIR=$(find "$TARGET_DIR" -path "*${RUST_TARGET}/release/bundle/osx" -type d 2>/dev/null | head -1)
+        ARM_MAIN=$(bundle_executable "$ARM_APP")
+        X86_MAIN=$(bundle_executable "$X86_APP")
+        UNIVERSAL_MAIN=$(bundle_executable "$UNIVERSAL_APP")
+        lipo -create "$ARM_MAIN" "$X86_MAIN" -output "$UNIVERSAL_MAIN"
 
-if [ -z "$BUNDLE_DIR" ] || [ ! -d "$BUNDLE_DIR/${APP_NAME}.app" ]; then
-    echo -e "${RED}Error: Could not find app bundle at expected location${NC}"
-    echo "Searched in: ${TARGET_DIR}"
-    exit 1
-fi
+        ARM_QL="$ARM_APP/Contents/PlugIns/AsterQuickLook.appex/Contents/MacOS/AsterQuickLook"
+        X86_QL="$X86_APP/Contents/PlugIns/AsterQuickLook.appex/Contents/MacOS/AsterQuickLook"
+        UNIVERSAL_QL="$UNIVERSAL_APP/Contents/PlugIns/AsterQuickLook.appex/Contents/MacOS/AsterQuickLook"
+        lipo -create "$ARM_QL" "$X86_QL" -output "$UNIVERSAL_QL"
 
-echo -e "${YELLOW}Found bundle at: ${BUNDLE_DIR}${NC}"
+        sign_app_bundle "$UNIVERSAL_APP"
+        create_dmg "$UNIVERSAL_DIR" "universal"
+        ;;
 
-# Create DMG
-create_dmg "$BUNDLE_DIR" "$DMG_SUFFIX"
+    *)
+        echo -e "${RED}Unknown architecture '$ARCH'${NC}" >&2
+        echo "Usage: $0 [arm64|x86_64|universal]" >&2
+        exit 1
+        ;;
+esac
 
-echo -e "\n${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}  Build complete!${NC}"
-echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "\n${GREEN}Build complete.${NC}"

@@ -1,0 +1,12 @@
+[package]
+name = "aster-markdown-quicklook"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "aster_markdown_quicklook"
+crate-type = ["staticlib"]
+
+[dependencies]
+gpui-gfm = { path = "../../third_party/gpui-gfm", default-features = false, features = ["html"] }
