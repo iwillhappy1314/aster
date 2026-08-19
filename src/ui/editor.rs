@@ -185,9 +185,9 @@ pub struct EditorView {
     cached_text: Option<(u64, String)>,
     /// Cached Markdown heading source offsets for edit-mode Outline synchronization.
     cached_outline_headings: Option<(u64, Vec<usize>)>,
-    /// Last heading ordinal reported for the current editor scroll position.
+    /// Last heading ordinal calculated for the current editor scroll position.
     active_outline_ordinal: Option<usize>,
-    /// Called when editor scrolling moves the active Outline section.
+    /// Called when editor rendering reports the active Outline section.
     on_active_outline: Option<Arc<dyn Fn(Option<usize>, &mut App)>>,
     /// Find panel state.
     search_active: bool,
@@ -343,9 +343,12 @@ impl EditorView {
 
         if self.active_outline_ordinal != next_active {
             self.active_outline_ordinal = next_active;
-            if let Some(callback) = self.on_active_outline.clone() {
-                callback(next_active, cx);
-            }
+        }
+        // Report every editor render rather than only local ordinal changes. Preview and
+        // editor keep independent scroll positions, so returning to edit mode must restore
+        // the editor's active section even if its own ordinal has not changed since last time.
+        if let Some(callback) = self.on_active_outline.clone() {
+            callback(next_active, cx);
         }
     }
 
