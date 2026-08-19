@@ -10,10 +10,11 @@ use crate::types::CodeBlock;
 
 use super::MarkdownRenderOptions;
 
+/// Maximum height (px) before vertical scroll kicks in.
+const CODE_BLOCK_MAX_HEIGHT_PX: f32 = 500.0;
 const CODE_BLOCK_PADDING_X_PX: f32 = 12.0;
 const CODE_BLOCK_PADDING_TOP_PX: f32 = 8.0;
 const CODE_BLOCK_PADDING_BOTTOM_PX: f32 = 8.0;
-const CODE_BLOCK_LINE_HEIGHT_PX: f32 = 20.0;
 
 // Indentation dots
 const INDENT_DOT_SIZE_PX: f32 = 2.0;
@@ -32,10 +33,6 @@ pub fn render_code_block(
 
   // Prepare display text: strip trailing newline
   let display_value = code_block_display_value(code);
-  let line_count = display_value.lines().count().max(1);
-  let code_height = CODE_BLOCK_PADDING_TOP_PX
-    + CODE_BLOCK_PADDING_BOTTOM_PX
-    + CODE_BLOCK_LINE_HEIGHT_PX * line_count as f32;
   let text: SharedString = display_value.clone().into();
 
   // Language label
@@ -97,9 +94,7 @@ pub fn render_code_block(
     );
   }
 
-  // Preserve the original, known-good GPUI scroll-layout path for code text,
-  // but give it an explicit content-derived height. Only horizontal scrolling
-  // remains; vertical scrolling always belongs to the parent preview.
+  // Code content — needs an id to support scrolling
   let code_id: SharedString = format!("md-code-{:x}", code as *const CodeBlock as usize).into();
   let code_font = Font {
     family: theme.code_font_family.clone(),
@@ -111,16 +106,26 @@ pub fn render_code_block(
 
   let mut code_area = div()
     .id(code_id)
-    .h(px(code_height))
     .px(px(CODE_BLOCK_PADDING_X_PX))
     .pt(px(CODE_BLOCK_PADDING_TOP_PX))
     .pb(px(CODE_BLOCK_PADDING_BOTTOM_PX))
     .text_sm()
-    .line_height(px(CODE_BLOCK_LINE_HEIGHT_PX))
     .text_color(theme.foreground)
     .font(code_font)
     .whitespace_nowrap()
     .overflow_x_scroll();
+
+  // Cap height and enable Y scroll (no-op for short blocks).
+  // Stop scroll-wheel propagation so the parent container doesn't scroll
+  // simultaneously (scroll chaining).
+  if !options.expand_code_blocks {
+    code_area = code_area
+      .max_h(px(CODE_BLOCK_MAX_HEIGHT_PX))
+      .overflow_y_scroll()
+      .on_scroll_wheel(|_, _, cx| {
+        cx.stop_propagation();
+      });
+  }
 
   // Build the code text child — use CodeBlockText when indentation dots are enabled,
   // otherwise plain SharedString for simplicity.
@@ -411,13 +416,17 @@ mod tests {
 
   #[test]
   fn clipboard_content_matches_display() {
+    // The clipboard should get the same content as what's displayed
     let code = CodeBlock {
       lang: Some("rust".into()),
       value: "fn main() {\n\tprintln!(\"hello\");\n}\n".into(),
     };
     let display = code_block_display_value(&code);
+    // Trailing newline stripped, tabs expanded
     assert_eq!(display, "fn main() {\n    println!(\"hello\");\n}");
   }
+
+  // ------ indentation dot tests ------
 
   #[test]
   fn indent_dots_empty_text() {
@@ -431,6 +440,7 @@ mod tests {
 
   #[test]
   fn indent_dots_blank_lines_skipped() {
+    // Lines with only spaces are blank → no dots
     let text = "   \n   \n";
     assert!(collect_indentation_dot_indices(text).is_empty());
   }
@@ -446,6 +456,7 @@ mod tests {
   fn indent_dots_multi_line() {
     let text = "fn main() {\n    println!();\n}";
     let indices = collect_indentation_dot_indices(text);
+    // 4 leading spaces on line 2, starting at byte 13
     assert_eq!(indices, vec![12, 13, 14, 15]);
   }
 
@@ -453,6 +464,7 @@ mod tests {
   fn indent_dots_mixed_blank_and_content() {
     let text = "  x\n   \n  y";
     let indices = collect_indentation_dot_indices(text);
+    // "  x" → indices 0,1 ; "   " blank → skip ; "  y" → indices 8,9
     assert_eq!(indices, vec![0, 1, 8, 9]);
   }
 
@@ -464,6 +476,7 @@ mod tests {
 
   #[test]
   fn indent_dots_limit_caps() {
+    // Create text with many leading spaces
     let mut text = String::new();
     for _ in 0..200 {
       text.push_str("      code\n");
