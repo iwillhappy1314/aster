@@ -269,6 +269,7 @@ impl EditorView {
 
     /// Aligns an Outline target to a stable top inset using its real text layout Y.
     pub fn reveal_outline(&mut self, byte: usize, cx: &mut Context<Self>) {
+        self.pending_scroll_to_byte = None;
         self.pending_outline_reveal_byte = Some(byte);
         cx.notify();
     }
@@ -523,7 +524,9 @@ impl EditorView {
 
         let target_top = target_pos.y;
         let mut new_offset_y = if align_to_top {
-            -(target_top - px(24.))
+            // The editor scroll container already has 24px top padding, so
+            // offsetting by the text-layout Y leaves the heading at that inset.
+            -target_top
         } else {
             let padding = px(28.);
             let visible_top = -offset.y;
