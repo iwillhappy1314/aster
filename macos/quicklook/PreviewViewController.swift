@@ -31,6 +31,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController, WKN
     }
 
     override func loadView() {
+        NSLog("AsterQuickLook: loadView")
         view = NSView(frame: NSRect(x: 0, y: 0, width: 900, height: 700))
         webView.frame = view.bounds
         webView.autoresizingMask = [.width, .height]
@@ -38,30 +39,11 @@ final class PreviewViewController: NSViewController, QLPreviewingController, WKN
         view.addSubview(webView)
     }
 
-    // Quick Look invokes this through the Objective-C QLPreviewingController
-    // selector. Export it explicitly because this extension is compiled with
-    // swiftc directly rather than through an Xcode target.
-    @objc(preparePreviewOfFileAtURL:completionHandler:)
-    func preparePreviewOfFile(
-        at url: URL,
-        completionHandler handler: @escaping (Error?) -> Void
-    ) {
-        NSLog("AsterQuickLook: callback preparing %@", url.path)
-
-        do {
-            try preparePreview(at: url)
-            handler(nil)
-        } catch {
-            NSLog("AsterQuickLook: callback prepare failed: %@", String(describing: error))
-            handler(error)
-        }
-    }
-
-    // Newer SDKs also expose the protocol requirement as a Swift concurrency
-    // overlay. Implement it as well so either dispatch path reaches the same
-    // preparation logic.
+    // In current macOS SDKs the completion-handler API is imported into Swift
+    // as this async protocol requirement. Defining both forms creates the same
+    // Objective-C selector twice, so keep only the async implementation.
     func preparePreviewOfFile(at url: URL) async throws {
-        NSLog("AsterQuickLook: async preparing %@", url.path)
+        NSLog("AsterQuickLook: preparing %@", url.path)
         try preparePreview(at: url)
     }
 
@@ -109,6 +91,8 @@ final class PreviewViewController: NSViewController, QLPreviewingController, WKN
         removeTemporaryPreview()
 
         let markdown = try String(contentsOf: url, encoding: .utf8)
+        NSLog("AsterQuickLook: read %ld Markdown bytes", markdown.utf8.count)
+
         let renderedHTML: String = try markdown.withCString { source in
             guard let rendered = aster_markdown_to_html(source) else {
                 throw PreviewError.renderFailed
@@ -116,6 +100,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController, WKN
             defer { aster_string_free(rendered) }
             return String(cString: rendered)
         }
+        NSLog("AsterQuickLook: rendered %ld HTML bytes", renderedHTML.utf8.count)
 
         let documentDirectory = URL(
             fileURLWithPath: url.deletingLastPathComponent().path,
@@ -124,8 +109,11 @@ final class PreviewViewController: NSViewController, QLPreviewingController, WKN
         let html = insertingBaseURL(documentDirectory, into: renderedHTML)
         let htmlURL = try writeTemporaryHTML(html)
         previewHTMLURL = htmlURL
+        NSLog("AsterQuickLook: temporary HTML %@", htmlURL.path)
 
-        // Loading a real file gives WebKit an explicit file read scope.
+        // Loading a real file gives WebKit an explicit file read scope. The
+        // generated document uses a <base> tag so relative Markdown assets are
+        // still resolved against the source document's directory.
         let readAccessRoot = URL(fileURLWithPath: "/", isDirectory: true)
         guard webView.loadFileURL(htmlURL, allowingReadAccessTo: readAccessRoot) != nil else {
             throw PreviewError.renderFailed
