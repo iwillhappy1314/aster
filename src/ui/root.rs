@@ -5,7 +5,8 @@ use crate::commands::{
 use crate::model::document::DocumentState;
 use crate::model::inline_markdown::InlineMarkdownState;
 use crate::services::fs::{
-    pick_open_markdown_path_async, pick_save_path_async, read_to_string, write_atomic,
+    is_markdown_path, pick_open_markdown_path_async, pick_save_path_async, read_to_string,
+    write_atomic,
 };
 use crate::services::inline_markdown::compute_inline_spans;
 use crate::services::settings::{self, OutlinePosition, Settings};
@@ -17,15 +18,16 @@ use crate::ui::theme::Theme;
 use camino::Utf8PathBuf;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, Bounds, Context, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ParentElement, Render, ScrollHandle, StatefulInteractiveElement, Styled,
-    Window, canvas, div, fill, point, px, size,
+    App, Bounds, Context, Entity, ExternalPaths, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, MouseMoveEvent, ParentElement, Render, ScrollHandle,
+    StatefulInteractiveElement, Styled, Window, canvas, div, fill, point, px, size,
 };
 use gpui_component::notification::NotificationList;
 use gpui_gfm::{
     MarkdownCache, MarkdownRenderOptions, MarkdownTheme, render_markdown_blocks_cached,
 };
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
+use std::path::Path;
 use std::time::Duration;
 
 const INLINE_SYNC_PARSE_MAX_BYTES: usize = 64 * 1024;
@@ -93,7 +95,8 @@ impl RootView {
             preview_scroll_handle: ScrollHandle::new(),
             preview_scroll_indicator_visible: false,
             preview_scroll_indicator_revision: 0,
-            preview_markdown_options: MarkdownRenderOptions::default(),
+            preview_markdown_options: MarkdownRenderOptions::default()
+                .with_image_loader(std::sync::Arc::new(markdown_image_source)),
             preview_markdown_cache: MarkdownCache::default(),
             preview_heading_child_indices: Default::default(),
         }
@@ -416,6 +419,96 @@ impl RootView {
             view.set_active_outline(active, cx);
         });
     }
+
+    /// Handles files dropped from Finder onto the Aster window.
+    /// A single Markdown document opens in-place; all other files are inserted as links.
+    fn handle_external_drop(
+        &mut self,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let files = paths
+            .paths()
+            .iter()
+            .filter(|path| path.is_file())
+            .collect::<Vec<_>>();
+
+        if files.len() == 1
+            && let Ok(markdown_path) = Utf8PathBuf::try_from(files[0].to_path_buf())
+            && is_markdown_path(&markdown_path)
+        {
+            self.action_open_path(markdown_path, window, cx);
+            return;
+        }
+
+        let snippets = files
+            .into_iter()
+            .filter_map(|path| dropped_file_markdown(path.as_path()))
+            .collect::<Vec<_>>();
+        if snippets.is_empty() {
+            return;
+        }
+
+        let insertion = snippets.join("\n");
+        let inserted_chars = insertion.chars().count();
+        let _ = self.document.update(cx, |doc, cx| {
+            doc.begin_edit();
+            doc.delete_selection();
+            let insert_at = doc.cursor;
+            doc.insert(insert_at, &insertion);
+            doc.cursor = insert_at.saturating_add(inserted_chars);
+            doc.commit_edit();
+            cx.notify();
+        });
+        let _ = self
+            .editor_view
+            .update(cx, |editor, cx| editor.reveal_cursor(cx));
+        cx.notify();
+    }
+}
+
+fn markdown_image_source(url: &str) -> gpui::ImageSource {
+    if let Ok(url) = url::Url::parse(url)
+        && url.scheme() == "file"
+        && let Ok(path) = url.to_file_path()
+    {
+        return path.into();
+    }
+
+    url.to_string().into()
+}
+
+fn dropped_file_markdown(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_string_lossy();
+    let label = escape_markdown_label(&file_name);
+    let file_url = url::Url::from_file_path(path).ok()?;
+    let target = format!("<{file_url}>");
+
+    if is_image_path(path) {
+        Some(format!("![{label}]({target})"))
+    } else {
+        Some(format!("[{label}]({target})"))
+    }
+}
+
+fn is_image_path(path: &Path) -> bool {
+    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+        return false;
+    };
+
+    gpui::Img::extensions()
+        .iter()
+        .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        || extension.eq_ignore_ascii_case("heic")
+        || extension.eq_ignore_ascii_case("heif")
+}
+
+fn escape_markdown_label(label: &str) -> String {
+    label
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
 }
 
 impl Render for RootView {
@@ -659,6 +752,10 @@ impl Render for RootView {
             .bg(Theme::bg())
             .text_color(Theme::text())
             .size_full()
+            .can_drop(|value, _, _| value.is::<ExternalPaths>())
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.handle_external_drop(paths, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &NewFile, window, cx| {
                 this.action_new_file(window, cx);
             }))
@@ -889,5 +986,30 @@ impl Render for RootView {
                     }),
             )
             .child(self.notifications.clone())
+    }
+}
+
+#[cfg(test)]
+mod drag_drop_tests {
+    use super::*;
+
+    #[test]
+    fn builds_image_markdown_for_local_file() {
+        let markdown = dropped_file_markdown(Path::new("/tmp/hero image.PNG")).unwrap();
+        assert!(markdown.starts_with("![hero image.PNG](<file://"));
+        assert!(markdown.contains("hero%20image.PNG"));
+    }
+
+    #[test]
+    fn builds_attachment_markdown_and_escapes_label() {
+        let markdown = dropped_file_markdown(Path::new("/tmp/[draft].pdf")).unwrap();
+        assert!(markdown.starts_with("[\\[draft\\].pdf](<file://"));
+    }
+
+    #[test]
+    fn image_detection_is_case_insensitive() {
+        assert!(is_image_path(Path::new("/tmp/photo.JpEg")));
+        assert!(is_image_path(Path::new("/tmp/photo.heic")));
+        assert!(!is_image_path(Path::new("/tmp/archive.zip")));
     }
 }
