@@ -1,0 +1,91 @@
+name: Agent Precise Outline Cleanup
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  cargo-check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Clean vendored diff and refine positioning
+        run: |
+          # Restore upstream formatting for vendored gpui-gfm, then apply only
+          # the small semantic API additions needed for exact block scrolling.
+          git checkout origin/main -- \
+            third_party/gpui-gfm/lib.rs \
+            third_party/gpui-gfm/render/mod.rs \
+            third_party/gpui-gfm/render/blocks.rs
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          blocks = Path("third_party/gpui-gfm/render/blocks.rs")
+          text = blocks.read_text()
+          marker = "/// Render a single block.\n"
+          helper = '''/// Render top-level blocks individually so a host scroll container can track\n/// each block's real layout bounds. Returns rendered elements plus the direct-child\n/// indices corresponding to headings, in document heading order.\npub(crate) fn render_top_level_blocks(\n  blocks: &[Block],\n  options: &MarkdownRenderOptions,\n  cx: &App,\n) -> (Vec<AnyElement>, Vec<usize>) {\n  let mut elements = Vec::with_capacity(blocks.len());\n  let mut heading_child_indices = Vec::new();\n\n  for (ix, block) in blocks.iter().enumerate() {\n    let mut element = render_block(block, options, 0, cx);\n    if matches!(block, Block::Heading { .. }) {\n      heading_child_indices.push(ix);\n      if ix > 0 {\n        element = div().mt(px(10.0)).child(element).into_any_element();\n      }\n    }\n    elements.push(element);\n  }\n\n  (elements, heading_child_indices)\n}\n\n'''
+          if marker not in text:
+              raise SystemExit("blocks.rs marker not found")
+          text = text.replace(marker, helper + marker, 1)
+          blocks.write_text(text)
+
+          render_mod = Path("third_party/gpui-gfm/render/mod.rs")
+          text = render_mod.read_text()
+          marker = "/// Render a markdown source string to a GPUI element.\n"
+          api = '''/// Top-level rendered Markdown blocks for hosts that need per-block layout bounds.\npub struct RenderedMarkdownBlocks {\n  pub elements: Vec<AnyElement>,\n  /// Direct-child indices of top-level headings, in heading order.\n  pub heading_child_indices: Vec<usize>,\n}\n\n/// Render cached Markdown as individual top-level blocks.\npub fn render_markdown_blocks_cached(\n  source: &str,\n  options: &MarkdownRenderOptions,\n  cache: &mut crate::cache::MarkdownCache,\n  cx: &App,\n) -> RenderedMarkdownBlocks {\n  let parsed = cache.get_or_parse(source);\n  render_parsed_markdown_blocks(&parsed, options, cx)\n}\n\n/// Render a pre-parsed document as individual top-level blocks.\npub fn render_parsed_markdown_blocks(\n  parsed: &ParsedMarkdown,\n  options: &MarkdownRenderOptions,\n  cx: &App,\n) -> RenderedMarkdownBlocks {\n  options.details_state.reset_counter();\n  options.selection_state.reset_counter();\n  let (elements, heading_child_indices) =\n    blocks::render_top_level_blocks(parsed.blocks(), options, cx);\n  RenderedMarkdownBlocks {\n    elements,\n    heading_child_indices,\n  }\n}\n\n'''
+          if marker not in text:
+              raise SystemExit("render/mod.rs marker not found")
+          text = text.replace(marker, api + marker, 1)
+          render_mod.write_text(text)
+
+          lib = Path("third_party/gpui-gfm/lib.rs")
+          text = lib.read_text()
+          old = '''pub use render::{\n  DetailsState, ImageLoaderFn, ListItemView, MarkdownRenderOptions, MarkdownTheme, RenderOverrides,\n  render_markdown, render_markdown_cached, render_parsed_markdown,\n};'''
+          new = '''pub use render::{\n  DetailsState, ImageLoaderFn, ListItemView, MarkdownRenderOptions, MarkdownTheme, RenderOverrides,\n  RenderedMarkdownBlocks, render_markdown, render_markdown_blocks_cached, render_markdown_cached,\n  render_parsed_markdown, render_parsed_markdown_blocks,\n};'''
+          if old not in text:
+              raise SystemExit("lib.rs export block not found")
+          lib.write_text(text.replace(old, new, 1))
+
+          editor = Path("src/ui/editor.rs")
+          text = editor.read_text()
+          old = '''    pub fn reveal_outline(&mut self, byte: usize, cx: &mut Context<Self>) {\n        self.pending_outline_reveal_byte = Some(byte);\n        cx.notify();\n    }'''
+          new = '''    pub fn reveal_outline(&mut self, byte: usize, cx: &mut Context<Self>) {\n        self.pending_scroll_to_byte = None;\n        self.pending_outline_reveal_byte = Some(byte);\n        cx.notify();\n    }'''
+          if old not in text:
+              raise SystemExit("editor reveal_outline block not found")
+          text = text.replace(old, new, 1)
+          old_align = '''        let mut new_offset_y = if align_to_top {\n            -(target_top - px(24.))\n        } else {'''
+          new_align = '''        let mut new_offset_y = if align_to_top {\n            // The editor scroll container already has 24px top padding, so\n            // offsetting by the text-layout Y leaves the heading at that inset.\n            -target_top\n        } else {'''
+          if old_align not in text:
+              raise SystemExit("editor top alignment block not found")
+          editor.write_text(text.replace(old_align, new_align, 1))
+          PY
+
+          # Only format Aster-owned files; preserve vendored gpui-gfm's upstream style.
+          rustfmt --edition 2024 src/ui/editor.rs src/ui/file_explorer.rs src/ui/root.rs
+
+      - name: Cargo check
+        run: cargo check
+
+      - name: Commit refined Outline reveal
+        if: success()
+        run: |
+          if [[ -n "$(git status --porcelain -- src/ui third_party/gpui-gfm)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add src/ui/editor.rs src/ui/file_explorer.rs src/ui/root.rs \
+              third_party/gpui-gfm/lib.rs third_party/gpui-gfm/render/mod.rs \
+              third_party/gpui-gfm/render/blocks.rs
+            git commit -m "Refine precise Outline reveal"
+            git push origin HEAD:${{ github.head_ref }}
+          fi
