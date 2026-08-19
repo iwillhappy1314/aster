@@ -106,7 +106,11 @@ impl DocumentState {
         } else {
             (head, anchor)
         };
-        self.selection = if start == end { None } else { Some(start..end) };
+        self.selection = if start == end {
+            None
+        } else {
+            Some(start..end)
+        };
         self.cursor = head;
         self.selection_anchor = Some(anchor);
     }
@@ -275,11 +279,7 @@ impl DocumentState {
             self.cursor = op.old_cursor.min(self.rope.len_chars());
             self.selection = op.old_selection;
             self.selection_anchor = self.selection.as_ref().map(|r| {
-                if self.cursor <= r.start {
-                    r.end
-                } else {
-                    r.start
-                }
+                if self.cursor <= r.start { r.end } else { r.start }
             });
             self.bump_revision();
             self.word_count_cache = None;
@@ -298,11 +298,7 @@ impl DocumentState {
             self.cursor = op.new_cursor.min(self.rope.len_chars());
             self.selection = op.new_selection;
             self.selection_anchor = self.selection.as_ref().map(|r| {
-                if self.cursor <= r.start {
-                    r.end
-                } else {
-                    r.start
-                }
+                if self.cursor <= r.start { r.end } else { r.start }
             });
             self.bump_revision();
             self.word_count_cache = None;

@@ -152,11 +152,7 @@ impl Render for FileExplorerView {
                                     .w(px(if is_active { 6. } else { 4. }))
                                     .h(px(if is_active { 6. } else { 4. }))
                                     .rounded_full()
-                                    .bg(if is_active {
-                                        Theme::accent()
-                                    } else {
-                                        Theme::muted()
-                                    }),
+                                    .bg(if is_active { Theme::accent() } else { Theme::muted() }),
                             ),
                     )
                     .child(
@@ -165,11 +161,7 @@ impl Render for FileExplorerView {
                             .line_height(px(20.))
                             .overflow_hidden()
                             .flex_1()
-                            .text_color(if is_active {
-                                Theme::accent()
-                            } else {
-                                Theme::text()
-                            })
+                            .text_color(if is_active { Theme::accent() } else { Theme::text() })
                             .child(ellipsize_chars(&title, 64)),
                     )
             })
