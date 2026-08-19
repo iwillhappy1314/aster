@@ -21,7 +21,8 @@ pub use cache::MarkdownCache;
 pub use github::{GithubCodeReferencePreview, GithubIssueReferenceContext};
 pub use parse::{parse_gfm, parse_markdown};
 pub use render::{
-  DetailsState, ImageLoaderFn, ListItemView, MarkdownRenderOptions, MarkdownTheme, RenderOverrides,
-  render_markdown, render_markdown_cached, render_parsed_markdown,
+    DetailsState, ImageLoaderFn, ListItemView, MarkdownRenderOptions, MarkdownTheme,
+    RenderOverrides, RenderedMarkdownBlocks, render_markdown, render_markdown_blocks_cached,
+    render_markdown_cached, render_parsed_markdown, render_parsed_markdown_blocks,
 };
 pub use types::ParsedMarkdown;

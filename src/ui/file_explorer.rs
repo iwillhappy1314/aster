@@ -18,7 +18,7 @@ struct OutlineItem {
 
 /// Callback invoked when an outline entry is selected, receiving the heading's
 /// byte offset in the document.
-pub type RevealCallback = Arc<dyn Fn(usize, &mut App)>;
+pub type RevealCallback = Arc<dyn Fn(usize, usize, &mut App)>;
 
 pub struct FileExplorerView {
     document: Entity<DocumentState>,
@@ -102,7 +102,7 @@ impl Render for FileExplorerView {
                                 cx.notify();
                             });
                             if let Some(on_reveal) = on_reveal.clone() {
-                                on_reveal(byte_start, cx);
+                                on_reveal(ordinal, byte_start, cx);
                             }
                         }),
                     )
