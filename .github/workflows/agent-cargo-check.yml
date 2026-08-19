@@ -5,14 +5,67 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   cargo-check:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Vendor pinned gpui-gfm
+        if: ${{ hashFiles('third_party/gpui-gfm/lib.rs') == '' }}
+        run: |
+          rm -rf /tmp/gpui-gfm
+          git clone https://github.com/joris-gallot/gpui-gfm /tmp/gpui-gfm
+          git -C /tmp/gpui-gfm checkout 34c588a52611d3d30bb6f10e5df9536a3770362
+          mkdir -p third_party/gpui-gfm
+          cp -R /tmp/gpui-gfm/crates/gpui-gfm/. third_party/gpui-gfm/
+          cat > third_party/gpui-gfm/Cargo.toml <<'EOF'
+          [package]
+          name = "gpui-gfm"
+          version = "0.2.0"
+          edition = "2024"
+          publish = false
+
+          [lib]
+          path = "lib.rs"
+
+          [dependencies]
+          gpui = "0.2.2"
+          comrak = "0.50"
+          tl = "0.7"
+          EOF
+
+      - name: Commit vendored renderer
+        run: |
+          if ! git diff --quiet -- third_party/gpui-gfm; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add third_party/gpui-gfm
+            git commit -m "Vendor gpui-gfm for preview rendering"
+            git push origin HEAD:${{ github.head_ref }}
+          fi
+
       - name: Cargo check
         run: cargo check
+
+      - name: Commit resolved lockfile
+        if: success()
+        run: |
+          if ! git diff --quiet -- Cargo.lock; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Cargo.lock
+            git commit -m "Update Cargo.lock for gpui-gfm preview"
+            git push origin HEAD:${{ github.head_ref }}
+          fi
+
       - name: Upload resolved lockfile
         if: always()
         uses: actions/upload-artifact@v4
