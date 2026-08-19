@@ -92,10 +92,10 @@ pub fn render_code_block(
     );
   }
 
-  // Keep the code area out of GPUI's scroll-container path entirely. Its
-  // height is intrinsic to the full code content, so the parent preview owns
-  // all scrolling and wheel events. Very long lines remain nowrap and are
-  // clipped by the rounded outer container instead of creating nested scroll.
+  // The code area deliberately is not a GPUI scroll container. Its height is
+  // always determined by the complete code content, leaving all wheel/vertical
+  // scrolling to the parent preview. Long nowrap lines are clipped by the
+  // rounded outer container instead of introducing nested scrolling.
   let code_id: SharedString = format!("md-code-{:x}", code as *const CodeBlock as usize).into();
   let code_font = Font {
     family: theme.code_font_family.clone(),
