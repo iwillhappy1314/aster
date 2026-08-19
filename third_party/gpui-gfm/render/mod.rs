@@ -669,6 +669,40 @@ impl MarkdownRenderOptions {
 static DEFAULT_DARK_THEME: std::sync::LazyLock<MarkdownTheme> =
   std::sync::LazyLock::new(MarkdownTheme::dark);
 
+/// Top-level rendered Markdown blocks for hosts that need per-block layout bounds.
+pub struct RenderedMarkdownBlocks {
+  pub elements: Vec<AnyElement>,
+  /// Direct-child indices of top-level headings, in heading order.
+  pub heading_child_indices: Vec<usize>,
+}
+
+/// Render cached Markdown as individual top-level blocks.
+pub fn render_markdown_blocks_cached(
+  source: &str,
+  options: &MarkdownRenderOptions,
+  cache: &mut crate::cache::MarkdownCache,
+  cx: &App,
+) -> RenderedMarkdownBlocks {
+  let parsed = cache.get_or_parse(source);
+  render_parsed_markdown_blocks(&parsed, options, cx)
+}
+
+/// Render a pre-parsed document as individual top-level blocks.
+pub fn render_parsed_markdown_blocks(
+  parsed: &ParsedMarkdown,
+  options: &MarkdownRenderOptions,
+  cx: &App,
+) -> RenderedMarkdownBlocks {
+  options.details_state.reset_counter();
+  options.selection_state.reset_counter();
+  let (elements, heading_child_indices) =
+    blocks::render_top_level_blocks(parsed.blocks(), options, cx);
+  RenderedMarkdownBlocks {
+    elements,
+    heading_child_indices,
+  }
+}
+
 /// Render a markdown source string to a GPUI element.
 pub fn render_markdown(source: &str, options: &MarkdownRenderOptions, cx: &App) -> AnyElement {
   render_markdown_impl(source, options, None, cx)

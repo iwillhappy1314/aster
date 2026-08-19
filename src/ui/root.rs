@@ -22,7 +22,9 @@ use gpui::{
     Window, canvas, div, fill, point, px, size,
 };
 use gpui_component::notification::NotificationList;
-use gpui_gfm::{MarkdownCache, MarkdownRenderOptions, MarkdownTheme, render_markdown_cached};
+use gpui_gfm::{
+    MarkdownCache, MarkdownRenderOptions, MarkdownTheme, render_markdown_blocks_cached,
+};
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use std::time::Duration;
 
@@ -61,6 +63,8 @@ pub struct RootView {
     preview_markdown_options: MarkdownRenderOptions,
     /// Parsed Markdown cache reused by the preview across GPUI render passes.
     preview_markdown_cache: MarkdownCache,
+    /// Direct preview child indices for headings, in Outline order.
+    preview_heading_child_indices: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
 }
 
 impl RootView {
@@ -91,6 +95,7 @@ impl RootView {
             preview_scroll_indicator_revision: 0,
             preview_markdown_options: MarkdownRenderOptions::default(),
             preview_markdown_cache: MarkdownCache::default(),
+            preview_heading_child_indices: Default::default(),
         }
     }
 
@@ -379,22 +384,33 @@ impl RootView {
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Install the outline-click reveal callback once. It scrolls both the
-        // editor (to the cursor) and the preview (proportionally) to the
-        // selected heading.
+        // Install the Outline reveal callback once. The editor uses TextLayout's
+        // exact Y position; preview uses ScrollHandle's real direct-child bounds.
         if !self.outline_reveal_installed {
             self.outline_reveal_installed = true;
             let editor = self.editor_view.clone();
-            let document = self.document.clone();
             let preview_scroll = self.preview_scroll_handle.clone();
+            let preview_heading_indices = self.preview_heading_child_indices.clone();
             let callback: crate::ui::file_explorer::RevealCallback =
-                std::sync::Arc::new(move |byte_start, cx: &mut App| {
-                    let _ = editor.update(cx, |editor, cx| editor.reveal_cursor(cx));
-                    let max_offset: f32 = preview_scroll.max_offset().height.into();
-                    if max_offset > 0.0 {
-                        let doc_len = document.read(cx).text().len().max(1);
-                        let frac = (byte_start as f32 / doc_len as f32).clamp(0.0, 1.0);
-                        preview_scroll.set_offset(point(px(0.), px(-frac * max_offset)));
+                std::sync::Arc::new(move |heading_ordinal, byte_start, cx: &mut App| {
+                    let _ = editor.update(cx, |editor, cx| editor.reveal_outline(byte_start, cx));
+
+                    let child_index = preview_heading_indices
+                        .lock()
+                        .ok()
+                        .and_then(|indices| indices.get(heading_ordinal).copied());
+                    if let Some(child_index) = child_index {
+                        if let Some(child_bounds) = preview_scroll.bounds_for_item(child_index) {
+                            let viewport = preview_scroll.bounds();
+                            let max = preview_scroll.max_offset();
+                            let current = preview_scroll.offset();
+                            let mut next = current;
+                            next.y = (viewport.top() + px(24.) - child_bounds.top())
+                                .clamp(-max.height, px(0.));
+                            preview_scroll.set_offset(next);
+                        } else {
+                            preview_scroll.scroll_to_top_of_item(child_index);
+                        }
                     }
                 });
             let _ = self
@@ -696,12 +712,15 @@ impl Render for RootView {
                             .preview_markdown_options
                             .clone()
                             .with_theme(markdown_theme);
-                        let markdown_content = render_markdown_cached(
+                        let markdown_blocks = render_markdown_blocks_cached(
                             &doc_text,
                             &markdown_options,
                             &mut self.preview_markdown_cache,
                             cx,
                         );
+                        if let Ok(mut indices) = self.preview_heading_child_indices.lock() {
+                            *indices = markdown_blocks.heading_child_indices.clone();
+                        }
                         div()
                             .relative()
                             .flex_1()
@@ -711,6 +730,12 @@ impl Render for RootView {
                                 div()
                                     .id("preview-scroll")
                                     .size_full()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .pl(px(32.))
+                                    .pr(px(32.))
+                                    .py(px(24.))
                                     .overflow_y_scroll()
                                     .overflow_x_hidden()
                                     .track_scroll(&self.preview_scroll_handle)
@@ -719,14 +744,7 @@ impl Render for RootView {
                                             this.reveal_preview_scroll_indicator(cx);
                                         },
                                     ))
-                                    .child(
-                                        div()
-                                            .h_auto()
-                                            .pl(px(32.))
-                                            .pr(px(32.))
-                                            .py(px(24.))
-                                            .child(markdown_content),
-                                    ),
+                                    .children(markdown_blocks.elements),
                             )
                             // Match the editor's indicator: it is rendered above the scrolling
                             // content and fixed to the view's right edge.

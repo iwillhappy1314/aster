@@ -189,6 +189,8 @@ pub struct EditorView {
     cached_search: Option<SearchCache>,
     /// Byte offset that should be revealed after next layout.
     pending_scroll_to_byte: Option<usize>,
+    /// Outline target that should be aligned near the top after layout.
+    pending_outline_reveal_byte: Option<usize>,
 }
 
 impl EditorView {
@@ -211,6 +213,7 @@ impl EditorView {
             search_current_match: 0,
             cached_search: None,
             pending_scroll_to_byte: None,
+            pending_outline_reveal_byte: None,
         }
     }
 
@@ -261,6 +264,13 @@ impl EditorView {
             .read(cx)
             .char_to_byte(self.document.read(cx).cursor);
         self.pending_scroll_to_byte = Some(byte);
+        cx.notify();
+    }
+
+    /// Aligns an Outline target to a stable top inset using its real text layout Y.
+    pub fn reveal_outline(&mut self, byte: usize, cx: &mut Context<Self>) {
+        self.pending_scroll_to_byte = None;
+        self.pending_outline_reveal_byte = Some(byte);
         cx.notify();
     }
 
@@ -479,9 +489,14 @@ impl EditorView {
         projection: &DisplayProjection,
         window: &mut Window,
     ) {
-        let Some(target_source_byte) = self.pending_scroll_to_byte else {
-            return;
-        };
+        let (target_source_byte, align_to_top) =
+            if let Some(byte) = self.pending_outline_reveal_byte {
+                (byte, true)
+            } else if let Some(byte) = self.pending_scroll_to_byte {
+                (byte, false)
+            } else {
+                return;
+            };
         let target_display_byte = projection.source_to_display_byte(target_source_byte);
 
         let Some(target_pos) = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -507,22 +522,32 @@ impl EditorView {
             return;
         }
 
-        let padding = px(28.);
-        let visible_top = -offset.y;
-        let visible_bottom = visible_top + viewport_height;
         let target_top = target_pos.y;
-        let target_bottom = target_pos.y + line_height;
-
-        let mut new_offset_y = offset.y;
-        if target_top < visible_top + padding {
-            new_offset_y = -(target_top - padding);
-        } else if target_bottom > visible_bottom - padding {
-            new_offset_y = -(target_bottom - viewport_height + padding);
-        }
+        let mut new_offset_y = if align_to_top {
+            // The editor scroll container already has 24px top padding, so
+            // offsetting by the text-layout Y leaves the heading at that inset.
+            -target_top
+        } else {
+            let padding = px(28.);
+            let visible_top = -offset.y;
+            let visible_bottom = visible_top + viewport_height;
+            let target_bottom = target_top + line_height;
+            let mut minimal_offset = offset.y;
+            if target_top < visible_top + padding {
+                minimal_offset = -(target_top - padding);
+            } else if target_bottom > visible_bottom - padding {
+                minimal_offset = -(target_bottom - viewport_height + padding);
+            }
+            minimal_offset
+        };
 
         new_offset_y = new_offset_y.clamp(-max.height, px(0.));
         self.scroll_handle.set_offset(point(offset.x, new_offset_y));
-        self.pending_scroll_to_byte = None;
+        if align_to_top {
+            self.pending_outline_reveal_byte = None;
+        } else {
+            self.pending_scroll_to_byte = None;
+        }
         window.refresh();
     }
 }

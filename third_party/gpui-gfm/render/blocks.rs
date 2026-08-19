@@ -37,6 +37,31 @@ pub fn render_blocks(
   container.into_any_element()
 }
 
+/// Render top-level blocks individually so a host scroll container can track
+/// each block's real layout bounds. Returns rendered elements plus the direct-child
+/// indices corresponding to headings, in document heading order.
+pub(crate) fn render_top_level_blocks(
+  blocks: &[Block],
+  options: &MarkdownRenderOptions,
+  cx: &App,
+) -> (Vec<AnyElement>, Vec<usize>) {
+  let mut elements = Vec::with_capacity(blocks.len());
+  let mut heading_child_indices = Vec::new();
+
+  for (ix, block) in blocks.iter().enumerate() {
+    let mut element = render_block(block, options, 0, cx);
+    if matches!(block, Block::Heading { .. }) {
+      heading_child_indices.push(ix);
+      if ix > 0 {
+        element = div().mt(px(10.0)).child(element).into_any_element();
+      }
+    }
+    elements.push(element);
+  }
+
+  (elements, heading_child_indices)
+}
+
 /// Render a single block.
 fn render_block(
   block: &Block,
