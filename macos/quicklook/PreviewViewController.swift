@@ -11,7 +11,6 @@ private enum PreviewError: Error {
 final class PreviewViewController: NSViewController, QLPreviewingController, WKNavigationDelegate {
     private let webView: WKWebView
     private var previewHTMLURL: URL?
-    private var pendingCompletion: ((Error?) -> Void)?
 
     override init(nibName nibNameOrNil: NSNib.Name?, bundle nibBundleOrNil: Bundle?) {
         let configuration = WKWebViewConfiguration()
@@ -46,9 +45,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController, WKN
         NSLog("AsterQuickLook: preparing %@", url.path)
 
         do {
-            // Accessing `view` is the AppKit-compatible way to force lazy view
-            // loading on macOS 11+. Apple documents that this invokes loadView()
-            // when the primary view has not been created yet.
+            // Accessing `view` forces NSViewController to load it on macOS 11+.
             _ = view
             removeTemporaryPreview()
 
@@ -68,26 +65,27 @@ final class PreviewViewController: NSViewController, QLPreviewingController, WKN
             let html = insertingBaseURL(documentDirectory, into: renderedHTML)
             let htmlURL = try writeTemporaryHTML(html)
             previewHTMLURL = htmlURL
-            pendingCompletion = handler
 
-            // loadHTMLString(baseURL:) can fail silently for file-based content
-            // inside a Quick Look extension. Loading a real file lets WebKit
-            // receive an explicit read-access scope. The extension entitlement
-            // is already read-only, so this never grants write access.
+            // Loading a real file gives WebKit an explicit file read scope.
+            // Quick Look shows a spinner until the completion handler is called,
+            // so do not wait for WKNavigationDelegate.didFinish here. The view is
+            // ready once navigation has successfully been started; WebKit can
+            // finish painting after Quick Look presents the controller.
             let readAccessRoot = URL(fileURLWithPath: "/", isDirectory: true)
             guard webView.loadFileURL(htmlURL, allowingReadAccessTo: readAccessRoot) != nil else {
                 throw PreviewError.renderFailed
             }
+
+            NSLog("AsterQuickLook: WebView navigation started")
+            handler(nil)
         } catch {
             NSLog("AsterQuickLook: prepare failed: %@", String(describing: error))
-            pendingCompletion = nil
             handler(error)
         }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         NSLog("AsterQuickLook: WebView finished loading")
-        finishPreview(nil)
     }
 
     func webView(
@@ -96,7 +94,6 @@ final class PreviewViewController: NSViewController, QLPreviewingController, WKN
         withError error: Error
     ) {
         NSLog("AsterQuickLook: WebView load failed: %@", String(describing: error))
-        finishPreview(error)
     }
 
     func webView(
@@ -105,7 +102,6 @@ final class PreviewViewController: NSViewController, QLPreviewingController, WKN
         withError error: Error
     ) {
         NSLog("AsterQuickLook: WebView provisional load failed: %@", String(describing: error))
-        finishPreview(error)
     }
 
     func webView(
@@ -124,12 +120,6 @@ final class PreviewViewController: NSViewController, QLPreviewingController, WKN
 
         NSWorkspace.shared.open(url)
         decisionHandler(.cancel)
-    }
-
-    private func finishPreview(_ error: Error?) {
-        guard let handler = pendingCompletion else { return }
-        pendingCompletion = nil
-        handler(error)
     }
 
     private func writeTemporaryHTML(_ html: String) throws -> URL {
