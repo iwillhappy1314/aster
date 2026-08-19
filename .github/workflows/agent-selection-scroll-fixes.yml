@@ -1,0 +1,703 @@
+name: Agent Selection And Scroll Fixes
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  cargo-check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Implement selection and code scroll fixes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # Editor: preserve the logical anchor/head direction while storing a
+          # normalised range for rendering/copy/delete operations.
+          document = Path("src/model/document.rs")
+          text = document.read_text()
+          old = '''    pub fn set_selection(&mut self, start: usize, end: usize) {
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        self.selection = if start == end {
+            None
+        } else {
+            Some(start.min(self.len_chars())..end.min(self.len_chars()))
+        };
+        self.cursor = end.min(self.len_chars());
+        self.selection_anchor = Some(start.min(self.len_chars()));
+    }
+'''
+          new = '''    pub fn set_selection(&mut self, anchor: usize, head: usize) {
+        let len = self.len_chars();
+        let anchor = anchor.min(len);
+        let head = head.min(len);
+        let (start, end) = if anchor <= head {
+            (anchor, head)
+        } else {
+            (head, anchor)
+        };
+        self.selection = if start == end {
+            None
+        } else {
+            Some(start..end)
+        };
+        // Keep selection direction separate from the normalised storage range.
+        // This lets drag/Shift selection extend naturally in either direction.
+        self.cursor = head;
+        self.selection_anchor = Some(anchor);
+    }
+'''
+          if old not in text:
+              raise SystemExit("document set_selection block not found")
+          text = text.replace(old, new, 1)
+
+          restore_old = '''            self.selection_anchor = self.selection.as_ref().map(|r| r.start);'''
+          restore_new = '''            self.selection_anchor = self.selection.as_ref().map(|r| {
+                if self.cursor <= r.start { r.end } else { r.start }
+            });'''
+          if text.count(restore_old) != 2:
+              raise SystemExit("document undo/redo selection restore blocks not found")
+          text = text.replace(restore_old, restore_new)
+
+          if "preserves_reverse_selection_direction" not in text:
+              text += '''
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_reverse_selection_direction() {
+        let mut doc = DocumentState::new_empty();
+        doc.set_text("abcdef");
+        doc.set_selection(5, 2);
+
+        assert_eq!(doc.selection_range(), Some(2..5));
+        assert_eq!(doc.selection_anchor, Some(5));
+        assert_eq!(doc.cursor, 2);
+
+        let anchor = doc.selection_anchor.unwrap();
+        doc.set_selection(anchor, 1);
+        assert_eq!(doc.selection_range(), Some(1..5));
+        assert_eq!(doc.selection_anchor, Some(5));
+        assert_eq!(doc.cursor, 1);
+    }
+}
+'''
+          document.write_text(text)
+
+          # Preview: selection state spans multiple selectable text blocks.
+          render_mod = Path("third_party/gpui-gfm/render/mod.rs")
+          text = render_mod.read_text()
+          start = text.find("/// Currently active text selection (drag in progress or completed).")
+          end = text.find("\n/// Clamp a byte index to a valid UTF-8 char boundary.", start)
+          if start < 0 or end < 0:
+              raise SystemExit("SelectionState block boundaries not found")
+          selection_impl = r'''/// Currently active text selection (drag in progress or completed).
+#[derive(Clone, Debug)]
+pub struct ActiveSelection {
+  /// Text block containing the fixed selection anchor.
+  pub anchor_text_id: usize,
+  /// Byte offset of the anchor inside `anchor_text_id`.
+  pub anchor: usize,
+  /// Text block containing the moving selection head.
+  pub head_text_id: usize,
+  /// Byte offset of the head inside `head_text_id`.
+  pub head: usize,
+  /// Whether the user is currently dragging.
+  pub dragging: bool,
+  /// Selection granularity (char / word / line).
+  pub mode: SelectionMode,
+  /// The initially-selected range from the click point (word or line range).
+  /// This range belongs to `anchor_text_id`.
+  pub initial_range: Option<std::ops::Range<usize>>,
+}
+
+/// Persistent state for text selection across all rendered text blocks.
+///
+/// Text block IDs are assigned in document order, so an anchor and head can
+/// describe one continuous selection even when they live in different blocks.
+#[derive(Clone, Default)]
+pub struct SelectionState {
+  selection: Arc<Mutex<Option<ActiveSelection>>>,
+  counter: Arc<AtomicUsize>,
+  selection_color: Arc<Mutex<Option<Hsla>>>,
+  /// Text content registered for the current render pass, indexed by text ID.
+  texts: Arc<Mutex<Vec<SharedString>>>,
+}
+
+impl SelectionState {
+  /// Reset text-block IDs before a render pass while retaining the selection.
+  pub fn reset_counter(&self) {
+    self.counter.store(0, Ordering::Relaxed);
+    self.texts.lock().unwrap().clear();
+  }
+
+  pub fn next_text_id(&self) -> usize {
+    self.counter.fetch_add(1, Ordering::Relaxed)
+  }
+
+  /// Register text for cross-block clipboard extraction.
+  pub fn register_text(&self, text_id: usize, text: SharedString) {
+    let mut texts = self.texts.lock().unwrap();
+    while texts.len() < text_id {
+      texts.push(SharedString::new_static(""));
+    }
+    if text_id == texts.len() {
+      texts.push(text);
+    } else {
+      texts[text_id] = text;
+    }
+  }
+
+  pub fn set_selection_color(&self, color: Hsla) {
+    *self.selection_color.lock().unwrap() = Some(color);
+  }
+
+  pub fn selection_color(&self) -> Hsla {
+    self.selection_color.lock().unwrap().unwrap_or(Hsla {
+      h: 0.58,
+      s: 0.6,
+      l: 0.5,
+      a: 0.3,
+    })
+  }
+
+  /// Update selection endpoints while preserving mode metadata.
+  pub fn update(
+    &self,
+    anchor_text_id: usize,
+    anchor: usize,
+    head_text_id: usize,
+    head: usize,
+    dragging: bool,
+  ) {
+    let mut sel = self.selection.lock().unwrap();
+    let (mode, initial_range) = sel
+      .as_ref()
+      .filter(|s| s.anchor_text_id == anchor_text_id)
+      .map(|s| (s.mode, s.initial_range.clone()))
+      .unwrap_or((SelectionMode::Char, None));
+    *sel = Some(ActiveSelection {
+      anchor_text_id,
+      anchor,
+      head_text_id,
+      head,
+      dragging,
+      mode,
+      initial_range,
+    });
+  }
+
+  pub fn update_with_mode(
+    &self,
+    anchor_text_id: usize,
+    anchor: usize,
+    head_text_id: usize,
+    head: usize,
+    dragging: bool,
+    mode: SelectionMode,
+    initial_range: Option<std::ops::Range<usize>>,
+  ) {
+    *self.selection.lock().unwrap() = Some(ActiveSelection {
+      anchor_text_id,
+      anchor,
+      head_text_id,
+      head,
+      dragging,
+      mode,
+      initial_range,
+    });
+  }
+
+  pub fn clear(&self) {
+    *self.selection.lock().unwrap() = None;
+  }
+
+  /// Return the active selection regardless of which block owns the mouse.
+  pub fn active_selection(&self) -> Option<ActiveSelection> {
+    self.selection.lock().unwrap().clone()
+  }
+
+  /// Return the active selection when it intersects this text block.
+  pub fn selection_for(&self, text_id: usize) -> Option<ActiveSelection> {
+    let active = self.active_selection()?;
+    let min_id = active.anchor_text_id.min(active.head_text_id);
+    let max_id = active.anchor_text_id.max(active.head_text_id);
+    (text_id >= min_id && text_id <= max_id).then_some(active)
+  }
+
+  pub fn is_dragging(&self) -> bool {
+    self
+      .selection
+      .lock()
+      .unwrap()
+      .as_ref()
+      .is_some_and(|s| s.dragging)
+  }
+
+  /// Get the local byte range selected inside one rendered text block.
+  pub fn selection_range_for(&self, text_id: usize, text: &str) -> Option<std::ops::Range<usize>> {
+    let active = self.active_selection()?;
+    local_selection_range(&active, text_id, text)
+  }
+
+  /// Extract the complete selection across all registered text blocks.
+  pub fn selected_text(&self) -> Option<String> {
+    let active = self.active_selection()?;
+    if active.anchor_text_id == active.head_text_id && active.anchor == active.head {
+      return None;
+    }
+
+    let texts = self.texts.lock().unwrap();
+    let start_id = active.anchor_text_id.min(active.head_text_id);
+    let end_id = active.anchor_text_id.max(active.head_text_id);
+    if start_id >= texts.len() || end_id >= texts.len() {
+      return None;
+    }
+
+    let mut parts = Vec::new();
+    for text_id in start_id..=end_id {
+      let text = texts[text_id].as_ref();
+      if let Some(range) = local_selection_range(&active, text_id, text) {
+        if let Some(slice) = text.get(range) {
+          parts.push(slice.to_string());
+        }
+      }
+    }
+
+    if parts.is_empty() { None } else { Some(parts.join("\n")) }
+  }
+}
+
+fn local_selection_range(
+  active: &ActiveSelection,
+  text_id: usize,
+  text: &str,
+) -> Option<std::ops::Range<usize>> {
+  let anchor_point = (active.anchor_text_id, active.anchor);
+  let head_point = (active.head_text_id, active.head);
+  if anchor_point == head_point {
+    return None;
+  }
+
+  let ((start_id, start_offset), (end_id, end_offset)) = if anchor_point <= head_point {
+    (anchor_point, head_point)
+  } else {
+    (head_point, anchor_point)
+  };
+
+  if text_id < start_id || text_id > end_id {
+    return None;
+  }
+
+  let text_len = text.len();
+  let (start, end) = if start_id == end_id {
+    (
+      clamp_to_char_boundary(text, start_offset.min(text_len)),
+      clamp_to_char_boundary(text, end_offset.min(text_len)),
+    )
+  } else if text_id == start_id {
+    (clamp_to_char_boundary(text, start_offset.min(text_len)), text_len)
+  } else if text_id == end_id {
+    (0, clamp_to_char_boundary(text, end_offset.min(text_len)))
+  } else {
+    (0, text_len)
+  };
+
+  (start < end).then_some(start..end)
+}
+'''
+          text = text[:start] + selection_impl + text[end:]
+
+          tests_start = text.find("  // --- SelectionState tests ---")
+          tests_end = text.find("  // --- apply_selection_to_runs tests ---", tests_start)
+          if tests_start < 0 or tests_end < 0:
+              raise SystemExit("SelectionState tests boundaries not found")
+          selection_tests = r'''  // --- SelectionState tests ---
+
+  #[test]
+  fn selection_state_default() {
+    let state = SelectionState::default();
+    assert!(!state.is_dragging());
+    assert!(state.active_selection().is_none());
+    assert!(state.selection_range_for(0, "hello").is_none());
+  }
+
+  #[test]
+  fn selection_state_counter() {
+    let state = SelectionState::default();
+    assert_eq!(state.next_text_id(), 0);
+    assert_eq!(state.next_text_id(), 1);
+    state.reset_counter();
+    assert_eq!(state.next_text_id(), 0);
+  }
+
+  #[test]
+  fn selection_state_same_block_range() {
+    let state = SelectionState::default();
+    state.update(0, 2, 0, 5, false);
+    assert_eq!(state.selection_range_for(0, "hello world"), Some(2..5));
+    state.update(0, 5, 0, 2, false);
+    assert_eq!(state.selection_range_for(0, "hello world"), Some(2..5));
+  }
+
+  #[test]
+  fn selection_state_crosses_blocks_forward() {
+    let state = SelectionState::default();
+    state.register_text(0, "first".into());
+    state.register_text(1, "middle".into());
+    state.register_text(2, "last".into());
+    state.update(0, 2, 2, 3, false);
+
+    assert_eq!(state.selection_range_for(0, "first"), Some(2..5));
+    assert_eq!(state.selection_range_for(1, "middle"), Some(0..6));
+    assert_eq!(state.selection_range_for(2, "last"), Some(0..3));
+    assert_eq!(state.selected_text(), Some("rst\nmiddle\nlas".to_string()));
+  }
+
+  #[test]
+  fn selection_state_crosses_blocks_backward() {
+    let state = SelectionState::default();
+    state.register_text(0, "first".into());
+    state.register_text(1, "middle".into());
+    state.register_text(2, "last".into());
+    state.update(2, 3, 0, 2, false);
+
+    assert_eq!(state.selection_range_for(0, "first"), Some(2..5));
+    assert_eq!(state.selection_range_for(1, "middle"), Some(0..6));
+    assert_eq!(state.selection_range_for(2, "last"), Some(0..3));
+    assert_eq!(state.selected_text(), Some("rst\nmiddle\nlas".to_string()));
+  }
+
+  #[test]
+  fn selection_state_empty_range() {
+    let state = SelectionState::default();
+    state.update(0, 3, 0, 3, false);
+    assert!(state.selection_range_for(0, "hello").is_none());
+    assert!(state.selected_text().is_none());
+  }
+
+  #[test]
+  fn selection_state_clear() {
+    let state = SelectionState::default();
+    state.update(0, 0, 0, 5, true);
+    assert!(state.is_dragging());
+    state.clear();
+    assert!(!state.is_dragging());
+    assert!(state.active_selection().is_none());
+  }
+
+  #[test]
+  fn selection_state_color_default() {
+    let state = SelectionState::default();
+    let color = state.selection_color();
+    assert!(color.a < 1.0);
+  }
+
+  #[test]
+  fn selection_state_custom_color() {
+    let state = SelectionState::default();
+    let red = Hsla {
+      h: 0.0,
+      s: 1.0,
+      l: 0.5,
+      a: 0.4,
+    };
+    state.set_selection_color(red);
+    let color = state.selection_color();
+    assert_eq!(color.h, 0.0);
+    assert_eq!(color.a, 0.4);
+  }
+
+'''
+          text = text[:tests_start] + selection_tests + text[tests_end:]
+          render_mod.write_text(text)
+
+          # SelectableText: register each block, then allow the active drag head
+          # to move into any hovered text block.
+          selectable = Path("third_party/gpui-gfm/render/selectable_text.rs")
+          text = selectable.read_text()
+          old_ctor = '''    let styled_text = StyledText::new(text.clone()).with_runs(base_runs.clone());
+    Self {'''
+          new_ctor = '''    selection_state.register_text(text_id, text.clone());
+    let styled_text = StyledText::new(text.clone()).with_runs(base_runs.clone());
+    Self {'''
+          if old_ctor not in text:
+              raise SystemExit("SelectableText constructor marker not found")
+          text = text.replace(old_ctor, new_ctor, 1)
+
+          # Update mousedown calls to the new endpoint-aware API.
+          text = text.replace(
+            '''              text_id,
+              range.start,
+              range.end,
+              true,
+              SelectionMode::Word,''',
+            '''              text_id,
+              range.start,
+              text_id,
+              range.end,
+              true,
+              SelectionMode::Word,''',
+            1,
+          )
+          text = text.replace(
+            '''              text_id,
+              range.start,
+              range.end,
+              true,
+              SelectionMode::Line,''',
+            '''              text_id,
+              range.start,
+              text_id,
+              range.end,
+              true,
+              SelectionMode::Line,''',
+            1,
+          )
+          text = text.replace(
+            '''              text_id,
+              index,
+              index,
+              true,
+              SelectionMode::Char,''',
+            '''              text_id,
+              index,
+              text_id,
+              index,
+              true,
+              SelectionMode::Char,''',
+            1,
+          )
+
+          move_start = text.find("    // Mouse-move: extend the selection while dragging.")
+          move_end = text.find("\n    // Mouse-up: finalise selection", move_start)
+          if move_start < 0 or move_end < 0:
+              raise SystemExit("SelectableText mouse-move boundaries not found")
+          move_block = r'''    // Mouse-move: extend the active selection into whichever text block is hovered.
+    let text_for_move = text.clone();
+    window.on_mouse_event({
+      let hitbox = hitbox.clone();
+      let selection_state = selection_state.clone();
+      let text_layout = text_layout.clone();
+      move |event: &MouseMoveEvent, phase, window, _cx| {
+        if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
+          return;
+        }
+
+        let Some(active) = selection_state.active_selection() else {
+          return;
+        };
+        if !active.dragging {
+          return;
+        }
+
+        let index = text_layout
+          .index_for_position(event.position)
+          .unwrap_or_else(|ix| ix);
+        let index = clamp_to_char_boundary(text_for_move.as_ref(), index.min(text_len));
+        let (anchor_text_id, new_anchor, head_text_id, new_head) = selection_endpoints_for_index(
+          &active,
+          text_id,
+          index,
+          text_for_move.as_ref(),
+        );
+        selection_state.update(
+          anchor_text_id,
+          new_anchor,
+          head_text_id,
+          new_head,
+          true,
+        );
+        window.refresh();
+      }
+    });
+'''
+          text = text[:move_start] + move_block + text[move_end:]
+
+          up_start = text.find("    // Mouse-up: finalise selection")
+          up_end = text.find("\n    // Paint the styled text.", up_start)
+          if up_start < 0 or up_end < 0:
+              raise SystemExit("SelectableText mouse-up boundaries not found")
+          up_block = r'''    // Mouse-up: finalise the selection in the block under the pointer.
+    let text_for_up = text.clone();
+    window.on_mouse_event({
+      let hitbox = hitbox.clone();
+      let selection_state = selection_state.clone();
+      let text_layout = text_layout.clone();
+      move |event: &MouseUpEvent, phase, window, cx| {
+        if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
+          return;
+        }
+
+        let Some(active) = selection_state.active_selection() else {
+          return;
+        };
+        if !active.dragging {
+          return;
+        }
+
+        let index = text_layout
+          .index_for_position(event.position)
+          .unwrap_or_else(|ix| ix);
+        let index = clamp_to_char_boundary(text_for_up.as_ref(), index.min(text_len));
+        let (anchor_text_id, final_anchor, head_text_id, final_head) =
+          selection_endpoints_for_index(&active, text_id, index, text_for_up.as_ref());
+
+        selection_state.update(
+          anchor_text_id,
+          final_anchor,
+          head_text_id,
+          final_head,
+          false,
+        );
+
+        if let Some(selected) = selection_state.selected_text() {
+          if !selected.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(selected));
+          }
+        } else {
+          // Empty selection (click) → handle link.
+          if let Some(link_url) = link_ranges
+            .iter()
+            .find(|lr| lr.range.contains(&index))
+            .map(|lr| lr.url.clone())
+          {
+            if let Some(handler) = &on_link {
+              handler(&link_url, window, cx);
+            } else {
+              cx.open_url(&link_url);
+            }
+          }
+        }
+
+        window.refresh();
+      }
+    });
+'''
+          text = text[:up_start] + up_block + text[up_end:]
+
+          helper_marker = "\nimpl IntoElement for SelectableText {"
+          helper = r'''
+
+fn selection_endpoints_for_index(
+  active: &super::ActiveSelection,
+  current_text_id: usize,
+  index: usize,
+  current_text: &str,
+) -> (usize, usize, usize, usize) {
+  match active.mode {
+    SelectionMode::Word => {
+      let initial = active.initial_range.as_ref().expect("word selection needs initial range");
+      let current = word_range_at(current_text, index);
+      let before_anchor = current_text_id < active.anchor_text_id
+        || (current_text_id == active.anchor_text_id && index < initial.start);
+      if before_anchor {
+        (active.anchor_text_id, initial.end, current_text_id, current.start)
+      } else {
+        (active.anchor_text_id, initial.start, current_text_id, current.end)
+      }
+    }
+    SelectionMode::Line => {
+      let initial = active.initial_range.as_ref().expect("line selection needs initial range");
+      let current = line_range_at(current_text, index);
+      let before_anchor = current_text_id < active.anchor_text_id
+        || (current_text_id == active.anchor_text_id && index < initial.start);
+      if before_anchor {
+        (active.anchor_text_id, initial.end, current_text_id, current.start)
+      } else {
+        (active.anchor_text_id, initial.start, current_text_id, current.end)
+      }
+    }
+    SelectionMode::Char => (
+      active.anchor_text_id,
+      active.anchor,
+      current_text_id,
+      index,
+    ),
+  }
+}
+'''
+          if helper_marker not in text:
+              raise SystemExit("SelectableText IntoElement marker not found")
+          text = text.replace(helper_marker, helper + helper_marker, 1)
+          selectable.write_text(text)
+
+          # Code blocks: always render at full vertical height and never intercept
+          # vertical wheel events. Horizontal scrolling remains for long lines.
+          code_block = Path("third_party/gpui-gfm/render/code_block.rs")
+          text = code_block.read_text()
+          text = text.replace(
+            '''/// Maximum height (px) before vertical scroll kicks in.\nconst CODE_BLOCK_MAX_HEIGHT_PX: f32 = 500.0;\n''',
+            '',
+            1,
+          )
+          capped = '''  // Cap height and enable Y scroll (no-op for short blocks).
+  // Stop scroll-wheel propagation so the parent container doesn't scroll
+  // simultaneously (scroll chaining).
+  if !options.expand_code_blocks {
+    code_area = code_area
+      .max_h(px(CODE_BLOCK_MAX_HEIGHT_PX))
+      .overflow_y_scroll()
+      .on_scroll_wheel(|_, _, cx| {
+        cx.stop_propagation();
+      });
+  }
+
+'''
+          if capped not in text:
+              raise SystemExit("code block vertical scroll block not found")
+          text = text.replace(capped, '', 1)
+          code_block.write_text(text)
+
+          # Keep the public option for compatibility, but document its new no-op behavior.
+          text = render_mod.read_text()
+          text = text.replace(
+            '''  /// Whether code blocks render at full height (no scroll cap).\n  pub expand_code_blocks: bool,''',
+            '''  /// Legacy compatibility flag. Code blocks now always render at full height.\n  pub expand_code_blocks: bool,''',
+            1,
+          )
+          render_mod.write_text(text)
+          PY
+
+          # Format only Aster-owned code; preserve the vendored renderer's style.
+          rustfmt --edition 2024 src/model/document.rs
+
+      - name: Cargo check
+        run: cargo check
+
+      - name: Document reverse-selection test
+        run: cargo test preserves_reverse_selection_direction
+
+      - name: gpui-gfm selection tests
+        run: cargo test --manifest-path third_party/gpui-gfm/Cargo.toml selection_state_
+
+      - name: Commit fixes
+        if: success()
+        run: |
+          if [[ -n "$(git status --porcelain -- src/model/document.rs third_party/gpui-gfm)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add src/model/document.rs \
+              third_party/gpui-gfm/render/mod.rs \
+              third_party/gpui-gfm/render/selectable_text.rs \
+              third_party/gpui-gfm/render/code_block.rs
+            git commit -m "Fix selection direction and preview scrolling"
+            git push origin HEAD:${{ github.head_ref }}
+          fi
