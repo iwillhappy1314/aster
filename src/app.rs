@@ -156,11 +156,18 @@ pub fn run() {
             cx.quit();
         });
         cx.on_action(|_: &CloseWindow, cx| {
-            if let Some(window) = cx.active_window()
-                && let Some(handle) = window.downcast::<RootView>()
-            {
-                let _ = handle.update(cx, |root, window, cx| {
-                    root.action_close_window(window, cx);
+            let target_window = cx.active_window().or_else(|| {
+                cx.window_stack()
+                    .and_then(|windows| windows.first().copied())
+            });
+
+            if let Some(window) = target_window {
+                cx.defer(move |cx| {
+                    if let Some(handle) = window.downcast::<RootView>() {
+                        let _ = handle.update(cx, |root, window, cx| {
+                            root.action_close_window(window, cx);
+                        });
+                    }
                 });
             }
         });
