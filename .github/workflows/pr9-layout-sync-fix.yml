@@ -27,8 +27,6 @@ jobs:
           path = Path("src/ui/editor.rs")
           text = path.read_text()
 
-          # The old implementation queried a freshly-created TextLayout during Render,
-          # before GPUI had measured/prepainted it. Remove those render-time helpers.
           start = text.index("    fn sync_outline_viewport(")
           end = text.index("    fn selection_highlights", start)
           text = text[:start] + text[end:]
@@ -96,9 +94,6 @@ fn reveal_source_byte_after_layout(
     let mut next = current;
 
     if align_to_top {
-        // TextLayout positions are already in painted/window coordinates and include
-        // the current scroll translation. Move the current offset by the remaining
-        // distance to the editor's 24px top content inset.
         let desired_top = viewport.top() + px(24.);
         next.y = current.y + (desired_top - target_pos.y);
     } else {
@@ -196,7 +191,7 @@ fn reveal_source_byte_after_layout(
           path.write_text(text)
 
       - name: Format
-        run: cargo fmt --all -- --check
+        run: cargo fmt --all
 
       - name: Test Outline helpers
         run: cargo test ui::file_explorer::tests --bin Aster
@@ -207,7 +202,6 @@ fn reveal_source_byte_after_layout(
       - name: Commit validated fix and remove temporary workflow
         shell: bash
         run: |
-          cargo fmt --all
           rm -f .github/workflows/pr9-layout-sync-fix.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
