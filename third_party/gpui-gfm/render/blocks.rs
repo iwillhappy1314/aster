@@ -2,7 +2,7 @@
 
 use gpui::{AnyElement, App, MouseButton, SharedString, div, prelude::*, px};
 
-use crate::typography::{heading_font_size_px, heading_font_weight};
+use crate::typography::{heading_font_size, heading_font_weight};
 use crate::types::*;
 
 use super::ListItemView;
@@ -96,7 +96,7 @@ fn render_block(
       let heading_level = *level as u8;
       let el = div()
         .text_color(theme.foreground)
-        .text_size(px(heading_font_size_px(heading_level)))
+        .text_size(heading_font_size(heading_level))
         .font_weight(heading_font_weight(heading_level))
         .child(render_inline_text(content, options, cx))
         .into_any_element();
