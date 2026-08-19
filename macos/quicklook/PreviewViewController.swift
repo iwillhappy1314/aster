@@ -46,7 +46,10 @@ final class PreviewViewController: NSViewController, QLPreviewingController, WKN
         NSLog("AsterQuickLook: preparing %@", url.path)
 
         do {
-            loadViewIfNeeded()
+            // Accessing `view` is the AppKit-compatible way to force lazy view
+            // loading on macOS 11+. Apple documents that this invokes loadView()
+            // when the primary view has not been created yet.
+            _ = view
             removeTemporaryPreview()
 
             let markdown = try String(contentsOf: url, encoding: .utf8)
