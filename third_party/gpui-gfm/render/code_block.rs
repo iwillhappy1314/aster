@@ -10,8 +10,6 @@ use crate::types::CodeBlock;
 
 use super::MarkdownRenderOptions;
 
-/// Maximum height (px) before vertical scroll kicks in.
-const CODE_BLOCK_MAX_HEIGHT_PX: f32 = 500.0;
 const CODE_BLOCK_PADDING_X_PX: f32 = 12.0;
 const CODE_BLOCK_PADDING_TOP_PX: f32 = 8.0;
 const CODE_BLOCK_PADDING_BOTTOM_PX: f32 = 8.0;
@@ -94,7 +92,8 @@ pub fn render_code_block(
     );
   }
 
-  // Code content — needs an id to support scrolling
+  // Code content scrolls horizontally for long lines, but always participates
+  // in the page's vertical scrolling instead of creating a nested scroll area.
   let code_id: SharedString = format!("md-code-{:x}", code as *const CodeBlock as usize).into();
   let code_font = Font {
     family: theme.code_font_family.clone(),
@@ -114,18 +113,6 @@ pub fn render_code_block(
     .font(code_font)
     .whitespace_nowrap()
     .overflow_x_scroll();
-
-  // Cap height and enable Y scroll (no-op for short blocks).
-  // Stop scroll-wheel propagation so the parent container doesn't scroll
-  // simultaneously (scroll chaining).
-  if !options.expand_code_blocks {
-    code_area = code_area
-      .max_h(px(CODE_BLOCK_MAX_HEIGHT_PX))
-      .overflow_y_scroll()
-      .on_scroll_wheel(|_, _, cx| {
-        cx.stop_propagation();
-      });
-  }
 
   // Build the code text child — use CodeBlockText when indentation dots are enabled,
   // otherwise plain SharedString for simplicity.
