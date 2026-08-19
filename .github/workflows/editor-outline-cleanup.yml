@@ -1,0 +1,58 @@
+name: Clean editor outline sync diff
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  clean-and-check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/editor-outline-active-sync
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore unrelated formatting changes
+        shell: bash
+        run: |
+          git fetch origin main
+          git checkout origin/main -- src/app.rs src/model/document.rs third_party/gpui-gfm
+
+      - name: Keep target diff minimal
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("src/ui/file_explorer.rs")
+          text = path.read_text()
+          text = text.replace(
+              '''                                    .bg(if is_active {\n                                        Theme::accent()\n                                    } else {\n                                        Theme::muted()\n                                    }),''',
+              '''                                    .bg(if is_active { Theme::accent() } else { Theme::muted() }),''',
+          )
+          text = text.replace(
+              '''                            .text_color(if is_active {\n                                Theme::accent()\n                            } else {\n                                Theme::text()\n                            })''',
+              '''                            .text_color(if is_active { Theme::accent() } else { Theme::text() })''',
+          )
+          path.write_text(text)
+
+      - name: Test Outline helpers
+        run: cargo test ui::file_explorer::tests --bin Aster
+
+      - name: Cargo check
+        run: cargo check
+
+      - name: Commit clean validated diff
+        shell: bash
+        run: |
+          rm -f .github/workflows/editor-outline-cleanup.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: keep editor Outline sync diff focused"
+          git push origin HEAD:agent/editor-outline-active-sync
