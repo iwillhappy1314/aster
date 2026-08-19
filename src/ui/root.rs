@@ -88,8 +88,8 @@ impl RootView {
             font_size: settings::get_font_size(),
             sidebar_width: 300.0,
             resizing_sidebar: false,
-            outline_visible: false,
-            preview_visible: true,
+            outline_visible: settings::get_outline_visible(),
+            preview_visible: settings::get_preview_visible(),
             preview_scroll_handle: ScrollHandle::new(),
             preview_scroll_indicator_visible: false,
             preview_scroll_indicator_revision: 0,
@@ -348,6 +348,7 @@ impl RootView {
     /// Toggles the optional document outline without changing the document state.
     fn toggle_outline(&mut self, cx: &mut Context<Self>) {
         self.outline_visible = !self.outline_visible;
+        settings::set_outline_visible(self.outline_visible);
         self.resizing_sidebar = false;
         cx.notify();
     }
@@ -355,6 +356,7 @@ impl RootView {
     /// Switches between the rendered preview and the editable Markdown source view.
     fn toggle_preview(&mut self, cx: &mut Context<Self>) {
         self.preview_visible = !self.preview_visible;
+        settings::set_preview_visible(self.preview_visible);
         cx.notify();
     }
 
