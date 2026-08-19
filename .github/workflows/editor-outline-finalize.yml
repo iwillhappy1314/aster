@@ -1,0 +1,103 @@
+name: Finalize editor Outline sync
+
+on:
+  push:
+    branches:
+      - agent/editor-outline-active-sync
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/editor-outline-active-sync
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Fix mode-switch and PageUp/PageDown synchronization
+        shell: python
+        run: |
+          from pathlib import Path
+
+          editor = Path("src/ui/editor.rs")
+          text = editor.read_text()
+
+          old = '''    pub fn set_on_outline_viewport_change(&mut self, callback: OutlineViewportCallback) {
+        self.on_outline_viewport_change = Some(callback);
+        self.last_outline_viewport_report = None;
+    }
+
+'''
+          new = '''    pub fn set_on_outline_viewport_change(&mut self, callback: OutlineViewportCallback) {
+        self.on_outline_viewport_change = Some(callback);
+        self.last_outline_viewport_report = None;
+    }
+
+    /// Forces the next editor render to report its viewport again.
+    /// Preview can change the shared Outline active state while the editor is hidden,
+    /// so returning to edit mode must not be suppressed by the editor's local dedupe.
+    pub fn invalidate_outline_viewport_report(&mut self) {
+        self.last_outline_viewport_report = None;
+    }
+
+'''
+          assert old in text
+          text = text.replace(old, new, 1)
+
+          old = '''                                    this.scroll_handle
+                                        .set_offset(point(new_offset.x, new_offset.y));
+                                    window.refresh();
+'''
+          new = '''                                    this.scroll_handle
+                                        .set_offset(point(new_offset.x, new_offset.y));
+                                    cx.notify();
+                                    window.refresh();
+'''
+          assert old in text
+          text = text.replace(old, new, 1)
+          editor.write_text(text)
+
+          root = Path("src/ui/root.rs")
+          text = root.read_text()
+          old = '''    fn toggle_preview(&mut self, cx: &mut Context<Self>) {
+        self.preview_visible = !self.preview_visible;
+        cx.notify();
+    }
+'''
+          new = '''    fn toggle_preview(&mut self, cx: &mut Context<Self>) {
+        self.preview_visible = !self.preview_visible;
+        if !self.preview_visible {
+            let _ = self.editor_view.update(cx, |editor, _| {
+                editor.invalidate_outline_viewport_report();
+            });
+        }
+        cx.notify();
+    }
+'''
+          assert old in text
+          text = text.replace(old, new, 1)
+          root.write_text(text)
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Test Outline helpers
+        run: cargo test ui::file_explorer::tests --bin Aster
+
+      - name: Cargo check
+        run: cargo check
+
+      - name: Commit validated fix and remove temporary workflow
+        shell: bash
+        run: |
+          rm -f .github/workflows/editor-outline-finalize.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/ui/editor.rs src/ui/root.rs .github/workflows/editor-outline-finalize.yml
+          git commit -m "fix: complete editor Outline synchronization"
+          git push origin HEAD:agent/editor-outline-active-sync
