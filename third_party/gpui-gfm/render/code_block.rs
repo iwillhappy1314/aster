@@ -3,12 +3,13 @@
 use gpui::{
   AnyElement, App, Bounds, ClipboardItem, Element, ElementId, Font, GlobalElementId, Hitbox,
   HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, MouseButton, Pixels,
-  SharedString, StyledText, Window, div, fill, point, prelude::*, px,
+  SharedString, StyledText, TextRun, Window, div, fill, point, prelude::*, px,
 };
 
 use crate::types::CodeBlock;
 
 use super::MarkdownRenderOptions;
+use super::selectable_text::SelectableText;
 
 const CODE_BLOCK_PADDING_X_PX: f32 = 12.0;
 const CODE_BLOCK_PADDING_TOP_PX: f32 = 8.0;
@@ -110,17 +111,34 @@ pub fn render_code_block(
     .pb(px(CODE_BLOCK_PADDING_BOTTOM_PX))
     .text_sm()
     .text_color(theme.foreground)
-    .font(code_font)
+    .font(code_font.clone())
     .whitespace_nowrap()
     .overflow_x_scroll();
 
-  // Build the code text child — use CodeBlockText when indentation dots are enabled,
-  // otherwise plain SharedString for simplicity.
+  // Keep the indentation-dot renderer when explicitly enabled. The normal Aster
+  // preview path uses SelectableText so code supports click-drag selection and
+  // copies the selected range on mouse-up just like paragraph text.
   if options.show_indentation_dots {
     let dot_color = theme.muted_foreground.opacity(INDENT_DOT_OPACITY);
     code_area = code_area.child(CodeBlockText::new(text, dot_color));
   } else {
-    code_area = code_area.child(text);
+    let text_id = options.selection_state.next_text_id();
+    let runs = vec![TextRun {
+      len: display_value.len(),
+      font: code_font,
+      color: theme.foreground,
+      underline: None,
+      strikethrough: None,
+      background_color: None,
+    }];
+    code_area = code_area.child(SelectableText::new(
+      text,
+      runs,
+      Vec::new(),
+      options.selection_state.clone(),
+      None,
+      text_id,
+    ));
   }
 
   // Wrap code area + copy button in a relative container so the button
