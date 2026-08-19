@@ -1,7 +1,8 @@
 use crate::commands::{
     About, CloseWindow, Copy, Cut, Find, FindNext, FindPrevious, FontSizeDecrease,
-    FontSizeIncrease, FontSizeReset, NewFile, OpenFile, Paste, Quit, Redo, SaveFile, SaveFileAs,
-    SelectAll, ThemeAyuDark, ThemeAyuLight, ThemeAyuMirage, ToggleOutline, TogglePreview, Undo,
+    FontSizeIncrease, FontSizeReset, NewFile, OpenFile, OutlinePositionLeft, OutlinePositionRight,
+    Paste, Quit, Redo, SaveFile, SaveFileAs, SelectAll, ThemeAyuDark, ThemeAyuLight,
+    ThemeAyuMirage, ToggleOutline, TogglePreview, Undo,
 };
 use crate::services::assets::AsterAssetSource;
 use crate::services::fs::{read_to_string, write_atomic};
@@ -106,6 +107,13 @@ pub fn run() {
                 name: "View".into(),
                 items: vec![
                     MenuItem::action("Show or Hide Outline", ToggleOutline),
+                    MenuItem::submenu(Menu {
+                        name: "Outline Position".into(),
+                        items: vec![
+                            MenuItem::action("Left", OutlinePositionLeft),
+                            MenuItem::action("Right", OutlinePositionRight),
+                        ],
+                    }),
                     MenuItem::action("Toggle Preview", TogglePreview),
                     MenuItem::separator(),
                     MenuItem::submenu(Menu {
