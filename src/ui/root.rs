@@ -682,9 +682,7 @@ impl Render for RootView {
                                         // Add breathing room above subsequent headings by
                                         // increasing the block gap used by the Markdown renderer.
                                         .style(
-                                            TextViewStyle::default()
-                                                .paragraph_gap(gpui::rems(1.5))
-                                                .heading_gap(gpui::rems(1.)),
+                                            TextViewStyle::default().paragraph_gap(gpui::rems(1.5)),
                                         )
                                         .selectable(true),
                                     ),

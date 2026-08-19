@@ -30,10 +30,6 @@ gpui-component = "0.4.0"
 url = "2.5.7"
 futures = "0.3.31"
 
-# Local fork of gpui-component so we can add heading top-gap styling.
-[patch.crates-io]
-gpui-component = { path = "third_party/gpui-component" }
-
 [package.metadata.bundle]
 identifier = "com.kumarujjawal.aster"
 name = "Aster"
