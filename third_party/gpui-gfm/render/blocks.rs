@@ -93,15 +93,15 @@ fn render_block(
     }
 
     Block::Heading { level, content } => {
-      let level = *level as u8;
+      let heading_level = *level as u8;
       let el = div()
         .text_color(theme.foreground)
-        .text_size(px(heading_font_size_px(level)))
-        .font_weight(heading_font_weight(level))
+        .text_size(px(heading_font_size_px(heading_level)))
+        .font_weight(heading_font_weight(heading_level))
         .child(render_inline_text(content, options, cx))
         .into_any_element();
       if let Some(override_fn) = options.overrides.heading.as_ref() {
-        override_fn(*level as _, el, cx)
+        override_fn(*level, el, cx)
       } else {
         el
       }
