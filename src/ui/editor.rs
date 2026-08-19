@@ -964,7 +964,6 @@ impl Render for EditorView {
                                         if doc.cursor < len {
                                             let end = (doc.cursor + 1).min(len);
                                             doc.delete_range(doc.cursor..end);
-                                            doc.cursor = doc.cursor;
                                             doc.commit_edit();
                                             cx_doc.notify();
                                         }
