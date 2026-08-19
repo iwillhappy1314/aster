@@ -1,0 +1,14 @@
+name: Agent Outline Active Check
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  cargo-check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check
