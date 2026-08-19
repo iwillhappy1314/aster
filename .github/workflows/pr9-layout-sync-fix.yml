@@ -1,9 +1,9 @@
 name: PR9 Layout Sync Fix
 
 on:
-  pull_request:
+  push:
     branches:
-      - main
+      - agent/editor-outline-active-sync
 
 permissions:
   contents: write
@@ -120,7 +120,7 @@ fn reveal_source_byte_after_layout(
 '''
           marker = "\n}\n\nimpl Focusable for EditorView"
           assert marker in text
-          text = text.replace(marker, marker.replace("\n\nimpl Focusable", helpers + "\n\nimpl Focusable"), 1)
+          text = text.replace(marker, "\n}\n" + helpers + "\nimpl Focusable for EditorView", 1)
 
           old = '''        let text_layout = styled.layout().clone();
         let had_pending_reveal =
@@ -132,6 +132,8 @@ fn reveal_source_byte_after_layout(
         let has_multiple_lines = text_owned.lines().nth(1).is_some();
 '''
           new = '''        let text_layout = styled.layout().clone();
+        let text_layout_for_sync = text_layout.clone();
+        let text_layout_for_caret = text_layout.clone();
         let pending_reveal = self
             .pending_outline_reveal_byte
             .take()
@@ -145,23 +147,28 @@ fn reveal_source_byte_after_layout(
           assert old in text
           text = text.replace(old, new, 1)
 
-          old = '''                                move |_bounds: Bounds<_>,
+          old = '''                            canvas(
+                                move |_, _, _| {},
+                                move |_bounds: Bounds<_>,
                                       (),
                                       window: &mut Window,
                                       _cx: &mut App| {
                                     if !draw_caret {
                                         return;
                                     }
+
+                                    let caret_pos =
+                                        std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                            text_layout.position_for_index(cursor_display_byte)
+                                        }))
 '''
-          new = '''                                move |_bounds: Bounds<_>,
-                                      (),
-                                      window: &mut Window,
-                                      cx: &mut App| {
+          new = '''                            canvas(
+                                move |_, window: &mut Window, cx: &mut App| {
                                     let had_pending_reveal = pending_reveal.is_some();
                                     if let Some((source_byte, align_to_top)) = pending_reveal {
                                         reveal_source_byte_after_layout(
                                             &outline_scroll_handle,
-                                            &text_layout,
+                                            &text_layout_for_sync,
                                             outline_projection.as_ref(),
                                             source_byte,
                                             align_to_top,
@@ -174,16 +181,32 @@ fn reveal_source_byte_after_layout(
                                         && let Some(source_byte) =
                                             source_byte_at_viewport_activation_line(
                                                 &outline_scroll_handle,
-                                                &text_layout,
+                                                &text_layout_for_sync,
                                                 outline_projection.as_ref(),
                                             )
                                     {
                                         callback(source_byte, cx);
                                     }
-
+                                },
+                                move |_bounds: Bounds<_>,
+                                      (),
+                                      window: &mut Window,
+                                      _cx: &mut App| {
                                     if !draw_caret {
                                         return;
                                     }
+
+                                    let caret_pos =
+                                        std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                            text_layout_for_caret.position_for_index(cursor_display_byte)
+                                        }))
+'''
+          assert old in text
+          text = text.replace(old, new, 1)
+
+          old = '''                                            text_layout.line_height()
+'''
+          new = '''                                            text_layout_for_caret.line_height()
 '''
           assert old in text
           text = text.replace(old, new, 1)
