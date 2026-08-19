@@ -14,6 +14,7 @@ pub mod estimate;
 pub mod github;
 pub mod parse;
 pub mod render;
+pub mod typography;
 pub mod types;
 
 // Re-export main public API.
@@ -25,4 +26,5 @@ pub use render::{
   RenderedMarkdownBlocks, render_markdown, render_markdown_blocks_cached, render_markdown_cached,
   render_parsed_markdown, render_parsed_markdown_blocks,
 };
+pub use typography::{heading_font_size, heading_font_weight};
 pub use types::ParsedMarkdown;

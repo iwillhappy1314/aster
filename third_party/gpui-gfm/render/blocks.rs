@@ -2,6 +2,7 @@
 
 use gpui::{AnyElement, App, MouseButton, SharedString, div, prelude::*, px};
 
+use crate::typography::{heading_font_size, heading_font_weight};
 use crate::types::*;
 
 use super::ListItemView;
@@ -92,16 +93,11 @@ fn render_block(
     }
 
     Block::Heading { level, content } => {
-      let el = div().text_color(theme.foreground);
-      let el = match level {
-        1 => el.text_3xl().font_weight(gpui::FontWeight::BOLD),
-        2 => el.text_2xl().font_weight(gpui::FontWeight::SEMIBOLD),
-        3 => el.text_xl().font_weight(gpui::FontWeight::SEMIBOLD),
-        4 => el.text_lg().font_weight(gpui::FontWeight::MEDIUM),
-        5 => el.text_base().font_weight(gpui::FontWeight::MEDIUM),
-        _ => el.text_sm().font_weight(gpui::FontWeight::MEDIUM),
-      };
-      let el = el
+      let heading_level = *level as u8;
+      let el = div()
+        .text_color(theme.foreground)
+        .text_size(heading_font_size(heading_level))
+        .font_weight(heading_font_weight(heading_level))
         .child(render_inline_text(content, options, cx))
         .into_any_element();
       if let Some(override_fn) = options.overrides.heading.as_ref() {
