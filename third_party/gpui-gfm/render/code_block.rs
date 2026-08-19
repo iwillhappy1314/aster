@@ -92,8 +92,9 @@ pub fn render_code_block(
     );
   }
 
-  // Code content scrolls horizontally for long lines, but always participates
-  // in the page's vertical scrolling instead of creating a nested scroll area.
+  // Keep the code area out of GPUI's scroll-container path entirely. Its
+  // height is intrinsic to the full code content, so the parent preview owns
+  // all vertical scrolling and wheel events.
   let code_id: SharedString = format!("md-code-{:x}", code as *const CodeBlock as usize).into();
   let code_font = Font {
     family: theme.code_font_family.clone(),
@@ -105,14 +106,15 @@ pub fn render_code_block(
 
   let mut code_area = div()
     .id(code_id)
+    .w_full()
+    .min_w_0()
     .px(px(CODE_BLOCK_PADDING_X_PX))
     .pt(px(CODE_BLOCK_PADDING_TOP_PX))
     .pb(px(CODE_BLOCK_PADDING_BOTTOM_PX))
     .text_sm()
     .text_color(theme.foreground)
     .font(code_font)
-    .whitespace_nowrap()
-    .overflow_x_scroll();
+    .whitespace_nowrap();
 
   // Build the code text child — use CodeBlockText when indentation dots are enabled,
   // otherwise plain SharedString for simplicity.
