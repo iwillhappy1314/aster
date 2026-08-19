@@ -1,18 +1,20 @@
 use crate::commands::{
     About, CloseWindow, Copy, Cut, Find, FindNext, FindPrevious, FontSizeDecrease,
     FontSizeIncrease, FontSizeReset, NewFile, OpenFile, Paste, Quit, Redo, SaveFile, SaveFileAs,
-    SelectAll, ToggleOutline, TogglePreview, Undo,
+    SelectAll, ThemeAyuDark, ThemeAyuLight, ThemeAyuMirage, ToggleOutline, TogglePreview, Undo,
 };
 use crate::services::assets::AsterAssetSource;
 use crate::services::fs::{read_to_string, write_atomic};
 use crate::services::settings;
 use crate::ui::root::RootView;
+use crate::ui::theme::ThemeName;
 use camino::Utf8PathBuf;
 use gpui::{
     App, AppContext, Application, Bounds, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType,
     TitlebarOptions, Window, WindowBounds, WindowOptions, point, px, size,
 };
 use gpui_component::notification::NotificationList;
+use gpui_component::theme::{Theme as ComponentTheme, ThemeMode};
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -106,6 +108,15 @@ pub fn run() {
                     MenuItem::action("Show or Hide Outline", ToggleOutline),
                     MenuItem::action("Toggle Preview", TogglePreview),
                     MenuItem::separator(),
+                    MenuItem::submenu(Menu {
+                        name: "Theme".into(),
+                        items: vec![
+                            MenuItem::action("Ayu Light", ThemeAyuLight),
+                            MenuItem::action("Ayu Dark", ThemeAyuDark),
+                            MenuItem::action("Ayu Mirage", ThemeAyuMirage),
+                        ],
+                    }),
+                    MenuItem::separator(),
                     MenuItem::action("Increase Font Size", FontSizeIncrease),
                     MenuItem::action("Decrease Font Size", FontSizeDecrease),
                     MenuItem::action("Reset Font Size", FontSizeReset),
@@ -136,6 +147,18 @@ pub fn run() {
 
             cx.quit();
         });
+        cx.on_action(|_: &CloseWindow, cx| {
+            if let Some(window) = cx.active_window()
+                && let Some(handle) = window.downcast::<RootView>()
+            {
+                let _ = handle.update(cx, |root, window, cx| {
+                    root.action_close_window(window, cx);
+                });
+            }
+        });
+        cx.on_action(|_: &ThemeAyuLight, cx| apply_theme(ThemeName::AyuLight, cx));
+        cx.on_action(|_: &ThemeAyuDark, cx| apply_theme(ThemeName::AyuDark, cx));
+        cx.on_action(|_: &ThemeAyuMirage, cx| apply_theme(ThemeName::AyuMirage, cx));
         cx.on_action(|_: &About, _cx| {
             MessageDialog::new()
                 .set_level(MessageLevel::Info)
@@ -188,6 +211,17 @@ pub fn run() {
             })
             .detach();
     });
+}
+
+/// Switches the active theme, syncs the Markdown preview's light/dark mode, and
+/// repaints every open window with the new palette.
+fn apply_theme(name: ThemeName, cx: &mut App) {
+    let is_dark = crate::ui::theme::set_theme(name);
+    let mode = if is_dark { ThemeMode::Dark } else { ThemeMode::Light };
+    ComponentTheme::change(mode, None, cx);
+    for window in cx.windows() {
+        let _ = window.update(cx, |_, window, _| window.refresh());
+    }
 }
 
 fn open_window(cx: &mut App, initial_path: Option<Utf8PathBuf>) -> anyhow::Result<()> {

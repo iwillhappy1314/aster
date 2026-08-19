@@ -1,6 +1,6 @@
 use crate::commands::{
-    CloseWindow, FontSizeDecrease, FontSizeIncrease, FontSizeReset, NewFile, OpenFile, SaveFile,
-    SaveFileAs, ToggleOutline, TogglePreview,
+    FontSizeDecrease, FontSizeIncrease, FontSizeReset, NewFile, OpenFile, SaveFile, SaveFileAs,
+    ToggleOutline, TogglePreview,
 };
 use crate::model::document::DocumentState;
 use crate::model::inline_markdown::InlineMarkdownState;
@@ -21,7 +21,10 @@ use gpui::{
     MouseMoveEvent, ParentElement, Render, ScrollHandle, StatefulInteractiveElement, Styled,
     Window, canvas, div, fill, point, px, size,
 };
-use gpui_component::{notification::NotificationList, text::TextView};
+use gpui_component::{
+    notification::NotificationList,
+    text::{TextView, TextViewStyle},
+};
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use std::time::Duration;
 
@@ -317,7 +320,7 @@ impl RootView {
         self.save_document(cx, true);
     }
 
-    fn action_close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn action_close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.confirm_can_discard_changes(window, cx, "Save changes before closing?") {
             return;
         }
@@ -369,14 +372,9 @@ impl RootView {
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (doc_path, doc_dirty, doc_revision, word_count) = {
+        let (doc_path, doc_dirty, doc_revision) = {
             self.document.update(cx, |doc, _| {
-                (
-                    doc.path.clone(),
-                    doc.dirty,
-                    doc.revision,
-                    doc.get_word_count(),
-                )
+                (doc.path.clone(), doc.dirty, doc.revision)
             })
         };
 
@@ -442,22 +440,6 @@ impl Render for RootView {
             }
         }
 
-        let (inline_parse_millis, inline_dropped_updates) = {
-            let inline = self.inline_markdown.read(cx);
-            (inline.parse_millis, inline.dropped_updates)
-        };
-        // Expose inline parser timing in status for quick perf monitoring.
-        let status_right = if inline_dropped_updates > 0 {
-            format!(
-                "{} words · inline {:.1} ms · dropped {}",
-                word_count, inline_parse_millis, inline_dropped_updates
-            )
-        } else {
-            format!(
-                "{} words · inline {:.1} ms",
-                word_count, inline_parse_millis
-            )
-        };
         // Use size_full() instead of explicit pixel dimensions to ensure proper layout
 
         let window_title = {
@@ -469,21 +451,6 @@ impl Render for RootView {
             format!("{name}{dirty} — Aster")
         };
         window.set_window_title(&window_title);
-
-        let top_chrome = div()
-            .id("window-chrome")
-            .h(px(38.))
-            .w_full()
-            .bg(Theme::panel())
-            .border_b_1()
-            .border_color(Theme::border())
-            .flex_shrink_0()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_, _: &MouseDownEvent, window, _| {
-                    window.start_window_move();
-                }),
-            );
 
         let resize_line_color = if self.resizing_sidebar {
             gpui::rgba(0x2d7fd299)
@@ -501,16 +468,23 @@ impl Render for RootView {
             Theme::muted()
         };
 
-        let bottom_bar = div()
+        let top_chrome = div()
+            .id("window-chrome")
+            .h(px(38.))
+            .w_full()
+            .bg(Theme::bg())
             .flex()
             .items_center()
+            .justify_end()
             .gap_3()
-            .px(px(16.))
-            .py(px(4.))
-            .bg(Theme::panel())
-            .border_t_1()
-            .border_color(Theme::border())
+            .pr(px(12.))
             .flex_shrink_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _: &MouseDownEvent, window, _| {
+                    window.start_window_move();
+                }),
+            )
             .child(
                 div()
                     .id("outline-toggle")
@@ -521,6 +495,7 @@ impl Render for RootView {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
                             this.toggle_outline(cx);
                         }),
                     )
@@ -552,6 +527,7 @@ impl Render for RootView {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
                             this.toggle_preview(cx);
                         }),
                     )
@@ -573,16 +549,6 @@ impl Render for RootView {
                             .child(div().w_full().h(px(1.)).bg(mode_toggle_color))
                             .child(div().w(px(6.)).h(px(1.)).bg(mode_toggle_color)),
                     ),
-            )
-            .child(
-                div().flex_1().flex().justify_end().child(
-                    div()
-                        .text_sm()
-                        .text_color(Theme::muted())
-                        .overflow_hidden()
-                        .max_w(px(640.))
-                        .child(status_right),
-                ),
             );
 
         div()
@@ -603,9 +569,6 @@ impl Render for RootView {
             }))
             .on_action(cx.listener(|this, _: &SaveFileAs, window, cx| {
                 this.action_save_as(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &CloseWindow, window, cx| {
-                this.action_close_window(window, cx);
             }))
             .on_action(cx.listener(|this, _: &FontSizeIncrease, _window, cx| {
                 this.font_size =
@@ -716,6 +679,13 @@ impl Render for RootView {
                                         .pl(px(32.))
                                         .pr(px(32.))
                                         .py(px(24.))
+                                        // Add breathing room above subsequent headings by
+                                        // increasing the block gap used by the Markdown renderer.
+                                        .style(
+                                            TextViewStyle::default()
+                                                .paragraph_gap(gpui::rems(1.5))
+                                                .heading_gap(gpui::rems(1.)),
+                                        )
                                         .selectable(true),
                                     ),
                             )
@@ -783,7 +753,6 @@ impl Render for RootView {
                             .into_any_element()
                     }),
             )
-            .child(bottom_bar)
             .child(self.notifications.clone())
     }
 }

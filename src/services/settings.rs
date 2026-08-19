@@ -1,3 +1,4 @@
+use crate::ui::theme::ThemeName;
 use directories::ProjectDirs;
 use gpui::{Bounds, Pixels, point, px, size};
 use serde::{Deserialize, Serialize};
@@ -11,9 +12,16 @@ pub struct Settings {
     /// Font size in points (8-32, default 14)
     #[serde(default = "default_font_size")]
     pub font_size: f32,
+    /// Active color theme.
+    #[serde(default = "default_theme_name")]
+    pub theme_name: ThemeName,
     /// Last valid normal-window geometry, restored on the next launch.
     #[serde(default)]
     pub window_geometry: Option<WindowGeometry>,
+}
+
+fn default_theme_name() -> ThemeName {
+    ThemeName::AyuLight
 }
 
 /// Persisted normal-window position and size in screen pixels.
@@ -63,6 +71,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             font_size: default_font_size(),
+            theme_name: default_theme_name(),
             window_geometry: None,
         }
     }
@@ -161,6 +170,21 @@ pub fn set_font_size(size: f32) {
     let clamped = Settings::clamp_font_size(size);
     if let Ok(mut manager) = settings().lock() {
         manager.update(|s| s.font_size = clamped);
+    }
+}
+
+/// Returns the currently persisted theme name.
+pub fn get_theme_name() -> ThemeName {
+    settings()
+        .lock()
+        .map(|s| s.get().theme_name)
+        .unwrap_or_default()
+}
+
+/// Persists the active theme name.
+pub fn set_theme_name(name: ThemeName) {
+    if let Ok(mut manager) = settings().lock() {
+        manager.update(|s| s.theme_name = name);
     }
 }
 
