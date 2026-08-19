@@ -1,0 +1,10 @@
+[package]
+name = "gpui-component"
+version = "0.4.2"
+edition = "2024"
+publish = false
+
+[dependencies]
+gpui = "0.2.2"
+gpui-component-upstream = { package = "gpui-component", version = "=0.4.2" }
+gpui-gfm = { git = "https://github.com/joris-gallot/gpui-gfm", rev = "34c588a52611d3d30bb6f10e5df9536a3770362" }
