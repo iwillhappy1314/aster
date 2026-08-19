@@ -18,56 +18,136 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Apply gpui 0.2.2 compatibility patch
+      - name: Integrate gpui-gfm directly
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
-          replacements = {
-              Path("third_party/gpui-gfm/render/code_block.rs"): [
-                  (
-                      """  let code_font = Font {\n    family: theme.code_font_family.clone(),\n    ..Default::default()\n  };""",
-                      """  let code_font = Font {\n    family: theme.code_font_family.clone(),\n    features: Default::default(),\n    fallbacks: None,\n    weight: Default::default(),\n    style: Default::default(),\n  };""",
-                  ),
-              ],
-              Path("third_party/gpui-gfm/render/code_preview.rs"): [
-                  (
-                      """  let code_font = Font {\n    family: theme.code_font_family.clone(),\n    weight: FontWeight::NORMAL,\n    style: FontStyle::Normal,\n    ..Default::default()\n  };""",
-                      """  let code_font = Font {\n    family: theme.code_font_family.clone(),\n    features: Default::default(),\n    fallbacks: None,\n    weight: FontWeight::NORMAL,\n    style: FontStyle::Normal,\n  };""",
-                  ),
-              ],
-              Path("third_party/gpui-gfm/render/inline.rs"): [
-                  (
-                      """      Font {\n        family: theme.code_font_family.clone(),\n        weight: font_weight,\n        style: font_style,\n        ..Default::default()\n      }""",
-                      """      Font {\n        family: theme.code_font_family.clone(),\n        features: Default::default(),\n        fallbacks: None,\n        weight: font_weight,\n        style: font_style,\n      }""",
-                  ),
-                  (
-                      """      Font {\n        weight: font_weight,\n        style: font_style,\n        ..Default::default()\n      }""",
-                      """      Font {\n        family: \".SystemUIFont\".into(),\n        features: Default::default(),\n        fallbacks: None,\n        weight: font_weight,\n        style: font_style,\n      }""",
-                  ),
-              ],
-          }
+          cargo = Path("Cargo.toml")
+          cargo_text = cargo.read_text()
+          old_dep = 'gpui-component = { path = "third_party/gpui-component-gfm" }'
+          new_dep = 'gpui-component = "0.4.2"\ngpui-gfm = { path = "third_party/gpui-gfm" }'
+          if old_dep not in cargo_text:
+              raise SystemExit("expected gpui-component bridge dependency not found")
+          cargo.write_text(cargo_text.replace(old_dep, new_dep, 1))
 
-          for path, pairs in replacements.items():
-              text = path.read_text()
-              original = text
-              for old, new in pairs:
-                  if old not in text:
-                      raise SystemExit(f"expected compatibility pattern not found in {path}")
-                  text = text.replace(old, new, 1)
-              if text != original:
-                  path.write_text(text)
+          root = Path("src/ui/root.rs")
+          text = root.read_text()
+
+          old_import = '''use gpui_component::{
+              notification::NotificationList,
+              text::{TextView, TextViewStyle},
+          };'''
+          new_import = '''use gpui_component::notification::NotificationList;
+          use gpui_gfm::{MarkdownCache, MarkdownRenderOptions, MarkdownTheme, render_markdown_cached};'''
+          if old_import not in text:
+              raise SystemExit("expected preview imports not found")
+          text = text.replace(old_import, new_import, 1)
+
+          old_fields = '''    /// Monotonic revision used to prevent an older hide timer from hiding a newer scroll event.
+              preview_scroll_indicator_revision: u64,
+          }'''
+          new_fields = '''    /// Monotonic revision used to prevent an older hide timer from hiding a newer scroll event.
+              preview_scroll_indicator_revision: u64,
+              /// Persistent gpui-gfm state so selection and interactive Markdown survive re-renders.
+              preview_markdown_options: MarkdownRenderOptions,
+              /// Parsed Markdown cache reused by the preview across GPUI render passes.
+              preview_markdown_cache: MarkdownCache,
+          }'''
+          if old_fields not in text:
+              raise SystemExit("expected RootView preview fields not found")
+          text = text.replace(old_fields, new_fields, 1)
+
+          old_init = '''            preview_scroll_indicator_visible: false,
+              preview_scroll_indicator_revision: 0,
+          }'''
+          new_init = '''            preview_scroll_indicator_visible: false,
+              preview_scroll_indicator_revision: 0,
+              preview_markdown_options: MarkdownRenderOptions::default(),
+              preview_markdown_cache: MarkdownCache::default(),
+          }'''
+          if old_init not in text:
+              raise SystemExit("expected RootView preview initialization not found")
+          text = text.replace(old_init, new_init, 1)
+
+          marker = '''                        let show_preview_scroll_indicator = self.preview_scroll_indicator_visible;
+          '''
+          insertion = '''                        let show_preview_scroll_indicator = self.preview_scroll_indicator_visible;
+                          let markdown_theme = MarkdownTheme {
+                              foreground: Theme::text().into(),
+                              muted_foreground: Theme::muted().into(),
+                              background: Theme::bg().into(),
+                              code_background: Theme::code_block_bg().into(),
+                              border: Theme::border().into(),
+                              link: Theme::accent().into(),
+                              accent: Theme::accent().into(),
+                              code_font_family: "Menlo".into(),
+                              is_dark: Theme::is_dark(),
+                          };
+                          let markdown_options = self
+                              .preview_markdown_options
+                              .clone()
+                              .with_theme(markdown_theme);
+                          let markdown_content = render_markdown_cached(
+                              &doc_text,
+                              &markdown_options,
+                              &mut self.preview_markdown_cache,
+                              cx,
+                          );
+          '''
+          if marker not in text:
+              raise SystemExit("expected preview block marker not found")
+          text = text.replace(marker, insertion, 1)
+
+          preview_pattern = re.compile(
+              r'''TextView::markdown\(\s*"markdown-preview",\s*doc_text,\s*window,\s*cx,\s*\)\s*
+                  \.h_auto\(\)\s*
+                  \.pl\(px\(32\.\)\)\s*
+                  \.pr\(px\(32\.\)\)\s*
+                  \.py\(px\(24\.\)\)\s*
+                  // Add breathing room above subsequent headings by\s*
+                  // increasing the block gap used by the Markdown renderer\.\s*
+                  \.style\(\s*TextViewStyle::default\(\)\.paragraph_gap\(gpui::rems\(1\.5\)\),\s*\)\s*
+                  \.selectable\(true\)''',
+              re.VERBOSE,
+          )
+          replacement = '''div()
+                                          .h_auto()
+                                          .pl(px(32.))
+                                          .pr(px(32.))
+                                          .py(px(24.))
+                                          .child(markdown_content)'''
+          text, count = preview_pattern.subn(replacement, text, count=1)
+          if count != 1:
+              raise SystemExit(f"expected one TextView preview block, replaced {count}")
+
+          root.write_text(text)
           PY
 
-      - name: Commit compatibility patch
+          rm -rf third_party/gpui-component-gfm
+          rustfmt --edition 2024 src/ui/root.rs
+
+      - name: Commit direct renderer integration
         run: |
-          if [[ -n "$(git status --porcelain -- third_party/gpui-gfm)" ]]; then
+          if [[ -n "$(git status --porcelain -- Cargo.toml src/ui/root.rs third_party/gpui-component-gfm)" ]]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add third_party/gpui-gfm
-            git commit -m "Adapt gpui-gfm fonts for GPUI 0.2.2"
+            git add Cargo.toml src/ui/root.rs third_party/gpui-component-gfm
+            git commit -m "Integrate gpui-gfm preview directly"
             git push origin HEAD:${{ github.head_ref }}
           fi
 
       - name: Cargo check
         run: cargo check
+
+      - name: Commit Cargo.lock
+        if: success()
+        run: |
+          if ! git diff --quiet -- Cargo.lock; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Cargo.lock
+            git commit -m "Update Cargo.lock for gpui-gfm"
+            git push origin HEAD:${{ github.head_ref }}
+          fi
