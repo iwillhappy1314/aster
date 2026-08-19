@@ -1,19 +1,19 @@
 //! Shared Markdown typography tokens used by the preview renderer and host editors.
 
-use gpui::FontWeight;
-
-/// The preview renderer's body text size (`text_sm`).
-pub const BODY_FONT_SIZE_PX: f32 = 14.0;
+use gpui::{FontWeight, Rems, rems};
 
 /// Returns the canonical font size for a Markdown heading level.
-pub fn heading_font_size_px(level: u8) -> f32 {
+///
+/// These values intentionally mirror GPUI's `text_3xl` through `text_sm`
+/// helpers so editor and preview remain identical even if the window rem size changes.
+pub fn heading_font_size(level: u8) -> Rems {
   match level {
-    1 => 30.0,
-    2 => 24.0,
-    3 => 20.0,
-    4 => 18.0,
-    5 => 16.0,
-    _ => 14.0,
+    1 => rems(1.875),
+    2 => rems(1.5),
+    3 => rems(1.25),
+    4 => rems(1.125),
+    5 => rems(1.0),
+    _ => rems(0.875),
   }
 }
 
@@ -32,11 +32,11 @@ mod tests {
 
   #[test]
   fn heading_sizes_match_preview_scale() {
-    assert_eq!(heading_font_size_px(1), 30.0);
-    assert_eq!(heading_font_size_px(2), 24.0);
-    assert_eq!(heading_font_size_px(3), 20.0);
-    assert_eq!(heading_font_size_px(4), 18.0);
-    assert_eq!(heading_font_size_px(5), 16.0);
-    assert_eq!(heading_font_size_px(6), 14.0);
+    assert_eq!(heading_font_size(1), rems(1.875));
+    assert_eq!(heading_font_size(2), rems(1.5));
+    assert_eq!(heading_font_size(3), rems(1.25));
+    assert_eq!(heading_font_size(4), rems(1.125));
+    assert_eq!(heading_font_size(5), rems(1.0));
+    assert_eq!(heading_font_size(6), rems(0.875));
   }
 }
