@@ -15,6 +15,8 @@ actions!(
         FontSizeReset,
         NewFile,
         OpenFile,
+        OutlinePositionLeft,
+        OutlinePositionRight,
         Paste,
         Quit,
         Redo,
