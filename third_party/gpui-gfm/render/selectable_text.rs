@@ -188,6 +188,7 @@ impl Element for SelectableText {
 
         match event.click_count {
           2 => {
+            // Double click → select word.
             let range = word_range_at(text_for_down.as_ref(), index);
             selection_state.update_with_mode(
               text_id,
@@ -199,6 +200,7 @@ impl Element for SelectableText {
             );
           }
           3 => {
+            // Triple click → select line.
             let range = line_range_at(text_for_down.as_ref(), index);
             selection_state.update_with_mode(
               text_id,
@@ -210,6 +212,7 @@ impl Element for SelectableText {
             );
           }
           _ => {
+            // Single click → character-level anchor.
             selection_state.update_with_mode(
               text_id,
               index,
@@ -226,6 +229,9 @@ impl Element for SelectableText {
       }
     });
 
+    // Mouse-move: extend the selection while dragging.
+    // For word/line mode, extend to the full word/line at the cursor position
+    // while keeping the original anchor word/line intact.
     let text_for_move = text.clone();
     window.on_mouse_event({
       let selection_state = selection_state.clone();
@@ -247,8 +253,10 @@ impl Element for SelectableText {
                 let initial = active.initial_range.as_ref().unwrap();
                 let current_word = word_range_at(text_for_move.as_ref(), index);
                 if index < initial.start {
+                  // Dragging before initial word → anchor at end of initial, head at start of current.
                   (initial.end, current_word.start)
                 } else {
+                  // Dragging after or within initial word → anchor at start of initial, head at end of current.
                   (initial.start, current_word.end)
                 }
               }
@@ -271,6 +279,7 @@ impl Element for SelectableText {
       }
     });
 
+    // Mouse-up: finalise selection → copy to clipboard, or handle link click.
     let text_for_up = text.clone();
     let text_for_copy = text.clone();
     window.on_mouse_event({
@@ -294,6 +303,7 @@ impl Element for SelectableText {
           .unwrap_or_else(|ix| ix);
         let index = clamp_to_char_boundary(text_for_up.as_ref(), index.min(text_len));
 
+        // Snap to word/line boundaries — same logic as mouse-move.
         let (final_anchor, final_head) = match active.mode {
           SelectionMode::Word => {
             let initial = active.initial_range.as_ref().unwrap();
@@ -316,13 +326,16 @@ impl Element for SelectableText {
           SelectionMode::Char => (active.anchor, index),
         };
 
+        // Stop dragging.
         selection_state.update(text_id, final_anchor, final_head, false);
 
+        // Check if there's a non-empty selection.
         if let Some(selected) = selection_state.selected_text(text_id, text_for_copy.as_ref()) {
           if !selected.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(selected));
           }
         } else if hitbox.is_hovered(window) {
+          // Empty selection (click) → handle link.
           if let Some(link_url) = link_ranges
             .iter()
             .find(|lr| lr.range.contains(&index))
@@ -340,6 +353,7 @@ impl Element for SelectableText {
       }
     });
 
+    // Paint the styled text.
     self
       .styled_text
       .paint(None, inspector_id, bounds, &mut (), &mut (), window, cx);
