@@ -1,10 +1,9 @@
-# retrigger after workflow exists on branch
 name: PR9 Final Check
 
 on:
   pull_request:
     branches:
-      - main
+      - agent/editor-outline-active-sync
 
 permissions:
   contents: write
