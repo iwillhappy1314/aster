@@ -12,6 +12,7 @@ use gpui::{
     MouseMoveEvent, ParentElement, Render, ScrollHandle, StatefulInteractiveElement, Styled,
     StyledText, UnderlineStyle, Window, canvas, combine_highlights, div, fill, point, px, size,
 };
+use pulldown_cmark::{Event, Parser, Tag};
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -182,6 +183,12 @@ pub struct EditorView {
     scroll_indicator_revision: u64,
     /// Cached text with revision to avoid repeated rope-to-string conversions
     cached_text: Option<(u64, String)>,
+    /// Cached Markdown heading source offsets for edit-mode Outline synchronization.
+    cached_outline_headings: Option<(u64, Vec<usize>)>,
+    /// Last heading ordinal reported for the current editor scroll position.
+    active_outline_ordinal: Option<usize>,
+    /// Called when editor scrolling moves the active Outline section.
+    on_active_outline: Option<Arc<dyn Fn(Option<usize>, &mut App)>>,
     /// Find panel state.
     search_active: bool,
     search_query: String,
@@ -208,6 +215,9 @@ impl EditorView {
             scroll_indicator_visible: false,
             scroll_indicator_revision: 0,
             cached_text: None,
+            cached_outline_headings: None,
+            active_outline_ordinal: None,
+            on_active_outline: None,
             search_active: false,
             search_query: String::new(),
             search_current_match: 0,
@@ -272,6 +282,71 @@ impl EditorView {
         self.pending_scroll_to_byte = None;
         self.pending_outline_reveal_byte = Some(byte);
         cx.notify();
+    }
+
+    pub fn set_on_active_outline(
+        &mut self,
+        callback: Arc<dyn Fn(Option<usize>, &mut App)>,
+    ) {
+        self.on_active_outline = Some(callback);
+    }
+
+    fn outline_heading_bytes(&mut self, text: &str, revision: u64) -> Vec<usize> {
+        if let Some((cached_revision, headings)) = &self.cached_outline_headings
+            && *cached_revision == revision
+        {
+            return headings.clone();
+        }
+
+        let headings = markdown_heading_starts(text);
+        self.cached_outline_headings = Some((revision, headings.clone()));
+        headings
+    }
+
+    fn sync_outline_active(
+        &mut self,
+        text_layout: &gpui::TextLayout,
+        projection: &DisplayProjection,
+        text: &str,
+        revision: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let heading_bytes = self.outline_heading_bytes(text, revision);
+        let next_active = if heading_bytes.is_empty() {
+            None
+        } else {
+            // The editor text itself begins after 24px top padding. Match preview's
+            // 32px activation line by using an 8px threshold inside the text layout.
+            let activation_y = -self.scroll_handle.offset().y + px(8.);
+            let mut active = Some(0usize);
+
+            for (ordinal, source_byte) in heading_bytes.into_iter().enumerate() {
+                let display_byte = projection.source_to_display_byte(source_byte);
+                let position = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    text_layout.position_for_index(display_byte)
+                }))
+                .ok()
+                .flatten();
+                let Some(position) = position else {
+                    continue;
+                };
+
+                if position.y <= activation_y {
+                    active = Some(ordinal);
+                } else {
+                    break;
+                }
+            }
+
+            active
+        };
+
+        if self.active_outline_ordinal != next_active {
+            self.active_outline_ordinal = next_active;
+            if let Some(callback) = self.on_active_outline.clone() {
+                callback(next_active, cx);
+            }
+        }
     }
 
     fn selection_highlights(&self, doc: &DocumentState) -> Vec<(Range<usize>, HighlightStyle)> {
@@ -641,6 +716,13 @@ impl Render for EditorView {
 
         let text_layout = styled.layout().clone();
         self.reveal_pending_byte(&text_layout, projection.as_ref(), window);
+        self.sync_outline_active(
+            &text_layout,
+            projection.as_ref(),
+            &text_owned,
+            doc_revision,
+            cx,
+        );
         let has_multiple_lines = text_owned.lines().nth(1).is_some();
         let editor_scroll_handle = self.scroll_handle.clone();
         let show_scroll_indicator = self.scroll_indicator_visible;
@@ -884,6 +966,7 @@ impl Render for EditorView {
                                         (new_offset.y + delta).clamp(-max.height, px(0.));
                                     this.scroll_handle
                                         .set_offset(point(new_offset.x, new_offset.y));
+                                    cx.notify();
                                     window.refresh();
                                 }
                                 return;
@@ -1177,6 +1260,19 @@ impl Render for EditorView {
     }
 }
 
+fn markdown_heading_starts(text: &str) -> Vec<usize> {
+    Parser::new(text)
+        .into_offset_iter()
+        .filter_map(|(event, range)| {
+            if matches!(event, Event::Start(Tag::Heading { .. })) {
+                Some(range.start)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn syntax_style(
     kind: SyntaxKind,
     hide_markers: bool,
@@ -1442,5 +1538,16 @@ mod tests {
         let spans = markdown_spans(source);
         let projection = DisplayProjection::from_source(source, &spans);
         assert_eq!(projection.display_text, "Hi");
+    }
+
+    #[test]
+    fn markdown_heading_starts_follow_parser_semantics() {
+        let text = "# One\n\n```md\n## Not a heading\n```\n\nTwo\n---\n\n### Three\n";
+        let starts = markdown_heading_starts(text);
+
+        assert_eq!(starts.len(), 3);
+        assert_eq!(starts[0], text.find("# One").unwrap());
+        assert_eq!(starts[1], text.find("Two").unwrap());
+        assert_eq!(starts[2], text.find("### Three").unwrap());
     }
 }
