@@ -254,6 +254,13 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Scrolls the editor so the current cursor is visible.
+    pub fn reveal_cursor(&mut self, cx: &mut Context<Self>) {
+        let byte = self.document.read(cx).char_to_byte(self.document.read(cx).cursor);
+        self.pending_scroll_to_byte = Some(byte);
+        cx.notify();
+    }
+
     fn selection_highlights(&self, doc: &DocumentState) -> Vec<(Range<usize>, HighlightStyle)> {
         doc.selection_bytes().map_or_else(Vec::new, |range| {
             vec![(

@@ -3,9 +3,10 @@ use crate::ui::text_utils::ellipsize_chars;
 use crate::ui::theme::Theme;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Context, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    Render, ScrollHandle, StatefulInteractiveElement, Styled, Window, div, px,
+    App, Context, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, Render, ScrollHandle, StatefulInteractiveElement, Styled, Window, div, px,
 };
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 struct OutlineItem {
@@ -15,11 +16,18 @@ struct OutlineItem {
     byte_start: usize,
 }
 
+/// Callback invoked when an outline entry is selected, receiving the heading's
+/// byte offset in the document.
+pub type RevealCallback = Arc<dyn Fn(usize, &mut App)>;
+
 pub struct FileExplorerView {
     document: Entity<DocumentState>,
     outline_scroll_handle: ScrollHandle,
     width: f32,
     cached_outline: Option<(u64, Vec<OutlineItem>)>,
+    /// Called when an outline entry is clicked so the host can scroll the
+    /// editor/preview to that section.
+    on_reveal: Option<RevealCallback>,
 }
 
 impl FileExplorerView {
@@ -29,12 +37,18 @@ impl FileExplorerView {
             outline_scroll_handle: ScrollHandle::new(),
             width: 200.0,
             cached_outline: None,
+            on_reveal: None,
         }
     }
 
     pub fn set_width(&mut self, width: f32, cx: &mut gpui::Context<Self>) {
         self.width = width;
         cx.notify();
+    }
+
+    /// Registers the callback invoked when an outline entry is selected.
+    pub fn set_on_reveal(&mut self, callback: RevealCallback) {
+        self.on_reveal = Some(callback);
     }
 }
 
@@ -68,6 +82,7 @@ impl Render for FileExplorerView {
                 let byte_start = item.byte_start;
                 let indent = (level.saturating_sub(1) as f32) * 10.0;
                 let document = document.clone();
+                let on_reveal = self.on_reveal.clone();
                 div()
                     .id(("outline-entry", ordinal))
                     .flex()
@@ -86,6 +101,9 @@ impl Render for FileExplorerView {
                                 doc.set_cursor(cursor);
                                 cx.notify();
                             });
+                            if let Some(on_reveal) = on_reveal.clone() {
+                                on_reveal(byte_start, cx);
+                            }
                         }),
                     )
                     .child(

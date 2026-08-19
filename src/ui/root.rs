@@ -41,6 +41,8 @@ pub struct RootView {
     scheduled_inline_revision: u64,
     /// Cached document text to avoid O(n) rope-to-string conversion every frame
     cached_doc_text: Option<(u64, String)>,
+    /// Whether we've installed the outline-click reveal callback.
+    outline_reveal_installed: bool,
     /// Current font size in points (8-32)
     font_size: f32,
     /// Current sidebar width in pixels
@@ -76,6 +78,7 @@ impl RootView {
             inline_debounce: Debouncer::new(Duration::from_millis(35)),
             scheduled_inline_revision: 0,
             cached_doc_text: None,
+            outline_reveal_installed: false,
             font_size: settings::get_font_size(),
             sidebar_width: 200.0,
             resizing_sidebar: false,
@@ -372,6 +375,29 @@ impl RootView {
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Install the outline-click reveal callback once. It scrolls both the
+        // editor (to the cursor) and the preview (proportionally) to the
+        // selected heading.
+        if !self.outline_reveal_installed {
+            self.outline_reveal_installed = true;
+            let editor = self.editor_view.clone();
+            let document = self.document.clone();
+            let preview_scroll = self.preview_scroll_handle.clone();
+            let callback: crate::ui::file_explorer::RevealCallback =
+                std::sync::Arc::new(move |byte_start, cx: &mut App| {
+                    let _ = editor.update(cx, |editor, cx| editor.reveal_cursor(cx));
+                    let max_offset: f32 = preview_scroll.max_offset().height.into();
+                    if max_offset > 0.0 {
+                        let doc_len = document.read(cx).text().len().max(1);
+                        let frac = (byte_start as f32 / doc_len as f32).clamp(0.0, 1.0);
+                        preview_scroll.set_offset(point(px(0.), px(-frac * max_offset)));
+                    }
+                });
+            let _ = self
+                .file_explorer_view
+                .update(cx, |view, _| view.set_on_reveal(callback));
+        }
+
         let (doc_path, doc_dirty, doc_revision) = {
             self.document.update(cx, |doc, _| {
                 (doc.path.clone(), doc.dirty, doc.revision)
