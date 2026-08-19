@@ -17,15 +17,16 @@ use crate::ui::theme::Theme;
 use camino::Utf8PathBuf;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, Bounds, Context, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ParentElement, Render, ScrollHandle, StatefulInteractiveElement, Styled,
-    Window, canvas, div, fill, point, px, size,
+    App, Bounds, Context, Entity, ExternalPaths, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, MouseMoveEvent, ParentElement, Render, ScrollHandle,
+    StatefulInteractiveElement, Styled, Window, canvas, div, fill, point, px, size,
 };
 use gpui_component::notification::NotificationList;
 use gpui_gfm::{
     MarkdownCache, MarkdownRenderOptions, MarkdownTheme, render_markdown_blocks_cached,
 };
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const INLINE_SYNC_PARSE_MAX_BYTES: usize = 64 * 1024;
@@ -315,6 +316,46 @@ impl RootView {
         self.open_path(&path, window, cx);
     }
 
+    fn handle_dropped_paths(
+        &mut self,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(markdown_path) = paths.paths().iter().find(|path| is_markdown_path(path)) {
+            if let Ok(path) = Utf8PathBuf::try_from(markdown_path.clone()) {
+                self.action_open_path(path, window, cx);
+            }
+            return;
+        }
+
+        let document_path = self.document.read(cx).path.clone();
+        let snippets = paths
+            .paths()
+            .iter()
+            .filter(|path| path.is_file())
+            .map(|path| markdown_for_dropped_file(path, document_path.as_ref()))
+            .collect::<Vec<_>>();
+
+        if snippets.is_empty() {
+            return;
+        }
+
+        let insertion = snippets.join("\n");
+        let _ = self.document.update(cx, |doc, cx| {
+            doc.begin_edit();
+            doc.delete_selection();
+            let insert_at = doc.cursor;
+            doc.insert(insert_at, &insertion);
+            doc.cursor = insert_at.saturating_add(insertion.chars().count());
+            doc.commit_edit();
+            cx.notify();
+        });
+        let _ = self
+            .editor_view
+            .update(cx, |editor, cx| editor.reveal_cursor(cx));
+    }
+
     pub fn confirm_before_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let can_quit =
             self.confirm_can_discard_changes(window, cx, "Save changes before quitting?");
@@ -416,6 +457,97 @@ impl RootView {
             view.set_active_outline(active, cx);
         });
     }
+}
+
+fn is_markdown_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "md" | "markdown" | "mdown" | "mkd"))
+}
+
+fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png"
+                    | "jpg"
+                    | "jpeg"
+                    | "gif"
+                    | "webp"
+                    | "bmp"
+                    | "tif"
+                    | "tiff"
+                    | "heic"
+                    | "heif"
+                    | "svg"
+                    | "avif"
+                    | "ico"
+            )
+        })
+}
+
+fn markdown_for_dropped_file(path: &Path, document_path: Option<&Utf8PathBuf>) -> String {
+    let label = escape_markdown_label(
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file"),
+    );
+    let target = markdown_drop_target(path, document_path);
+
+    if is_image_path(path) {
+        format!("![{label}](<{target}>)")
+    } else {
+        format!("[{label}](<{target}>)")
+    }
+}
+
+fn markdown_drop_target(path: &Path, document_path: Option<&Utf8PathBuf>) -> String {
+    let rendered_path = document_path
+        .and_then(|document_path| document_path.parent())
+        .and_then(|base_dir| relative_path_from(base_dir.as_std_path(), path))
+        .unwrap_or_else(|| path.to_path_buf());
+
+    rendered_path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .replace('>', "%3E")
+}
+
+fn relative_path_from(base_dir: &Path, target: &Path) -> Option<PathBuf> {
+    if base_dir.is_absolute() != target.is_absolute() {
+        return None;
+    }
+
+    let base = base_dir.components().collect::<Vec<_>>();
+    let target = target.components().collect::<Vec<_>>();
+    let common = base
+        .iter()
+        .zip(target.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+
+    if common == 0 {
+        return None;
+    }
+
+    let mut relative = PathBuf::new();
+    for _ in common..base.len() {
+        relative.push("..");
+    }
+    for component in target.iter().skip(common) {
+        relative.push(component.as_os_str());
+    }
+
+    Some(relative)
+}
+
+fn escape_markdown_label(label: &str) -> String {
+    label
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
 }
 
 impl Render for RootView {
@@ -659,6 +791,9 @@ impl Render for RootView {
             .bg(Theme::bg())
             .text_color(Theme::text())
             .size_full()
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.handle_dropped_paths(paths, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &NewFile, window, cx| {
                 this.action_new_file(window, cx);
             }))
