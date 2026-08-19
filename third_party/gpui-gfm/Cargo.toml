@@ -1,0 +1,13 @@
+[package]
+name = "gpui-gfm"
+version = "0.2.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+gpui = "0.2.2"
+comrak = "0.50"
+tl = "0.7"

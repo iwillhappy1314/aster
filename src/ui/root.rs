@@ -21,10 +21,8 @@ use gpui::{
     MouseMoveEvent, ParentElement, Render, ScrollHandle, StatefulInteractiveElement, Styled,
     Window, canvas, div, fill, point, px, size,
 };
-use gpui_component::{
-    notification::NotificationList,
-    text::{TextView, TextViewStyle},
-};
+use gpui_component::notification::NotificationList;
+use gpui_gfm::{MarkdownCache, MarkdownRenderOptions, MarkdownTheme, render_markdown_cached};
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use std::time::Duration;
 
@@ -59,6 +57,10 @@ pub struct RootView {
     preview_scroll_indicator_visible: bool,
     /// Monotonic revision used to prevent an older hide timer from hiding a newer scroll event.
     preview_scroll_indicator_revision: u64,
+    /// Persistent gpui-gfm state so selection and interactive Markdown survive re-renders.
+    preview_markdown_options: MarkdownRenderOptions,
+    /// Parsed Markdown cache reused by the preview across GPUI render passes.
+    preview_markdown_cache: MarkdownCache,
 }
 
 impl RootView {
@@ -87,6 +89,8 @@ impl RootView {
             preview_scroll_handle: ScrollHandle::new(),
             preview_scroll_indicator_visible: false,
             preview_scroll_indicator_revision: 0,
+            preview_markdown_options: MarkdownRenderOptions::default(),
+            preview_markdown_cache: MarkdownCache::default(),
         }
     }
 
@@ -399,9 +403,8 @@ impl Render for RootView {
         }
 
         let (doc_path, doc_dirty, doc_revision) = {
-            self.document.update(cx, |doc, _| {
-                (doc.path.clone(), doc.dirty, doc.revision)
-            })
+            self.document
+                .update(cx, |doc, _| (doc.path.clone(), doc.dirty, doc.revision))
         };
 
         // Use cached text if revision hasn't changed to avoid O(n) rope conversion
@@ -677,6 +680,27 @@ impl Render for RootView {
                         let preview_scroll_handle = self.preview_scroll_handle.clone();
                         let has_multiple_lines = doc_text.lines().nth(1).is_some();
                         let show_preview_scroll_indicator = self.preview_scroll_indicator_visible;
+                        let markdown_theme = MarkdownTheme {
+                            foreground: Theme::text().into(),
+                            muted_foreground: Theme::muted().into(),
+                            background: Theme::bg().into(),
+                            code_background: Theme::code_block_bg().into(),
+                            border: Theme::border().into(),
+                            link: Theme::accent().into(),
+                            accent: Theme::accent().into(),
+                            code_font_family: "Menlo".into(),
+                            is_dark: Theme::is_dark(),
+                        };
+                        let markdown_options = self
+                            .preview_markdown_options
+                            .clone()
+                            .with_theme(markdown_theme);
+                        let markdown_content = render_markdown_cached(
+                            &doc_text,
+                            &markdown_options,
+                            &mut self.preview_markdown_cache,
+                            cx,
+                        );
                         div()
                             .relative()
                             .flex_1()
@@ -695,22 +719,12 @@ impl Render for RootView {
                                         },
                                     ))
                                     .child(
-                                        TextView::markdown(
-                                            "markdown-preview",
-                                            doc_text,
-                                            window,
-                                            cx,
-                                        )
-                                        .h_auto()
-                                        .pl(px(32.))
-                                        .pr(px(32.))
-                                        .py(px(24.))
-                                        // Add breathing room above subsequent headings by
-                                        // increasing the block gap used by the Markdown renderer.
-                                        .style(
-                                            TextViewStyle::default().paragraph_gap(gpui::rems(1.5)),
-                                        )
-                                        .selectable(true),
+                                        div()
+                                            .h_auto()
+                                            .pl(px(32.))
+                                            .pr(px(32.))
+                                            .py(px(24.))
+                                            .child(markdown_content),
                                     ),
                             )
                             // Match the editor's indicator: it is rendered above the scrolling
