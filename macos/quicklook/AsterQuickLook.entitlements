@@ -6,13 +6,5 @@
     <true/>
     <key>com.apple.security.files.user-selected.read-only</key>
     <true/>
-    <!-- Quick Look only grants the selected file directly. This read-only
-         exception lets relative Markdown images resolve from sibling folders.
-         Remove it if Aster is prepared for Mac App Store distribution and
-         replace local asset loading with security-scoped attachment handling. -->
-    <key>com.apple.security.temporary-exception.files.absolute-path.read-only</key>
-    <array>
-        <string>/</string>
-    </array>
 </dict>
 </plist>
