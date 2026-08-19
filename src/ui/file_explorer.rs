@@ -86,7 +86,7 @@ impl Render for FileExplorerView {
                 div()
                     .id(("outline-entry", ordinal))
                     .flex()
-                    .items_center()
+                    .items_start()
                     .gap(px(6.))
                     .pl(px(8. + indent))
                     .pr(px(8.))
@@ -108,15 +108,22 @@ impl Render for FileExplorerView {
                     )
                     .child(
                         div()
-                            .w(px(4.))
-                            .h(px(4.))
-                            .rounded_full()
-                            .bg(Theme::accent())
-                            .flex_shrink_0(),
+                            .h(px(20.))
+                            .flex()
+                            .items_center()
+                            .flex_shrink_0()
+                            .child(
+                                div()
+                                    .w(px(4.))
+                                    .h(px(4.))
+                                    .rounded_full()
+                                    .bg(Theme::accent()),
+                            ),
                     )
                     .child(
                         div()
                             .text_sm()
+                            .line_height(px(20.))
                             .overflow_hidden()
                             .flex_1()
                             .text_color(Theme::text())
