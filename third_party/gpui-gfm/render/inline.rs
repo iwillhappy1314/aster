@@ -32,8 +32,9 @@ enum InlineSegment {
 
 /// Render a list of inlines as GPUI elements.
 ///
-/// When `on_link` is set, link segments become clickable with cursor pointer.
-/// Otherwise everything is a single `StyledText`.
+/// Links always use the segmented renderer so they retain their URL ranges.
+/// A custom `on_link` handler is optional; `SelectableText` falls back to
+/// `cx.open_url()` when no custom handler is provided.
 pub fn render_inline_text(
   inlines: &[Inline],
   options: &MarkdownRenderOptions,
@@ -48,11 +49,22 @@ pub fn render_inline_text(
     inlines
   };
 
-  if options.on_link.is_some() || inlines_contain_image(inlines) {
+  if options.on_link.is_some() || inlines_contain_link(inlines) || inlines_contain_image(inlines) {
     render_inline_segmented(inlines, options, cx)
   } else {
     render_inline_flat(inlines, options, cx)
   }
+}
+
+/// Check if any inline (recursively) contains a link.
+fn inlines_contain_link(inlines: &[Inline]) -> bool {
+  inlines.iter().any(|inline| match inline {
+    Inline::Link { .. } => true,
+    Inline::Strong(children) | Inline::Emphasis(children) | Inline::Strikethrough(children) => {
+      inlines_contain_link(children)
+    }
+    _ => false,
+  })
 }
 
 /// Check if any inline (recursively) contains an image.
@@ -69,7 +81,7 @@ fn inlines_contain_image(inlines: &[Inline]) -> bool {
   })
 }
 
-/// Fast path: no link handler → single StyledText (no segmentation needed).
+/// Fast path: no links or images → single StyledText.
 fn render_inline_flat(inlines: &[Inline], options: &MarkdownRenderOptions, cx: &App) -> AnyElement {
   let mut text = String::new();
   let mut runs: Vec<TextRun> = Vec::new();
@@ -103,7 +115,7 @@ fn render_inline_flat(inlines: &[Inline], options: &MarkdownRenderOptions, cx: &
   .into_any_element()
 }
 
-/// Segmented path: split into text/link segments, wrap links in clickable divs.
+/// Segmented path: split into text/link segments, preserving clickable URL ranges.
 fn render_inline_segmented(
   inlines: &[Inline],
   options: &MarkdownRenderOptions,
@@ -561,6 +573,16 @@ pub fn resolve_url(url: &str, options: &MarkdownRenderOptions) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn detects_links_without_custom_handler() {
+    let inlines = vec![Inline::Strong(vec![Inline::Link {
+      url: "https://example.com".into(),
+      title: None,
+      content: vec![Inline::Text("click".into())],
+    }])];
+    assert!(inlines_contain_link(&inlines));
+  }
 
   #[test]
   fn resolve_relative_url_with_base() {
