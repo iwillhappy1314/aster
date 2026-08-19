@@ -104,6 +104,15 @@ pub fn markdown_spans(source: &str) -> Vec<SyntaxSpan> {
     spans
 }
 
+/// Returns the ATX heading level (1–6) for a single Markdown source line.
+/// Leading indentation and trailing line endings are ignored.
+pub fn markdown_heading_level(raw_line: &str) -> Option<u8> {
+    let line = raw_line.trim_end_matches('\n').trim_end_matches('\r');
+    let leading = leading_whitespace_bytes(line);
+    let content = &line[leading..];
+    heading_prefix(content).map(|(_, hashes)| hashes as u8)
+}
+
 fn leading_whitespace_bytes(line: &str) -> usize {
     line.char_indices()
         .find_map(|(idx, ch)| if ch.is_whitespace() { None } else { Some(idx) })
@@ -348,5 +357,14 @@ dn’t require a patchwork of vendors.
         assert!(spans.iter().any(|s| s.kind == SyntaxKind::InlineCode));
         assert!(spans.iter().any(|s| s.kind == SyntaxKind::EmphasisText));
         assert!(spans.iter().any(|s| s.kind == SyntaxKind::StrongText));
+    }
+
+    #[test]
+    fn heading_level_matches_scanner_rules() {
+        assert_eq!(markdown_heading_level("# H1"), Some(1));
+        assert_eq!(markdown_heading_level("  ### H3\n"), Some(3));
+        assert_eq!(markdown_heading_level("###### H6"), Some(6));
+        assert_eq!(markdown_heading_level("####### not a heading"), None);
+        assert_eq!(markdown_heading_level("#missing-space"), None);
     }
 }
