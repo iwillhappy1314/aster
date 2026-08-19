@@ -7,7 +7,12 @@ publish = false
 [lib]
 path = "lib.rs"
 
+[features]
+default = ["gpui-render"]
+gpui-render = ["dep:gpui"]
+html = []
+
 [dependencies]
-gpui = "0.2.2"
+gpui = { version = "0.2.2", optional = true }
 comrak = "0.50"
 tl = "0.7"
