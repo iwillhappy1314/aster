@@ -182,7 +182,7 @@ impl RootView {
                 // Skip notification here too - simplifies and avoids window context issues
             }
             Err(_err) => {
-                // Silently fail for now - window context not available for notification
+                // Silently fail for async context - no window for notification
             }
         }
     }
@@ -345,7 +345,7 @@ impl RootView {
         settings::set_window_bounds(window.bounds());
     }
 
-    /// Toggles the optional outline sidebar without changing the document state.
+    /// Toggles the optional document outline without changing the document state.
     fn toggle_outline(&mut self, cx: &mut Context<Self>) {
         self.outline_visible = !self.outline_visible;
         self.resizing_sidebar = false;
@@ -379,6 +379,40 @@ impl RootView {
         })
         .detach();
         cx.notify();
+    }
+
+    fn sync_preview_outline_active(
+        &mut self,
+        heading_child_indices: &[usize],
+        cx: &mut Context<Self>,
+    ) {
+        if heading_child_indices.is_empty() {
+            let _ = self.file_explorer_view.update(cx, |view, cx| {
+                view.set_active_outline(None, cx);
+            });
+            return;
+        }
+
+        let viewport = self.preview_scroll_handle.bounds();
+        let offset = self.preview_scroll_handle.offset();
+        let activation_line = viewport.top() + px(32.);
+        let mut active = Some(0usize);
+
+        for (ordinal, child_index) in heading_child_indices.iter().copied().enumerate() {
+            let Some(bounds) = self.preview_scroll_handle.bounds_for_item(child_index) else {
+                continue;
+            };
+            let painted_top = bounds.top() + offset.y;
+            if painted_top <= activation_line {
+                active = Some(ordinal);
+            } else {
+                break;
+            }
+        }
+
+        let _ = self.file_explorer_view.update(cx, |view, cx| {
+            view.set_active_outline(active, cx);
+        });
     }
 }
 
@@ -718,9 +752,11 @@ impl Render for RootView {
                             &mut self.preview_markdown_cache,
                             cx,
                         );
+                        let heading_child_indices = markdown_blocks.heading_child_indices.clone();
                         if let Ok(mut indices) = self.preview_heading_child_indices.lock() {
-                            *indices = markdown_blocks.heading_child_indices.clone();
+                            *indices = heading_child_indices.clone();
                         }
+                        self.sync_preview_outline_active(&heading_child_indices, cx);
                         div()
                             .relative()
                             .flex_1()

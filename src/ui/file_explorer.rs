@@ -26,6 +26,8 @@ pub struct FileExplorerView {
     outline_scroll_handle: ScrollHandle,
     width: f32,
     cached_outline: Option<(u64, Vec<OutlineItem>)>,
+    /// Currently active heading in document order.
+    active_outline_ordinal: Option<usize>,
     /// Called when an outline entry is clicked so the host can scroll the
     /// editor/preview to that section.
     on_reveal: Option<RevealCallback>,
@@ -38,6 +40,7 @@ impl FileExplorerView {
             outline_scroll_handle: ScrollHandle::new(),
             width: 200.0,
             cached_outline: None,
+            active_outline_ordinal: None,
             on_reveal: None,
         }
     }
@@ -45,6 +48,13 @@ impl FileExplorerView {
     pub fn set_width(&mut self, width: f32, cx: &mut gpui::Context<Self>) {
         self.width = width;
         cx.notify();
+    }
+
+    pub fn set_active_outline(&mut self, ordinal: Option<usize>, cx: &mut Context<Self>) {
+        if self.active_outline_ordinal != ordinal {
+            self.active_outline_ordinal = ordinal;
+            cx.notify();
+        }
     }
 
     /// Registers the callback invoked when an outline entry is selected.
@@ -81,6 +91,7 @@ impl Render for FileExplorerView {
                 let level = item.level;
                 let title = item.title;
                 let byte_start = item.byte_start;
+                let is_active = self.active_outline_ordinal == Some(ordinal);
                 let indent = (level.saturating_sub(1) as f32) * 10.0;
                 let document = document.clone();
                 let on_reveal = self.on_reveal.clone();
@@ -93,10 +104,12 @@ impl Render for FileExplorerView {
                     .pr(px(8.))
                     .py(px(3.))
                     .cursor_pointer()
+                    .when(is_active, |this| this.bg(Theme::panel_alt()))
                     .hover(|this| this.bg(Theme::panel_alt()))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |_this, _: &MouseDownEvent, _, cx| {
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            this.set_active_outline(Some(ordinal), cx);
                             let _ = document.update(cx, |doc, cx| {
                                 let cursor = doc.byte_to_char(byte_start);
                                 doc.set_cursor(cursor);
@@ -115,10 +128,10 @@ impl Render for FileExplorerView {
                             .flex_shrink_0()
                             .child(
                                 div()
-                                    .w(px(4.))
-                                    .h(px(4.))
+                                    .w(px(if is_active { 6. } else { 4. }))
+                                    .h(px(if is_active { 6. } else { 4. }))
                                     .rounded_full()
-                                    .bg(Theme::accent()),
+                                    .bg(if is_active { Theme::accent() } else { Theme::muted() }),
                             ),
                     )
                     .child(
@@ -127,7 +140,7 @@ impl Render for FileExplorerView {
                             .line_height(px(20.))
                             .overflow_hidden()
                             .flex_1()
-                            .text_color(Theme::text())
+                            .text_color(if is_active { Theme::accent() } else { Theme::text() })
                             .child(ellipsize_chars(&title, 64)),
                     )
             })
