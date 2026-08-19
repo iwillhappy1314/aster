@@ -19,6 +19,8 @@ use std::time::Duration;
 
 const CARET_WIDTH: f32 = 2.0;
 
+pub type OutlineViewportCallback = Arc<dyn Fn(usize, &mut App)>;
+
 struct SearchCache {
     revision: u64,
     query: String,
@@ -191,6 +193,8 @@ pub struct EditorView {
     pending_scroll_to_byte: Option<usize>,
     /// Outline target that should be aligned near the top after layout.
     pending_outline_reveal_byte: Option<usize>,
+    /// Reports the source byte crossing the editor viewport activation line.
+    on_outline_viewport_change: Option<OutlineViewportCallback>,
 }
 
 impl EditorView {
@@ -214,6 +218,7 @@ impl EditorView {
             cached_search: None,
             pending_scroll_to_byte: None,
             pending_outline_reveal_byte: None,
+            on_outline_viewport_change: None,
         }
     }
 
@@ -272,6 +277,10 @@ impl EditorView {
         self.pending_scroll_to_byte = None;
         self.pending_outline_reveal_byte = Some(byte);
         cx.notify();
+    }
+
+    pub fn set_on_outline_viewport_change(&mut self, callback: OutlineViewportCallback) {
+        self.on_outline_viewport_change = Some(callback);
     }
 
     fn selection_highlights(&self, doc: &DocumentState) -> Vec<(Range<usize>, HighlightStyle)> {
@@ -482,72 +491,85 @@ impl EditorView {
             }
         }
     }
+}
 
-    fn reveal_pending_byte(
-        &mut self,
-        text_layout: &gpui::TextLayout,
-        projection: &DisplayProjection,
-        window: &mut Window,
-    ) {
-        let (target_source_byte, align_to_top) =
-            if let Some(byte) = self.pending_outline_reveal_byte {
-                (byte, true)
-            } else if let Some(byte) = self.pending_scroll_to_byte {
-                (byte, false)
-            } else {
-                return;
-            };
-        let target_display_byte = projection.source_to_display_byte(target_source_byte);
+fn source_byte_at_viewport_activation_line(
+    scroll_handle: &ScrollHandle,
+    text_layout: &gpui::TextLayout,
+    projection: &DisplayProjection,
+) -> Option<usize> {
+    let viewport = scroll_handle.bounds();
+    if viewport.size.height <= px(0.) {
+        return None;
+    }
 
-        let Some(target_pos) = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            text_layout.position_for_index(target_display_byte)
-        }))
+    let activation_point = point(viewport.left() + px(32.), viewport.top() + px(32.));
+    let display_byte = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        text_layout.index_for_position(activation_point)
+    }))
+    .ok()
+    .map(|result| match result {
+        Ok(index) => index,
+        Err(index) => index,
+    })?;
+
+    Some(projection.display_to_source_byte(display_byte))
+}
+
+fn reveal_source_byte_after_layout(
+    scroll_handle: &ScrollHandle,
+    text_layout: &gpui::TextLayout,
+    projection: &DisplayProjection,
+    source_byte: usize,
+    align_to_top: bool,
+    window: &mut Window,
+) {
+    let display_byte = projection.source_to_display_byte(source_byte);
+    let Some(target_pos) = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        text_layout.position_for_index(display_byte)
+    }))
+    .ok()
+    .flatten() else {
+        return;
+    };
+
+    let line_height = std::panic::catch_unwind(AssertUnwindSafe(|| text_layout.line_height()))
         .ok()
-        .flatten() else {
-            return;
-        };
+        .unwrap_or(px(0.));
+    if line_height <= px(0.) {
+        return;
+    }
 
-        let line_height = std::panic::catch_unwind(AssertUnwindSafe(|| text_layout.line_height()))
-            .ok()
-            .unwrap_or(px(0.));
-        if line_height <= px(0.) {
-            return;
-        }
+    let viewport = scroll_handle.bounds();
+    if viewport.size.height <= px(0.) {
+        return;
+    }
 
-        let max = self.scroll_handle.max_offset();
-        let offset = self.scroll_handle.offset();
-        let bounds = self.scroll_handle.bounds();
-        let viewport_height = bounds.size.height;
-        if viewport_height <= px(0.) {
-            return;
-        }
+    let max = scroll_handle.max_offset();
+    let current = scroll_handle.offset();
+    let mut next = current;
 
-        let target_top = target_pos.y;
-        let mut new_offset_y = if align_to_top {
-            // The editor scroll container already has 24px top padding, so
-            // offsetting by the text-layout Y leaves the heading at that inset.
-            -target_top
+    if align_to_top {
+        let desired_top = viewport.top() + px(24.);
+        next.y = current.y + (desired_top - target_pos.y);
+    } else {
+        let padding = px(28.);
+        let visible_top = viewport.top() + padding;
+        let visible_bottom = viewport.bottom() - padding;
+        let target_bottom = target_pos.y + line_height;
+
+        if target_pos.y < visible_top {
+            next.y = current.y + (visible_top - target_pos.y);
+        } else if target_bottom > visible_bottom {
+            next.y = current.y - (target_bottom - visible_bottom);
         } else {
-            let padding = px(28.);
-            let visible_top = -offset.y;
-            let visible_bottom = visible_top + viewport_height;
-            let target_bottom = target_top + line_height;
-            let mut minimal_offset = offset.y;
-            if target_top < visible_top + padding {
-                minimal_offset = -(target_top - padding);
-            } else if target_bottom > visible_bottom - padding {
-                minimal_offset = -(target_bottom - viewport_height + padding);
-            }
-            minimal_offset
-        };
-
-        new_offset_y = new_offset_y.clamp(-max.height, px(0.));
-        self.scroll_handle.set_offset(point(offset.x, new_offset_y));
-        if align_to_top {
-            self.pending_outline_reveal_byte = None;
-        } else {
-            self.pending_scroll_to_byte = None;
+            return;
         }
+    }
+
+    next.y = next.y.clamp(-max.height, px(0.));
+    if next.y != current.y {
+        scroll_handle.set_offset(next);
         window.refresh();
     }
 }
@@ -640,7 +662,16 @@ impl Render for EditorView {
         }
 
         let text_layout = styled.layout().clone();
-        self.reveal_pending_byte(&text_layout, projection.as_ref(), window);
+        let text_layout_for_sync = text_layout.clone();
+        let text_layout_for_caret = text_layout.clone();
+        let pending_reveal = self
+            .pending_outline_reveal_byte
+            .take()
+            .map(|byte| (byte, true))
+            .or_else(|| self.pending_scroll_to_byte.take().map(|byte| (byte, false)));
+        let outline_callback = self.on_outline_viewport_change.clone();
+        let outline_scroll_handle = self.scroll_handle.clone();
+        let outline_projection = projection.clone();
         let has_multiple_lines = text_owned.lines().nth(1).is_some();
         let editor_scroll_handle = self.scroll_handle.clone();
         let show_scroll_indicator = self.scroll_indicator_visible;
@@ -884,6 +915,7 @@ impl Render for EditorView {
                                         (new_offset.y + delta).clamp(-max.height, px(0.));
                                     this.scroll_handle
                                         .set_offset(point(new_offset.x, new_offset.y));
+                                    cx.notify();
                                     window.refresh();
                                 }
                                 return;
@@ -1042,7 +1074,31 @@ impl Render for EditorView {
                     .child(
                         div().relative().w_full().child(styled).child(
                             canvas(
-                                move |_, _, _| {},
+                                move |_, window: &mut Window, cx: &mut App| {
+                                    let had_pending_reveal = pending_reveal.is_some();
+                                    if let Some((source_byte, align_to_top)) = pending_reveal {
+                                        reveal_source_byte_after_layout(
+                                            &outline_scroll_handle,
+                                            &text_layout_for_sync,
+                                            outline_projection.as_ref(),
+                                            source_byte,
+                                            align_to_top,
+                                            window,
+                                        );
+                                    }
+
+                                    if !had_pending_reveal
+                                        && let Some(callback) = outline_callback.as_ref()
+                                        && let Some(source_byte) =
+                                            source_byte_at_viewport_activation_line(
+                                                &outline_scroll_handle,
+                                                &text_layout_for_sync,
+                                                outline_projection.as_ref(),
+                                            )
+                                    {
+                                        callback(source_byte, cx);
+                                    }
+                                },
                                 move |_bounds: Bounds<_>,
                                       (),
                                       window: &mut Window,
@@ -1053,7 +1109,8 @@ impl Render for EditorView {
 
                                     let caret_pos =
                                         std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                            text_layout.position_for_index(cursor_display_byte)
+                                            text_layout_for_caret
+                                                .position_for_index(cursor_display_byte)
                                         }))
                                         .ok()
                                         .flatten();
@@ -1063,7 +1120,7 @@ impl Render for EditorView {
 
                                     let line_height =
                                         std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                            text_layout.line_height()
+                                            text_layout_for_caret.line_height()
                                         }))
                                         .ok()
                                         .unwrap_or(px(0.));

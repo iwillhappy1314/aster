@@ -57,6 +57,27 @@ impl FileExplorerView {
         }
     }
 
+    pub fn set_active_outline_for_byte(&mut self, byte: usize, cx: &mut Context<Self>) {
+        let doc_revision = self.document.read(cx).revision;
+        let outline_items = if let Some((cached_revision, items)) = &self.cached_outline {
+            if *cached_revision == doc_revision {
+                items.clone()
+            } else {
+                let text = self.document.read(cx).text();
+                let parsed = parse_outline_items(&text);
+                self.cached_outline = Some((doc_revision, parsed.clone()));
+                parsed
+            }
+        } else {
+            let text = self.document.read(cx).text();
+            let parsed = parse_outline_items(&text);
+            self.cached_outline = Some((doc_revision, parsed.clone()));
+            parsed
+        };
+
+        self.set_active_outline(active_outline_ordinal(&outline_items, byte), cx);
+    }
+
     /// Registers the callback invoked when an outline entry is selected.
     pub fn set_on_reveal(&mut self, callback: RevealCallback) {
         self.on_reveal = Some(callback);
@@ -224,6 +245,19 @@ fn parse_outline_items(text: &str) -> Vec<OutlineItem> {
     items
 }
 
+fn active_outline_ordinal(items: &[OutlineItem], byte: usize) -> Option<usize> {
+    if items.is_empty() {
+        return None;
+    }
+
+    Some(
+        items
+            .iter()
+            .rposition(|item| item.byte_start <= byte)
+            .unwrap_or(0),
+    )
+}
+
 fn heading_level_number(level: HeadingLevel) -> u32 {
     match level {
         HeadingLevel::H1 => 1,
@@ -257,6 +291,19 @@ mod tests {
         assert_eq!(items[2].level, 3);
         assert_eq!(items[2].title, "Leaf");
         assert_eq!(items[2].byte_start, text.find("### Leaf").unwrap());
+    }
+
+    #[test]
+    fn active_outline_follows_last_heading_before_viewport_byte() {
+        let text = "# Top\n\nbody\n\n## Child\n\nmore\n\n### Leaf\n";
+        let items = parse_outline_items(text);
+        let child = text.find("## Child").unwrap();
+        let leaf = text.find("### Leaf").unwrap();
+
+        assert_eq!(active_outline_ordinal(&items, 0), Some(0));
+        assert_eq!(active_outline_ordinal(&items, child - 1), Some(0));
+        assert_eq!(active_outline_ordinal(&items, child), Some(1));
+        assert_eq!(active_outline_ordinal(&items, leaf), Some(2));
     }
 
     #[test]
