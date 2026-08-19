@@ -1,0 +1,119 @@
+name: Agent Shared Markdown Theme
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  cargo-check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Share Markdown theme between editor and preview
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # theme.rs: add a renderer-neutral Markdown palette derived from the active Ayu theme.
+          theme = Path("src/ui/theme.rs")
+          text = theme.read_text()
+
+          style_marker = "/// Namespace for accessing the current theme's colors. The active theme is\n"
+          style_block = '''/// Shared Markdown colors used by both the inline editor and rendered preview.\n#[derive(Debug, Clone, Copy)]\npub struct MarkdownStyle {\n    pub foreground: Rgba,\n    pub muted_foreground: Rgba,\n    pub background: Rgba,\n    pub code_background: Rgba,\n    pub border: Rgba,\n    pub link: Rgba,\n    pub accent: Rgba,\n}\n\n'''
+          if "pub struct MarkdownStyle" not in text:
+              if style_marker not in text:
+                  raise SystemExit("theme.rs MarkdownStyle insertion marker not found")
+              text = text.replace(style_marker, style_block + style_marker, 1)
+
+          old_tail = '''    pub fn selection_bg() -> Rgba {\n        current_colors().selection_bg\n    }\n}'''
+          new_tail = '''    pub fn selection_bg() -> Rgba {\n        current_colors().selection_bg\n    }\n\n    /// Markdown colors shared by the editor's inline styling and the preview renderer.\n    pub fn markdown_style() -> MarkdownStyle {\n        let colors = current_colors();\n        MarkdownStyle {\n            foreground: colors.text,\n            muted_foreground: colors.muted,\n            background: colors.bg,\n            code_background: colors.code_block_bg,\n            border: colors.border,\n            link: colors.accent,\n            accent: colors.accent,\n        }\n    }\n}'''
+          if "pub fn markdown_style()" not in text:
+              if old_tail not in text:
+                  raise SystemExit("theme.rs Theme impl tail not found")
+              text = text.replace(old_tail, new_tail, 1)
+          theme.write_text(text)
+
+          # editor.rs: consume the shared Markdown style once per render pass.
+          editor = Path("src/ui/editor.rs")
+          text = editor.read_text()
+          text = text.replace(
+              "use crate::ui::theme::Theme;",
+              "use crate::ui::theme::{MarkdownStyle, Theme};",
+              1,
+          )
+
+          old_highlights = '''    fn inline_syntax_highlights(\n        &self,\n        spans: &[SyntaxSpan],\n    ) -> Vec<(Range<usize>, HighlightStyle)> {\n        spans\n            .iter()\n            .map(|span| {\n                let hide_markers = is_inline_hidden_kind(span.kind);\n                (span.range.clone(), syntax_style(span.kind, hide_markers))\n            })\n            .collect()\n    }'''
+          new_highlights = '''    fn inline_syntax_highlights(\n        &self,\n        spans: &[SyntaxSpan],\n        markdown_style: MarkdownStyle,\n    ) -> Vec<(Range<usize>, HighlightStyle)> {\n        spans\n            .iter()\n            .map(|span| {\n                let hide_markers = is_inline_hidden_kind(span.kind);\n                (\n                    span.range.clone(),\n                    syntax_style(span.kind, hide_markers, markdown_style),\n                )\n            })\n            .collect()\n    }'''
+          if old_highlights in text:
+              text = text.replace(old_highlights, new_highlights, 1)
+          elif "markdown_style: MarkdownStyle" not in text:
+              raise SystemExit("editor.rs inline_syntax_highlights block not found")
+
+          focus_marker = "        let is_focused = focus_handle.is_focused(window);\n"
+          if "        let markdown_style = Theme::markdown_style();\n" not in text:
+              if focus_marker not in text:
+                  raise SystemExit("editor.rs render theme marker not found")
+              text = text.replace(
+                  focus_marker,
+                  focus_marker + "        let markdown_style = Theme::markdown_style();\n",
+                  1,
+              )
+
+          old_call = '''        let syntax_highlights =\n            projection.project_highlights(self.inline_syntax_highlights(inline_spans.as_ref()));'''
+          new_call = '''        let syntax_highlights = projection.project_highlights(\n            self.inline_syntax_highlights(inline_spans.as_ref(), markdown_style),\n        );'''
+          if old_call in text:
+              text = text.replace(old_call, new_call, 1)
+          elif "inline_spans.as_ref(), markdown_style" not in text:
+              raise SystemExit("editor.rs syntax highlight call not found")
+
+          old_base_text = '''                    .py(px(24.))\n                    .text_size(px(settings::get_font_size()))\n                    .text_color(Theme::text())\n                    .font_family("Menlo")'''
+          new_base_text = '''                    .py(px(24.))\n                    .text_size(px(settings::get_font_size()))\n                    .text_color(markdown_style.foreground)\n                    .font_family("Menlo")'''
+          if old_base_text in text:
+              text = text.replace(old_base_text, new_base_text, 1)
+          elif ".text_color(markdown_style.foreground)" not in text:
+              raise SystemExit("editor.rs base text style not found")
+
+          start = text.find("fn syntax_style(")
+          end = text.find("\nfn is_inline_hidden_kind", start)
+          if start < 0 or end < 0:
+              raise SystemExit("editor.rs syntax_style boundaries not found")
+          new_syntax_style = '''fn syntax_style(\n    kind: SyntaxKind,\n    hide_markers: bool,\n    markdown_style: MarkdownStyle,\n) -> HighlightStyle {\n    if hide_markers {\n        let hidden_color = match kind {\n            SyntaxKind::InlineCodeMarker => markdown_style.code_background,\n            _ => Theme::panel(),\n        };\n        let hidden_background = match kind {\n            SyntaxKind::InlineCodeMarker => Some(markdown_style.code_background.into()),\n            _ => None,\n        };\n        return HighlightStyle {\n            color: Some(hidden_color.into()),\n            background_color: hidden_background,\n            ..Default::default()\n        };\n    }\n\n    match kind {\n        SyntaxKind::HeadingMarker => HighlightStyle {\n            color: Some(markdown_style.muted_foreground.into()),\n            font_weight: Some(FontWeight::BOLD),\n            ..Default::default()\n        },\n        SyntaxKind::HeadingText => HighlightStyle {\n            color: Some(markdown_style.foreground.into()),\n            font_weight: Some(FontWeight::BOLD),\n            ..Default::default()\n        },\n        SyntaxKind::QuoteMarker => HighlightStyle {\n            color: Some(markdown_style.muted_foreground.into()),\n            ..Default::default()\n        },\n        SyntaxKind::ListMarker | SyntaxKind::TaskMarker => HighlightStyle {\n            color: Some(markdown_style.foreground.into()),\n            ..Default::default()\n        },\n        SyntaxKind::CodeFence => HighlightStyle {\n            color: Some(markdown_style.muted_foreground.into()),\n            ..Default::default()\n        },\n        SyntaxKind::InlineCodeMarker | SyntaxKind::InlineCode => HighlightStyle {\n            color: Some(markdown_style.foreground.into()),\n            background_color: Some(markdown_style.code_background.into()),\n            ..Default::default()\n        },\n        SyntaxKind::LinkTextDelimiter | SyntaxKind::LinkUrlDelimiter => HighlightStyle {\n            color: Some(markdown_style.muted_foreground.into()),\n            ..Default::default()\n        },\n        SyntaxKind::LinkText => HighlightStyle {\n            color: Some(markdown_style.link.into()),\n            underline: Some(UnderlineStyle {\n                thickness: px(1.),\n                color: Some(markdown_style.link.into()),\n                wavy: false,\n            }),\n            ..Default::default()\n        },\n        SyntaxKind::LinkUrl => HighlightStyle {\n            color: Some(markdown_style.muted_foreground.into()),\n            font_style: Some(FontStyle::Italic),\n            ..Default::default()\n        },\n        SyntaxKind::EmphasisMarker => HighlightStyle {\n            color: Some(markdown_style.muted_foreground.into()),\n            ..Default::default()\n        },\n        SyntaxKind::EmphasisText => HighlightStyle {\n            font_style: Some(FontStyle::Italic),\n            ..Default::default()\n        },\n        SyntaxKind::StrongText => HighlightStyle {\n            font_weight: Some(FontWeight::BOLD),\n            ..Default::default()\n        },\n    }\n}\n'''
+          text = text[:start] + new_syntax_style + text[end:]
+          editor.write_text(text)
+
+          # root.rs: build gpui-gfm's theme from the exact same MarkdownStyle.
+          root = Path("src/ui/root.rs")
+          text = root.read_text()
+          old_theme = '''                        let markdown_theme = MarkdownTheme {\n                            foreground: Theme::text().into(),\n                            muted_foreground: Theme::muted().into(),\n                            background: Theme::bg().into(),\n                            code_background: Theme::code_block_bg().into(),\n                            border: Theme::border().into(),\n                            link: Theme::accent().into(),\n                            accent: Theme::accent().into(),\n                            code_font_family: "Menlo".into(),\n                            is_dark: Theme::is_dark(),\n                        };'''
+          new_theme = '''                        let markdown_style = Theme::markdown_style();\n                        let markdown_theme = MarkdownTheme {\n                            foreground: markdown_style.foreground.into(),\n                            muted_foreground: markdown_style.muted_foreground.into(),\n                            background: markdown_style.background.into(),\n                            code_background: markdown_style.code_background.into(),\n                            border: markdown_style.border.into(),\n                            link: markdown_style.link.into(),\n                            accent: markdown_style.accent.into(),\n                            code_font_family: "Menlo".into(),\n                            is_dark: Theme::is_dark(),\n                        };'''
+          if old_theme in text:
+              text = text.replace(old_theme, new_theme, 1)
+          elif "let markdown_style = Theme::markdown_style();" not in text:
+              raise SystemExit("root.rs MarkdownTheme block not found")
+          root.write_text(text)
+          PY
+
+          rustfmt --edition 2024 src/ui/theme.rs src/ui/editor.rs src/ui/root.rs
+
+      - name: Cargo check
+        run: cargo check
+
+      - name: Commit shared Markdown theme
+        if: success()
+        run: |
+          if [[ -n "$(git status --porcelain -- src/ui/theme.rs src/ui/editor.rs src/ui/root.rs)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add src/ui/theme.rs src/ui/editor.rs src/ui/root.rs
+            git commit -m "Share Markdown theme between editor and preview"
+            git push origin HEAD:${{ github.head_ref }}
+          fi
