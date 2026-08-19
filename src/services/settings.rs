@@ -27,6 +27,12 @@ pub struct Settings {
     /// Side of the editor where the Outline is displayed.
     #[serde(default)]
     pub outline_position: OutlinePosition,
+    /// Whether the optional document Outline is visible.
+    #[serde(default)]
+    pub outline_visible: bool,
+    /// Whether the document starts in rendered preview mode.
+    #[serde(default = "default_preview_visible")]
+    pub preview_visible: bool,
     /// Last valid normal-window geometry, restored on the next launch.
     #[serde(default)]
     pub window_geometry: Option<WindowGeometry>,
@@ -34,6 +40,10 @@ pub struct Settings {
 
 fn default_theme_name() -> ThemeName {
     ThemeName::AyuLight
+}
+
+fn default_preview_visible() -> bool {
+    true
 }
 
 /// Persisted normal-window position and size in screen pixels.
@@ -85,6 +95,8 @@ impl Default for Settings {
             font_size: default_font_size(),
             theme_name: default_theme_name(),
             outline_position: OutlinePosition::default(),
+            outline_visible: false,
+            preview_visible: default_preview_visible(),
             window_geometry: None,
         }
     }
@@ -185,6 +197,36 @@ pub fn set_outline_position(position: OutlinePosition) {
     }
 }
 
+/// Returns whether the Outline should be visible when a window opens.
+pub fn get_outline_visible() -> bool {
+    settings()
+        .lock()
+        .map(|s| s.get().outline_visible)
+        .unwrap_or(false)
+}
+
+/// Persists whether the Outline is visible.
+pub fn set_outline_visible(visible: bool) {
+    if let Ok(mut manager) = settings().lock() {
+        manager.update(|s| s.outline_visible = visible);
+    }
+}
+
+/// Returns whether a window should open in rendered preview mode.
+pub fn get_preview_visible() -> bool {
+    settings()
+        .lock()
+        .map(|s| s.get().preview_visible)
+        .unwrap_or_else(|_| default_preview_visible())
+}
+
+/// Persists whether rendered preview mode is active.
+pub fn set_preview_visible(visible: bool) {
+    if let Ok(mut manager) = settings().lock() {
+        manager.update(|s| s.preview_visible = visible);
+    }
+}
+
 /// Convenience function to get current font size
 pub fn get_font_size() -> f32 {
     settings()
@@ -241,12 +283,19 @@ pub fn set_window_bounds(bounds: Bounds<Pixels>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{OutlinePosition, WindowGeometry};
+    use super::{OutlinePosition, Settings, WindowGeometry};
     use gpui::{Bounds, point, px, size};
 
     #[test]
     fn outline_position_defaults_to_right() {
         assert_eq!(OutlinePosition::default(), OutlinePosition::Right);
+    }
+
+    #[test]
+    fn layout_visibility_defaults_match_existing_behavior() {
+        let settings = Settings::default();
+        assert!(!settings.outline_visible);
+        assert!(settings.preview_visible);
     }
 
     #[test]
