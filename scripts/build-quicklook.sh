@@ -8,6 +8,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SOURCE_DIR="$ROOT_DIR/macos/quicklook"
 RUST_MANIFEST="$ROOT_DIR/macos/quicklook-rust/Cargo.toml"
 ARCH="${1:-$(uname -m)}"
+DEPLOYMENT_TARGET="12.0"
 
 get_target_dir() {
     if command -v cargo >/dev/null 2>&1; then
@@ -28,12 +29,12 @@ case "$ARCH" in
     arm64|aarch64)
         ARCH_NAME="arm64"
         RUST_TARGET="aarch64-apple-darwin"
-        SWIFT_TARGET="arm64-apple-macos11.0"
+        SWIFT_TARGET="arm64-apple-macos${DEPLOYMENT_TARGET}"
         ;;
     x86_64|intel)
         ARCH_NAME="x86_64"
         RUST_TARGET="x86_64-apple-darwin"
-        SWIFT_TARGET="x86_64-apple-macos11.0"
+        SWIFT_TARGET="x86_64-apple-macos${DEPLOYMENT_TARGET}"
         ;;
     *)
         echo "Unsupported Quick Look architecture: $ARCH" >&2
@@ -57,9 +58,10 @@ VERSION=$(grep '^version' "$ROOT_DIR/Cargo.toml" | head -1 | sed 's/.*"\(.*\)".*
 
 rustup target add "$RUST_TARGET" >/dev/null 2>&1 || true
 
-# The Quick Look bridge is a standalone Cargo package. Force it to use the
-# same target directory as the main Aster build so the library path below is
-# deterministic and universal packaging can find both architecture outputs.
+# Data-based Quick Look uses QLPreviewProvider/QLPreviewReply, available on
+# macOS 12+. Keep the Rust objects and Swift extension on the same deployment
+# target so the final linker does not mix incompatible minimum OS versions.
+MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
 CARGO_TARGET_DIR="$TARGET_DIR" cargo build \
     --release \
     --manifest-path "$RUST_MANIFEST" \
