@@ -33,7 +33,7 @@ pub fn render_code_block(
   // Prepare display text: strip trailing newline
   let display_value = code_block_display_value(code);
   let line_count = display_value.lines().count().max(1);
-  let code_min_height = CODE_BLOCK_PADDING_TOP_PX
+  let code_height = CODE_BLOCK_PADDING_TOP_PX
     + CODE_BLOCK_PADDING_BOTTOM_PX
     + CODE_BLOCK_LINE_HEIGHT_PX * line_count as f32;
   let text: SharedString = display_value.clone().into();
@@ -97,9 +97,9 @@ pub fn render_code_block(
     );
   }
 
-  // The code area deliberately is not a GPUI scroll container. Its minimum
-  // height is derived from the number of source lines, preventing the layout
-  // from collapsing to zero while still allowing content to grow naturally.
+  // Preserve the original, known-good GPUI scroll-layout path for code text,
+  // but give it an explicit content-derived height. Only horizontal scrolling
+  // remains; vertical scrolling always belongs to the parent preview.
   let code_id: SharedString = format!("md-code-{:x}", code as *const CodeBlock as usize).into();
   let code_font = Font {
     family: theme.code_font_family.clone(),
@@ -111,12 +111,7 @@ pub fn render_code_block(
 
   let mut code_area = div()
     .id(code_id)
-    .flex()
-    .flex_col()
-    .items_start()
-    .w_full()
-    .min_w_0()
-    .min_h(px(code_min_height))
+    .h(px(code_height))
     .px(px(CODE_BLOCK_PADDING_X_PX))
     .pt(px(CODE_BLOCK_PADDING_TOP_PX))
     .pb(px(CODE_BLOCK_PADDING_BOTTOM_PX))
@@ -124,7 +119,8 @@ pub fn render_code_block(
     .line_height(px(CODE_BLOCK_LINE_HEIGHT_PX))
     .text_color(theme.foreground)
     .font(code_font)
-    .whitespace_nowrap();
+    .whitespace_nowrap()
+    .overflow_x_scroll();
 
   // Build the code text child — use CodeBlockText when indentation dots are enabled,
   // otherwise plain SharedString for simplicity.
@@ -135,15 +131,9 @@ pub fn render_code_block(
     code_area = code_area.child(text);
   }
 
-  // Keep the wrapper itself at least as tall as the complete code content, too.
-  // The copy button remains absolutely positioned and does not affect layout.
-  let code_wrapper = div()
-    .relative()
-    .flex()
-    .flex_col()
-    .min_h(px(code_min_height))
-    .child(code_area)
-    .child(copy_button);
+  // Wrap code area + copy button in a relative container so the button
+  // is positioned relative to the code area (below the header).
+  let code_wrapper = div().relative().child(code_area).child(copy_button);
 
   container.child(code_wrapper).into_any_element()
 }
