@@ -267,6 +267,15 @@ fn build_root_view(
     let editor_view = cx.new(|_| RootView::build_editor(document.clone(), inline_markdown.clone()));
     let file_explorer_view = cx.new(|_| RootView::build_file_explorer(document.clone()));
 
+    let outline_view_for_editor = file_explorer_view.clone();
+    let _ = editor_view.update(cx, move |editor, _| {
+        editor.set_on_active_outline(Arc::new(move |ordinal, cx| {
+            let _ = outline_view_for_editor.update(cx, |view, cx| {
+                view.set_active_outline(ordinal, cx);
+            });
+        }));
+    });
+
     if let Some(path) = initial_path.as_ref() {
         if let Ok(text) = read_to_string(path) {
             let _ = document.update(cx, |d, cx| {
