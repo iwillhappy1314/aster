@@ -10,7 +10,7 @@ private enum PreviewError: Error {
 
 @objc(AsterQuickLookPreviewProvider)
 final class PreviewProvider: QLPreviewProvider, QLPreviewingController {
-    override func providePreview(
+    func providePreview(
         for request: QLFilePreviewRequest,
         completionHandler handler: @escaping (QLPreviewReply?, Error?) -> Void
     ) {
