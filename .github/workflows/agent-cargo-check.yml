@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   cargo-check:
     runs-on: macos-latest
@@ -15,12 +18,56 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Inspect GPUI Font API
+      - name: Apply gpui 0.2.2 compatibility patch
         run: |
-          cargo fetch
-          FONT_FILE=$(find "$CARGO_HOME/registry/src" -path '*/gpui-0.2.2/src/*.rs' -type f -print0 | xargs -0 grep -l 'pub struct Font' | head -1)
-          echo "FONT_FILE=$FONT_FILE"
-          grep -n -A30 -B5 'pub struct Font' "$FONT_FILE"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          replacements = {
+              Path("third_party/gpui-gfm/render/code_block.rs"): [
+                  (
+                      """  let code_font = Font {\n    family: theme.code_font_family.clone(),\n    ..Default::default()\n  };""",
+                      """  let code_font = Font {\n    family: theme.code_font_family.clone(),\n    features: Default::default(),\n    fallbacks: None,\n    weight: Default::default(),\n    style: Default::default(),\n  };""",
+                  ),
+              ],
+              Path("third_party/gpui-gfm/render/code_preview.rs"): [
+                  (
+                      """  let code_font = Font {\n    family: theme.code_font_family.clone(),\n    weight: FontWeight::NORMAL,\n    style: FontStyle::Normal,\n    ..Default::default()\n  };""",
+                      """  let code_font = Font {\n    family: theme.code_font_family.clone(),\n    features: Default::default(),\n    fallbacks: None,\n    weight: FontWeight::NORMAL,\n    style: FontStyle::Normal,\n  };""",
+                  ),
+              ],
+              Path("third_party/gpui-gfm/render/inline.rs"): [
+                  (
+                      """      Font {\n        family: theme.code_font_family.clone(),\n        weight: font_weight,\n        style: font_style,\n        ..Default::default()\n      }""",
+                      """      Font {\n        family: theme.code_font_family.clone(),\n        features: Default::default(),\n        fallbacks: None,\n        weight: font_weight,\n        style: font_style,\n      }""",
+                  ),
+                  (
+                      """      Font {\n        weight: font_weight,\n        style: font_style,\n        ..Default::default()\n      }""",
+                      """      Font {\n        family: \".SystemUIFont\".into(),\n        features: Default::default(),\n        fallbacks: None,\n        weight: font_weight,\n        style: font_style,\n      }""",
+                  ),
+              ],
+          }
+
+          for path, pairs in replacements.items():
+              text = path.read_text()
+              original = text
+              for old, new in pairs:
+                  if old not in text:
+                      raise SystemExit(f"expected compatibility pattern not found in {path}")
+                  text = text.replace(old, new, 1)
+              if text != original:
+                  path.write_text(text)
+          PY
+
+      - name: Commit compatibility patch
+        run: |
+          if [[ -n "$(git status --porcelain -- third_party/gpui-gfm)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add third_party/gpui-gfm
+            git commit -m "Adapt gpui-gfm fonts for GPUI 0.2.2"
+            git push origin HEAD:${{ github.head_ref }}
+          fi
 
       - name: Cargo check
         run: cargo check
