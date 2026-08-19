@@ -3,6 +3,7 @@ use crate::model::document::DocumentState;
 use crate::model::inline_markdown::InlineMarkdownState;
 use crate::services::settings;
 use crate::services::syntax::{SyntaxKind, SyntaxSpan};
+use crate::ui::editor_text_layout::{EditorTextLayout, render_editor_text};
 use crate::ui::text_utils::ellipsize_chars;
 use crate::ui::theme::{MarkdownStyle, Theme};
 use gpui::prelude::FluentBuilder as _;
@@ -10,7 +11,7 @@ use gpui::{
     App, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontStyle, FontWeight,
     HighlightStyle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, ParentElement, Render, ScrollHandle, StatefulInteractiveElement, Styled,
-    StyledText, UnderlineStyle, Window, canvas, combine_highlights, div, fill, point, px, size,
+    UnderlineStyle, Window, canvas, combine_highlights, div, fill, point, px, size,
 };
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
@@ -495,7 +496,7 @@ impl EditorView {
 
 fn source_byte_at_viewport_activation_line(
     scroll_handle: &ScrollHandle,
-    text_layout: &gpui::TextLayout,
+    text_layout: &EditorTextLayout,
     projection: &DisplayProjection,
 ) -> Option<usize> {
     let viewport = scroll_handle.bounds();
@@ -518,7 +519,7 @@ fn source_byte_at_viewport_activation_line(
 
 fn reveal_source_byte_after_layout(
     scroll_handle: &ScrollHandle,
-    text_layout: &gpui::TextLayout,
+    text_layout: &EditorTextLayout,
     projection: &DisplayProjection,
     source_byte: usize,
     align_to_top: bool,
@@ -533,9 +534,11 @@ fn reveal_source_byte_after_layout(
         return;
     };
 
-    let line_height = std::panic::catch_unwind(AssertUnwindSafe(|| text_layout.line_height()))
-        .ok()
-        .unwrap_or(px(0.));
+    let line_height = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        text_layout.line_height_for_index(display_byte)
+    }))
+    .ok()
+    .unwrap_or(px(0.));
     if line_height <= px(0.) {
         return;
     }
@@ -650,18 +653,15 @@ impl Render for EditorView {
             combine_highlights(syntax_and_search, selection_highlights).collect()
         };
 
-        let mut styled = StyledText::new(projection.display_text.clone());
         let safe_highlights = sanitize_highlights(&projection.display_text, all_highlights);
-        if !safe_highlights.is_empty() {
-            // On some platforms GPUI can panic while shaping mixed-style Unicode text.
-            // Fall back to plain text for that frame rather than dropping inline mode globally.
-            styled = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                StyledText::new(projection.display_text.clone()).with_highlights(safe_highlights)
-            }))
-            .unwrap_or_else(|_| StyledText::new(projection.display_text.clone()));
-        }
-
-        let text_layout = styled.layout().clone();
+        let editor_text = render_editor_text(
+            &projection.display_text,
+            &text_owned,
+            &safe_highlights,
+            settings::get_font_size(),
+        );
+        let text_layout = editor_text.layout.clone();
+        let editor_text_element = editor_text.element;
         let text_layout_for_sync = text_layout.clone();
         let text_layout_for_caret = text_layout.clone();
         let pending_reveal = self
@@ -1072,7 +1072,7 @@ impl Render for EditorView {
                         })
                     })
                     .child(
-                        div().relative().w_full().child(styled).child(
+                        div().relative().w_full().child(editor_text_element).child(
                             canvas(
                                 move |_, window: &mut Window, cx: &mut App| {
                                     let had_pending_reveal = pending_reveal.is_some();
@@ -1120,7 +1120,8 @@ impl Render for EditorView {
 
                                     let line_height =
                                         std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                            text_layout_for_caret.line_height()
+                                            text_layout_for_caret
+                                                .line_height_for_index(cursor_display_byte)
                                         }))
                                         .ok()
                                         .unwrap_or(px(0.));
@@ -1258,12 +1259,10 @@ fn syntax_style(
     match kind {
         SyntaxKind::HeadingMarker => HighlightStyle {
             color: Some(markdown_style.muted_foreground.into()),
-            font_weight: Some(FontWeight::BOLD),
             ..Default::default()
         },
         SyntaxKind::HeadingText => HighlightStyle {
             color: Some(markdown_style.foreground.into()),
-            font_weight: Some(FontWeight::BOLD),
             ..Default::default()
         },
         SyntaxKind::QuoteMarker => HighlightStyle {
