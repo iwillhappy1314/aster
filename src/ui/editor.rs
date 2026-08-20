@@ -138,20 +138,34 @@ impl DisplayProjection {
 
     fn display_to_source_byte(&self, display_byte: usize) -> usize {
         let display_byte = display_byte.min(self.display_text.len());
+        let mut mapped = self.source_len;
+
         for segment in &self.segments {
             if display_byte < segment.display_start {
                 return segment.source.start;
             }
+
             if segment.hidden {
+                // Hidden Markdown syntax occupies no display width. When the caret lands exactly
+                // on that boundary, bias it to the right so typing after a rendered link happens
+                // after `](...)` rather than inside the hidden Markdown syntax.
+                if display_byte == segment.display_start {
+                    mapped = segment.source.end;
+                }
                 continue;
             }
 
             let display_end = segment.display_start + segment.source.len();
-            if display_byte <= display_end {
+            if display_byte < display_end {
                 return segment.source.start + (display_byte - segment.display_start);
             }
+            if display_byte == display_end {
+                mapped = segment.source.end;
+                continue;
+            }
         }
-        self.source_len
+
+        mapped.min(self.source_len)
     }
 
     fn project_highlights(
@@ -718,7 +732,7 @@ impl Render for EditorView {
         let is_focused = focus_handle.is_focused(window);
         let markdown_style = Theme::markdown_style();
 
-        // Use cached text if revision hasn't changed to avoid O(n) rope conversion.
+        // Use cached text if revision hasn't changed to avoid O(n) rope-to-string conversion.
         let (text_owned, doc_revision) = {
             let doc = self.document.read(cx);
             let rev = doc.revision;
@@ -1634,5 +1648,33 @@ mod tests {
         let spans = markdown_spans(source);
         let projection = DisplayProjection::from_source(source, &spans);
         assert_eq!(projection.display_text, "Hi");
+    }
+
+    #[test]
+    fn display_projection_maps_link_end_after_hidden_target() {
+        let source = "![cola-2.png](<assets/cola-2.png>)";
+        let spans = markdown_spans(source);
+        let projection = DisplayProjection::from_source(source, &spans);
+
+        assert_eq!(projection.display_text, "!cola-2.png");
+        assert_eq!(
+            projection.display_to_source_byte(projection.display_text.len()),
+            source.len()
+        );
+    }
+
+    #[test]
+    fn display_projection_maps_link_boundary_to_following_source_text() {
+        let source = "[Google](https://google.com) next";
+        let spans = markdown_spans(source);
+        let projection = DisplayProjection::from_source(source, &spans);
+        let display_boundary = "Google".len();
+        let source_boundary = source.find(" next").expect("trailing text");
+
+        assert_eq!(projection.display_text, "Google next");
+        assert_eq!(
+            projection.display_to_source_byte(display_boundary),
+            source_boundary
+        );
     }
 }
