@@ -330,10 +330,12 @@ impl RootView {
         }
 
         let document_path = self.document.read(cx).path.clone();
+        // ExternalPaths already represents paths supplied by the platform drag payload.
+        // Avoid metadata checks such as is_file(): they can fail for dropped paths before
+        // macOS has granted normal filesystem metadata access to the process.
         let snippets = paths
             .paths()
             .iter()
-            .filter(|path| path.is_file())
             .map(|path| markdown_for_dropped_file(path, document_path.as_ref()))
             .collect::<Vec<_>>();
 
@@ -354,6 +356,9 @@ impl RootView {
         let _ = self
             .editor_view
             .update(cx, |editor, cx| editor.reveal_cursor(cx));
+        // The preview is rendered by RootView rather than EditorView, so ensure a drop
+        // immediately repaints both modes and refreshes the cached document revision.
+        cx.notify();
     }
 
     pub fn confirm_before_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
