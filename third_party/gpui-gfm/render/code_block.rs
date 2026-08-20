@@ -165,6 +165,7 @@ pub fn render_code_block(
       runs,
       Vec::new(),
       options.selection_state.clone(),
+      options.focus_handle.clone(),
       None,
       text_id,
     ));

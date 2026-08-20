@@ -18,8 +18,8 @@ use crate::ui::theme::Theme;
 use camino::Utf8PathBuf;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, Entity, ExternalPaths, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Render,
+    App, Bounds, ClipboardItem, Context, Entity, ExternalPaths, FocusHandle, InteractiveElement,
+    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Render,
     ScrollHandle, StatefulInteractiveElement, Styled, Window, canvas, div, fill, point, px,
     size,
 };
@@ -69,6 +69,10 @@ pub struct RootView {
     outline_visible: bool,
     /// Whether the document is currently shown in read-only preview mode.
     preview_visible: bool,
+    /// Focus target that keeps preview keyboard actions available to macOS.
+    preview_focus_handle: Option<FocusHandle>,
+    /// Whether the preview should receive focus after the next render.
+    focus_preview_on_render: bool,
     /// Scroll state shared by the preview content and its right-edge indicator.
     preview_scroll_handle: ScrollHandle,
     /// Whether the preview's right-edge scroll indicator is currently visible.
@@ -106,6 +110,8 @@ impl RootView {
             resizing_sidebar: false,
             outline_visible: settings::get_outline_visible(),
             preview_visible: settings::get_preview_visible(),
+            preview_focus_handle: None,
+            focus_preview_on_render: true,
             preview_scroll_handle: ScrollHandle::new(),
             preview_scroll_indicator_visible: false,
             preview_scroll_indicator_revision: 0,
@@ -418,24 +424,22 @@ impl RootView {
     fn toggle_preview(&mut self, cx: &mut Context<Self>) {
         self.preview_visible = !self.preview_visible;
         settings::set_preview_visible(self.preview_visible);
+        self.focus_preview_on_render = self.preview_visible;
         cx.notify();
     }
 
-    /// Selects the complete document for shortcuts handled outside the source editor.
-    fn select_all_document(&mut self, cx: &mut Context<Self>) {
-        let _ = self.document.update(cx, |document, cx| {
-            document.select_all();
-            cx.notify();
-        });
+    /// Selects all text rendered in the Markdown preview.
+    fn select_all_preview_text(&mut self, cx: &mut Context<Self>) {
+        self.preview_markdown_options.select_all_preview_text();
+        cx.notify();
     }
 
-    /// Copies the document's current selection to the system clipboard.
-    fn copy_document_selection(&self, cx: &mut Context<Self>) {
-        let Some(selection) = self.document.read(cx).selection_range() else {
+    /// Copies the Markdown preview's current text selection to the system clipboard.
+    fn copy_preview_selection(&self, cx: &mut Context<Self>) {
+        let Some(text) = self.preview_markdown_options.selected_preview_text() else {
             return;
         };
 
-        let text = self.document.read(cx).slice_chars(selection);
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
@@ -693,6 +697,14 @@ fn open_preview_link(target: &str, document_dir: &Path, cx: &mut App) {
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let preview_focus_handle = self
+            .preview_focus_handle
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone();
+        if self.preview_visible && self.focus_preview_on_render {
+            preview_focus_handle.focus(window);
+            self.focus_preview_on_render = false;
+        }
         // Install the Outline reveal callback once. The editor uses TextLayout's
         // exact Y position; preview uses ScrollHandle's real direct-child bounds.
         if !self.outline_reveal_installed {
@@ -997,12 +1009,12 @@ impl Render for RootView {
             }))
             .on_action(cx.listener(|this, _: &SelectAll, _window, cx| {
                 if this.preview_visible {
-                    this.select_all_document(cx);
+                    this.select_all_preview_text(cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &Copy, _window, cx| {
                 if this.preview_visible {
-                    this.copy_document_selection(cx);
+                    this.copy_preview_selection(cx);
                 }
             }))
             // Handle sidebar resize drag at root level so we don't lose events
@@ -1088,7 +1100,8 @@ impl Render for RootView {
                         let mut markdown_options = self
                             .preview_markdown_options
                             .clone()
-                            .with_theme(markdown_theme);
+                            .with_theme(markdown_theme)
+                            .with_focus_handle(preview_focus_handle.clone());
                         markdown_options.set_selection_color(Theme::selection_bg().into());
                         if let Some(document_dir) = doc_path
                             .as_ref()
@@ -1138,6 +1151,7 @@ impl Render for RootView {
                                     .overflow_y_scroll()
                                     .overflow_x_hidden()
                                     .track_scroll(&self.preview_scroll_handle)
+                                    .track_focus(&preview_focus_handle)
                                     .on_scroll_wheel(cx.listener(
                                         |this, _: &gpui::ScrollWheelEvent, _, cx| {
                                             this.reveal_preview_scroll_indicator(cx);

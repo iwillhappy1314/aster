@@ -11,7 +11,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 use gpui::{
   AnyElement, App, ClipboardItem, CursorStyle, DispatchPhase, Element, ElementId,
   GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId,
-  MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString,
+  FocusHandle, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+  SharedString,
   StatefulInteractiveElement, StyledText, TextRun, Window, anchored, deferred, div, prelude::*, px,
 };
 
@@ -119,6 +120,7 @@ impl SelectableText {
     base_runs: Vec<TextRun>,
     link_ranges: Vec<LinkRange>,
     selection_state: SelectionState,
+    focus_handle: Option<FocusHandle>,
     on_link: Option<Arc<LinkHandlerFn>>,
     text_id: usize,
   ) -> Self {
@@ -131,6 +133,7 @@ impl SelectableText {
         base_runs,
         link_ranges,
         selection_state,
+        focus_handle,
         on_link,
         text_id,
         styled_text,
@@ -152,6 +155,8 @@ struct SelectableTextElement {
   link_ranges: Vec<LinkRange>,
   /// Shared selection state (across all text blocks in the document).
   selection_state: SelectionState,
+  /// Host focus target that enables preview keyboard actions.
+  focus_handle: Option<FocusHandle>,
   /// Link click handler.
   on_link: Option<Arc<LinkHandlerFn>>,
   /// Unique ID for this text block within the current render pass.
@@ -247,6 +252,7 @@ impl Element for SelectableTextElement {
     let text_id = self.text_id;
     let text_len = text.len();
     let selection_state = self.selection_state.clone();
+    let focus_handle = self.focus_handle.clone();
     let on_link = self.on_link.clone();
     let link_ranges = self.link_ranges.clone();
 
@@ -276,6 +282,9 @@ impl Element for SelectableTextElement {
         }
 
         clear_context_menu(&selection_state);
+        if let Some(focus_handle) = &focus_handle {
+          focus_handle.focus(window);
+        }
         let index = text_layout
           .index_for_position(event.position)
           .unwrap_or_else(|ix| ix);
@@ -811,6 +820,7 @@ impl IntoElement for SelectableText {
 
     let mut wrapper = div()
       .id(("preview-selectable-text", text_id))
+      .w_full()
       .child(self.inner);
 
     if let Some(context) = menu_context {
@@ -849,5 +859,19 @@ mod tests {
     register_cross_block_text(&state, 1, "second");
     select_all_cross_block(&state);
     assert_eq!(cross_block_selected_text(&state).as_deref(), Some("first\nsecond"));
+  }
+
+  #[test]
+  fn preview_selection_api_returns_all_registered_text() {
+    let options = MarkdownRenderOptions::default();
+    register_cross_block_text(&options.selection_state, 0, "first");
+    register_cross_block_text(&options.selection_state, 1, "second");
+
+    options.select_all_preview_text();
+
+    assert_eq!(
+      options.selected_preview_text().as_deref(),
+      Some("first\nsecond")
+    );
   }
 }

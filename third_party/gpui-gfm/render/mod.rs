@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use gpui::{AnyElement, App, Hsla, SharedString, div, prelude::*};
+use gpui::{AnyElement, App, FocusHandle, Hsla, SharedString, div, prelude::*};
 
 use crate::github::GithubCodeReferencePreview;
 use crate::github::GithubIssueReferenceContext;
@@ -602,6 +602,8 @@ pub struct MarkdownRenderOptions {
   pub show_indentation_dots: bool,
   /// Internal: persistent state for text selection
   pub(crate) selection_state: SelectionState,
+  /// Focus target activated when rendered Markdown text is selected.
+  pub(crate) focus_handle: Option<FocusHandle>,
 }
 
 impl MarkdownRenderOptions {
@@ -612,6 +614,12 @@ impl MarkdownRenderOptions {
 
   pub fn with_theme(mut self, theme: MarkdownTheme) -> Self {
     self.theme = Some(theme);
+    self
+  }
+
+  /// Associates rendered Markdown with the host view's keyboard focus target.
+  pub fn with_focus_handle(mut self, focus_handle: FocusHandle) -> Self {
+    self.focus_handle = Some(focus_handle);
     self
   }
 

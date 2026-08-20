@@ -109,6 +109,7 @@ fn render_inline_flat(inlines: &[Inline], options: &MarkdownRenderOptions, cx: &
     runs,
     Vec::new(), // no link ranges in flat path
     sel.clone(),
+    options.focus_handle.clone(),
     options.on_link.clone(),
     text_id,
   )
@@ -190,6 +191,7 @@ fn render_selectable_segmented(
     all_runs,
     link_ranges,
     sel.clone(),
+    options.focus_handle.clone(),
     options.on_link.clone(),
     text_id,
   )
