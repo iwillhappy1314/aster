@@ -121,6 +121,8 @@ impl SelectableText {
     link_ranges: Vec<LinkRange>,
     selection_state: SelectionState,
     focus_handle: Option<FocusHandle>,
+    search_query: Option<SharedString>,
+    search_highlight_color: Option<Hsla>,
     on_link: Option<Arc<LinkHandlerFn>>,
     text_id: usize,
   ) -> Self {
@@ -134,10 +136,13 @@ impl SelectableText {
         link_ranges,
         selection_state,
         focus_handle,
+        search_query,
+        search_highlight_color,
         on_link,
         text_id,
         styled_text,
         last_selection: None,
+        last_search_query: None,
       },
       menu_theme,
     }
@@ -157,6 +162,10 @@ struct SelectableTextElement {
   selection_state: SelectionState,
   /// Host focus target that enables preview keyboard actions.
   focus_handle: Option<FocusHandle>,
+  /// Query highlighted within this rendered text block.
+  search_query: Option<SharedString>,
+  /// Background color applied to query matches.
+  search_highlight_color: Option<Hsla>,
   /// Link click handler.
   on_link: Option<Arc<LinkHandlerFn>>,
   /// Unique ID for this text block within the current render pass.
@@ -165,6 +174,8 @@ struct SelectableTextElement {
   styled_text: StyledText,
   /// Last selection range applied (used to avoid re-building runs).
   last_selection: Option<Range<usize>>,
+  /// Last search query applied to the rendered runs.
+  last_search_query: Option<SharedString>,
 }
 
 impl SelectableTextElement {
@@ -176,22 +187,30 @@ impl SelectableTextElement {
       self.text.as_ref(),
     );
 
-    if selection == self.last_selection {
+    if selection == self.last_selection && self.search_query == self.last_search_query {
       return;
+    }
+
+    let mut runs = self.base_runs.clone();
+    if let (Some(query), Some(color)) = (&self.search_query, self.search_highlight_color) {
+      for range in find_matches_case_insensitive(self.text.as_ref(), query.as_ref()) {
+        runs = apply_selection_to_runs(runs, range, color);
+      }
     }
 
     let runs = if let Some(ref sel) = selection {
       apply_selection_to_runs(
-        self.base_runs.clone(),
+        runs,
         sel.clone(),
         self.selection_state.selection_color(),
       )
     } else {
-      self.base_runs.clone()
+      runs
     };
 
     self.styled_text = StyledText::new(self.text.clone()).with_runs(runs);
     self.last_selection = selection;
+    self.last_search_query = self.search_query.clone();
   }
 }
 
@@ -635,6 +654,56 @@ fn cross_block_selected_text(selection_state: &SelectionState) -> Option<String>
   if parts.is_empty() { None } else { Some(parts.join("\n")) }
 }
 
+/// Returns non-overlapping ASCII-case-insensitive matches at UTF-8 boundaries.
+fn find_matches_case_insensitive(text: &str, query: &str) -> Vec<Range<usize>> {
+  if query.is_empty() || query.len() > text.len() {
+    return Vec::new();
+  }
+
+  let query = query
+    .as_bytes()
+    .iter()
+    .map(u8::to_ascii_lowercase)
+    .collect::<Vec<_>>();
+  let bytes = text.as_bytes();
+  let mut matches = Vec::new();
+  let mut start = 0;
+
+  while start + query.len() <= bytes.len() {
+    let end = start + query.len();
+    if text.is_char_boundary(start)
+      && text.is_char_boundary(end)
+      && bytes[start..end]
+        .iter()
+        .map(u8::to_ascii_lowercase)
+        .eq(query.iter().copied())
+    {
+      matches.push(start..end);
+      start = end;
+    } else {
+      start += 1;
+    }
+  }
+
+  matches
+}
+
+fn preview_search_match_count(selection_state: &SelectionState, query: &str) -> usize {
+  let key = selection_state_key(selection_state);
+  CROSS_BLOCK_SELECTIONS
+    .lock()
+    .unwrap()
+    .get(&key)
+    .map(|state| {
+      state
+        .texts
+        .values()
+        .map(|text| find_matches_case_insensitive(text, query).len())
+        .sum()
+    })
+    .unwrap_or_default()
+}
+
 fn select_all_cross_block(selection_state: &SelectionState) {
   let key = selection_state_key(selection_state);
   let mut all = CROSS_BLOCK_SELECTIONS.lock().unwrap();
@@ -846,6 +915,15 @@ impl MarkdownRenderOptions {
   pub fn select_all_preview_text(&self) {
     select_all_cross_block(&self.selection_state);
   }
+
+  /// Returns the number of highlighted matches in the current rendered preview.
+  pub fn preview_search_match_count(&self) -> usize {
+    self
+      .search_query
+      .as_deref()
+      .map(|query| preview_search_match_count(&self.selection_state, query))
+      .unwrap_or_default()
+  }
 }
 
 #[cfg(test)]
@@ -872,6 +950,14 @@ mod tests {
     assert_eq!(
       options.selected_preview_text().as_deref(),
       Some("first\nsecond")
+    );
+  }
+
+  #[test]
+  fn search_matches_ignore_ascii_case_and_preserve_utf8_boundaries() {
+    assert_eq!(
+      find_matches_case_insensitive("部署 Deploy deploy", "deploy"),
+      vec![7..13, 14..20]
     );
   }
 }

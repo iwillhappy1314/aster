@@ -604,6 +604,10 @@ pub struct MarkdownRenderOptions {
   pub(crate) selection_state: SelectionState,
   /// Focus target activated when rendered Markdown text is selected.
   pub(crate) focus_handle: Option<FocusHandle>,
+  /// Query highlighted in rendered Markdown text.
+  pub(crate) search_query: Option<SharedString>,
+  /// Background color used for rendered Markdown search matches.
+  pub(crate) search_highlight_color: Option<Hsla>,
 }
 
 impl MarkdownRenderOptions {
@@ -620,6 +624,14 @@ impl MarkdownRenderOptions {
   /// Associates rendered Markdown with the host view's keyboard focus target.
   pub fn with_focus_handle(mut self, focus_handle: FocusHandle) -> Self {
     self.focus_handle = Some(focus_handle);
+    self
+  }
+
+  /// Highlights case-insensitive matches for a query in rendered Markdown text.
+  pub fn with_search_highlight(mut self, query: impl Into<SharedString>, color: Hsla) -> Self {
+    let query = query.into();
+    self.search_query = (!query.is_empty()).then_some(query);
+    self.search_highlight_color = Some(color);
     self
   }
 

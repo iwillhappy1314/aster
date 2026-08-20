@@ -166,6 +166,8 @@ pub fn render_code_block(
       Vec::new(),
       options.selection_state.clone(),
       options.focus_handle.clone(),
+      options.search_query.clone(),
+      options.search_highlight_color,
       None,
       text_id,
     ));

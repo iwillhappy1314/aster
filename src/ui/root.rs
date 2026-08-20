@@ -1,5 +1,5 @@
 use crate::commands::{
-    Copy, FontSizeDecrease, FontSizeIncrease, FontSizeReset, NewFile, OpenFile,
+    Copy, Find, FontSizeDecrease, FontSizeIncrease, FontSizeReset, NewFile, OpenFile,
     OutlinePositionLeft, OutlinePositionRight, SaveFile, SaveFileAs, SelectAll, ToggleOutline,
     TogglePreview,
 };
@@ -18,10 +18,11 @@ use crate::ui::theme::Theme;
 use camino::Utf8PathBuf;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, Entity, ExternalPaths, FocusHandle, InteractiveElement,
-    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Render,
+    App, Bounds, ClipboardItem, Context, ElementInputHandler, Entity, EntityInputHandler,
+    ExternalPaths, FocusHandle, FontWeight, InteractiveElement, IntoElement, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Render,
     ScrollHandle, StatefulInteractiveElement, Styled, Window, canvas, div, fill, point, px,
-    size,
+    size, UTF16Selection,
 };
 use gpui_component::notification::NotificationList;
 use gpui_gfm::{
@@ -29,6 +30,7 @@ use gpui_gfm::{
 };
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -73,6 +75,14 @@ pub struct RootView {
     preview_focus_handle: Option<FocusHandle>,
     /// Whether the preview should receive focus after the next render.
     focus_preview_on_render: bool,
+    /// Whether the preview Find panel is visible.
+    preview_find_active: bool,
+    /// Query currently highlighted in rendered preview text.
+    preview_find_query: String,
+    /// Caret position in the Find query, measured in Unicode scalar values.
+    preview_find_cursor: usize,
+    /// Text currently under composition by the system input method.
+    preview_find_marked_range: Option<Range<usize>>,
     /// Scroll state shared by the preview content and its right-edge indicator.
     preview_scroll_handle: ScrollHandle,
     /// Whether the preview's right-edge scroll indicator is currently visible.
@@ -112,6 +122,10 @@ impl RootView {
             preview_visible: settings::get_preview_visible(),
             preview_focus_handle: None,
             focus_preview_on_render: true,
+            preview_find_active: false,
+            preview_find_query: String::new(),
+            preview_find_cursor: 0,
+            preview_find_marked_range: None,
             preview_scroll_handle: ScrollHandle::new(),
             preview_scroll_indicator_visible: false,
             preview_scroll_indicator_revision: 0,
@@ -428,6 +442,52 @@ impl RootView {
         cx.notify();
     }
 
+    /// Opens the Find panel while keeping the rendered Markdown preview visible.
+    fn activate_preview_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.preview_find_active = true;
+        self.preview_find_cursor = self.preview_find_query.chars().count();
+        if let Some(focus_handle) = &self.preview_focus_handle {
+            focus_handle.focus(window);
+        }
+        cx.notify();
+    }
+
+    /// Handles non-text preview Find keyboard commands.
+    fn handle_preview_find_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.to_lowercase();
+        let modifiers = event.keystroke.modifiers;
+        let is_command = modifiers.platform || modifiers.control;
+
+        if key == "escape" {
+            self.preview_find_active = false;
+            cx.notify();
+            return;
+        }
+
+        if !self.preview_find_active || is_command {
+            return;
+        }
+    }
+
+    /// Replaces part of the Find query and keeps cursor/composition ranges in character offsets.
+    fn replace_preview_find_query(
+        &mut self,
+        target: Range<usize>,
+        text: &str,
+        marked: bool,
+    ) {
+        let query_len = self.preview_find_query.chars().count();
+        let start = target.start.min(query_len);
+        let end = target.end.min(query_len).max(start);
+        let start_byte = char_offset_to_byte(&self.preview_find_query, start);
+        let end_byte = char_offset_to_byte(&self.preview_find_query, end);
+        self.preview_find_query.replace_range(start_byte..end_byte, text);
+
+        let inserted_chars = text.chars().count();
+        self.preview_find_cursor = start.saturating_add(inserted_chars);
+        self.preview_find_marked_range = marked.then_some(start..start.saturating_add(inserted_chars));
+    }
+
     /// Selects all text rendered in the Markdown preview.
     fn select_all_preview_text(&mut self, cx: &mut Context<Self>) {
         self.preview_markdown_options.select_all_preview_text();
@@ -695,12 +755,167 @@ fn open_preview_link(target: &str, document_dir: &Path, cx: &mut App) {
     }
 }
 
+/// Converts a UTF-16 offset to a character offset without splitting multi-unit characters.
+fn utf16_offset_to_char_offset(text: &str, utf16_offset: usize) -> usize {
+    let mut utf16_count = 0usize;
+    let mut char_count = 0usize;
+
+    for character in text.chars() {
+        let next = utf16_count.saturating_add(character.len_utf16());
+        if next > utf16_offset {
+            break;
+        }
+        utf16_count = next;
+        char_count += 1;
+    }
+
+    char_count
+}
+
+/// Converts a character offset to the corresponding byte offset in UTF-8 text.
+fn char_offset_to_byte(text: &str, char_offset: usize) -> usize {
+    text.char_indices()
+        .nth(char_offset)
+        .map_or(text.len(), |(byte_offset, _)| byte_offset)
+}
+
+/// Converts a character range in the Find query to a UTF-16 range for macOS input APIs.
+fn preview_find_char_range_to_utf16(text: &str, range: &Range<usize>) -> Range<usize> {
+    let start = text
+        .chars()
+        .take(range.start.min(text.chars().count()))
+        .map(char::len_utf16)
+        .sum();
+    let end = text
+        .chars()
+        .take(range.end.min(text.chars().count()))
+        .map(char::len_utf16)
+        .sum();
+    start..end
+}
+
+/// Implements macOS text-input callbacks for the preview Find query, including IME composition.
+impl EntityInputHandler for RootView {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let range = utf16_offset_to_char_offset(&self.preview_find_query, range_utf16.start)
+            ..utf16_offset_to_char_offset(&self.preview_find_query, range_utf16.end);
+        adjusted_range.replace(preview_find_char_range_to_utf16(
+            &self.preview_find_query,
+            &range,
+        ));
+        let start_byte = char_offset_to_byte(&self.preview_find_query, range.start);
+        let end_byte = char_offset_to_byte(&self.preview_find_query, range.end);
+        Some(self.preview_find_query[start_byte..end_byte].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let cursor = self.preview_find_cursor.min(self.preview_find_query.chars().count());
+        let range = preview_find_char_range_to_utf16(&self.preview_find_query, &(cursor..cursor));
+        Some(UTF16Selection {
+            range,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.preview_find_marked_range
+            .as_ref()
+            .map(|range| preview_find_char_range_to_utf16(&self.preview_find_query, range))
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.preview_find_marked_range = None;
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = range_utf16
+            .as_ref()
+            .map(|range| {
+                utf16_offset_to_char_offset(&self.preview_find_query, range.start)
+                    ..utf16_offset_to_char_offset(&self.preview_find_query, range.end)
+            })
+            .or_else(|| self.preview_find_marked_range.clone())
+            .unwrap_or(self.preview_find_cursor..self.preview_find_cursor);
+        self.replace_preview_find_query(target, text, false);
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range_utf16: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = range_utf16
+            .as_ref()
+            .map(|range| {
+                utf16_offset_to_char_offset(&self.preview_find_query, range.start)
+                    ..utf16_offset_to_char_offset(&self.preview_find_query, range.end)
+            })
+            .or_else(|| self.preview_find_marked_range.clone())
+            .unwrap_or(self.preview_find_cursor..self.preview_find_cursor);
+        self.replace_preview_find_query(target, new_text, true);
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(Bounds {
+            origin: element_bounds.origin,
+            size: size(px(1.), px(1.)),
+        })
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(preview_find_char_range_to_utf16(
+            &self.preview_find_query,
+            &(self.preview_find_cursor..self.preview_find_cursor),
+        )
+        .start)
+    }
+}
+
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let preview_focus_handle = self
             .preview_focus_handle
             .get_or_insert_with(|| cx.focus_handle())
             .clone();
+        let preview_input_entity = cx.entity();
         if self.preview_visible && self.focus_preview_on_render {
             preview_focus_handle.focus(window);
             self.focus_preview_on_render = false;
@@ -1007,6 +1222,11 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &TogglePreview, _window, cx| {
                 this.toggle_preview(cx);
             }))
+            .on_action(cx.listener(|this, _: &Find, window, cx| {
+                if this.preview_visible {
+                    this.activate_preview_find(window, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &SelectAll, _window, cx| {
                 if this.preview_visible {
                     this.select_all_preview_text(cx);
@@ -1097,11 +1317,17 @@ impl Render for RootView {
                             code_font_family: "Menlo".into(),
                             is_dark: Theme::is_dark(),
                         };
+                        let mut preview_find_color: gpui::Hsla = gpui::rgb(0xffd66b).into();
+                        preview_find_color.a = 0.42;
                         let mut markdown_options = self
                             .preview_markdown_options
                             .clone()
                             .with_theme(markdown_theme)
-                            .with_focus_handle(preview_focus_handle.clone());
+                            .with_focus_handle(preview_focus_handle.clone())
+                            .with_search_highlight(
+                                self.preview_find_query.clone(),
+                                preview_find_color,
+                            );
                         markdown_options.set_selection_color(Theme::selection_bg().into());
                         if let Some(document_dir) = doc_path
                             .as_ref()
@@ -1128,6 +1354,11 @@ impl Render for RootView {
                             &mut self.preview_markdown_cache,
                             cx,
                         );
+                        let preview_find_active = self.preview_find_active;
+                        let preview_find_query = self.preview_find_query.clone();
+                        let preview_find_count = markdown_options.preview_search_match_count();
+                        let preview_input_focus_handle = preview_focus_handle.clone();
+                        let preview_input_entity = preview_input_entity.clone();
                         let heading_child_indices = markdown_blocks.heading_child_indices.clone();
                         if let Ok(mut indices) = self.preview_heading_child_indices.lock() {
                             *indices = heading_child_indices.clone();
@@ -1138,6 +1369,21 @@ impl Render for RootView {
                             .flex_1()
                             .min_h(px(0.))
                             .min_w(px(0.))
+                            .child(canvas(
+                                |_, _window: &mut Window, _cx: &mut App| {},
+                                move |bounds: Bounds<_>, (), window: &mut Window, cx: &mut App| {
+                                    if preview_find_active {
+                                        window.handle_input(
+                                            &preview_input_focus_handle,
+                                            ElementInputHandler::new(
+                                                bounds,
+                                                preview_input_entity.clone(),
+                                            ),
+                                            cx,
+                                        );
+                                    }
+                                },
+                            ))
                             .child(
                                 div()
                                     .id("preview-scroll")
@@ -1152,6 +1398,13 @@ impl Render for RootView {
                                     .overflow_x_hidden()
                                     .track_scroll(&self.preview_scroll_handle)
                                     .track_focus(&preview_focus_handle)
+                                    .on_key_down(cx.listener(
+                                        move |this, event: &KeyDownEvent, window, cx| {
+                                            if preview_focus_handle.is_focused(window) {
+                                                this.handle_preview_find_key(event, cx);
+                                            }
+                                        },
+                                    ))
                                     .on_scroll_wheel(cx.listener(
                                         |this, _: &gpui::ScrollWheelEvent, _, cx| {
                                             this.reveal_preview_scroll_indicator(cx);
@@ -1159,6 +1412,48 @@ impl Render for RootView {
                                     ))
                                     .children(markdown_blocks.elements),
                             )
+                            .when(preview_find_active, |this| {
+                                this.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(8.))
+                                        .right(px(12.))
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .px(px(10.))
+                                        .py(px(6.))
+                                        .rounded(px(6.))
+                                        .bg(Theme::panel_alt())
+                                        .border_1()
+                                        .border_color(Theme::border())
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(Theme::muted())
+                                                .child("FIND"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .max_w(px(300.))
+                                                .overflow_hidden()
+                                                .text_color(Theme::text())
+                                                .child(if preview_find_query.is_empty() {
+                                                    "Type to search".to_string()
+                                                } else {
+                                                    preview_find_query
+                                                }),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(Theme::muted())
+                                                .child(preview_find_count.to_string()),
+                                        ),
+                                )
+                            })
                             // Match the editor's indicator: it is rendered above the scrolling
                             // content and fixed to the view's right edge.
                             .child(
