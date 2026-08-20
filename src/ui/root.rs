@@ -21,12 +21,13 @@ use gpui::{
     App, Bounds, ClipboardItem, Context, ElementInputHandler, Entity, EntityInputHandler,
     ExternalPaths, FocusHandle, FontWeight, InteractiveElement, IntoElement, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Render,
-    ScrollHandle, StatefulInteractiveElement, Styled, Window, canvas, div, fill, point, px,
-    size, UTF16Selection,
+    ScrollHandle, StatefulInteractiveElement, Styled, UTF16Selection, Window, canvas, div, px,
+    size,
 };
 use gpui_component::notification::NotificationList;
 use gpui_gfm::{
-    MarkdownCache, MarkdownRenderOptions, MarkdownTheme, render_markdown_blocks_cached,
+    InteractiveScrollbarAxis, InteractiveScrollbarState, MarkdownCache, MarkdownRenderOptions,
+    MarkdownTheme, render_interactive_scrollbar, render_markdown_blocks_cached,
 };
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use std::fs;
@@ -85,10 +86,8 @@ pub struct RootView {
     preview_find_marked_range: Option<Range<usize>>,
     /// Scroll state shared by the preview content and its right-edge indicator.
     preview_scroll_handle: ScrollHandle,
-    /// Whether the preview's right-edge scroll indicator is currently visible.
-    preview_scroll_indicator_visible: bool,
-    /// Monotonic revision used to prevent an older hide timer from hiding a newer scroll event.
-    preview_scroll_indicator_revision: u64,
+    /// Hover and drag state for the preview's interactive vertical scrollbar.
+    preview_scrollbar_state: InteractiveScrollbarState,
     /// Persistent gpui-gfm state so selection and interactive Markdown survive re-renders.
     preview_markdown_options: MarkdownRenderOptions,
     /// Parsed Markdown cache reused by the preview across GPUI render passes.
@@ -127,8 +126,7 @@ impl RootView {
             preview_find_cursor: 0,
             preview_find_marked_range: None,
             preview_scroll_handle: ScrollHandle::new(),
-            preview_scroll_indicator_visible: false,
-            preview_scroll_indicator_revision: 0,
+            preview_scrollbar_state: InteractiveScrollbarState::default(),
             preview_markdown_options: MarkdownRenderOptions::default(),
             preview_markdown_cache: MarkdownCache::default(),
             preview_heading_child_indices: Default::default(),
@@ -501,29 +499,6 @@ impl RootView {
         };
 
         cx.write_to_clipboard(ClipboardItem::new_string(text));
-    }
-
-    /// Shows the preview scroll indicator briefly after a wheel-scroll event.
-    fn reveal_preview_scroll_indicator(&mut self, cx: &mut Context<Self>) {
-        self.preview_scroll_indicator_visible = true;
-        self.preview_scroll_indicator_revision =
-            self.preview_scroll_indicator_revision.wrapping_add(1);
-        let revision = self.preview_scroll_indicator_revision;
-        let entity = cx.entity();
-
-        cx.spawn(async move |_view, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(1_200))
-                .await;
-            let _ = entity.update(cx, |view, cx| {
-                if view.preview_scroll_indicator_revision == revision {
-                    view.preview_scroll_indicator_visible = false;
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
-        cx.notify();
     }
 
     fn sync_preview_outline_active(
@@ -1303,8 +1278,7 @@ impl Render for RootView {
                     })
                     .child(if self.preview_visible {
                         let preview_scroll_handle = self.preview_scroll_handle.clone();
-                        let has_multiple_lines = doc_text.lines().nth(1).is_some();
-                        let show_preview_scroll_indicator = self.preview_scroll_indicator_visible;
+                        let preview_scrollbar_state = self.preview_scrollbar_state.clone();
                         let markdown_style = Theme::markdown_style();
                         let markdown_theme = MarkdownTheme {
                             foreground: markdown_style.foreground.into(),
@@ -1405,11 +1379,6 @@ impl Render for RootView {
                                             }
                                         },
                                     ))
-                                    .on_scroll_wheel(cx.listener(
-                                        |this, _: &gpui::ScrollWheelEvent, _, cx| {
-                                            this.reveal_preview_scroll_indicator(cx);
-                                        },
-                                    ))
                                     .children(markdown_blocks.elements),
                             )
                             .when(preview_find_active, |this| {
@@ -1454,57 +1423,13 @@ impl Render for RootView {
                                         ),
                                 )
                             })
-                            // Match the editor's indicator: it is rendered above the scrolling
-                            // content and fixed to the view's right edge.
                             .child(
-                                canvas(
-                                    move |_, _, _| {},
-                                    move |bounds: Bounds<_>,
-                                          (),
-                                          window: &mut Window,
-                                          _cx: &mut App| {
-                                        if !show_preview_scroll_indicator {
-                                            return;
-                                        }
-                                        let viewport_height =
-                                            preview_scroll_handle.bounds().size.height;
-                                        let max_offset = preview_scroll_handle.max_offset().height;
-                                        if viewport_height <= px(0.)
-                                            || (max_offset <= px(0.) && !has_multiple_lines)
-                                        {
-                                            return;
-                                        }
-
-                                        let content_height = viewport_height + max_offset;
-                                        let thumb_height = if max_offset > px(0.) {
-                                            (viewport_height / content_height * bounds.size.height)
-                                                .max(px(48.))
-                                                .min(bounds.size.height)
-                                        } else {
-                                            px(48.).min(bounds.size.height)
-                                        };
-                                        let travel = bounds.size.height - thumb_height;
-                                        let progress = if max_offset > px(0.) {
-                                            (-preview_scroll_handle.offset().y / max_offset)
-                                                .clamp(0., 1.)
-                                        } else {
-                                            0.
-                                        };
-                                        let top = bounds.origin.y + travel * progress;
-
-                                        window.paint_quad(fill(
-                                            Bounds {
-                                                origin: point(bounds.right() - px(8.), top),
-                                                size: size(px(6.), thumb_height),
-                                            },
-                                            Theme::muted(),
-                                        ));
-                                    },
-                                )
-                                .absolute()
-                                .top_0()
-                                .left_0()
-                                .size_full(),
+                                render_interactive_scrollbar(
+                                    InteractiveScrollbarAxis::Vertical,
+                                    preview_scrollbar_state,
+                                    preview_scroll_handle,
+                                    Theme::muted().into(),
+                                ),
                             )
                             .into_any_element()
                     } else {

@@ -14,11 +14,16 @@ use gpui::{
 use crate::types::CodeBlock;
 
 use super::MarkdownRenderOptions;
+use super::interactive_scrollbar::{
+  InteractiveScrollbarAxis, render_interactive_scrollbar, stop_horizontal_scroll_propagation,
+};
 use super::selectable_text::SelectableText;
 
 const CODE_BLOCK_PADDING_X_PX: f32 = 12.0;
 const CODE_BLOCK_PADDING_TOP_PX: f32 = 8.0;
 const CODE_BLOCK_PADDING_BOTTOM_PX: f32 = 8.0;
+/// Approximate Menlo glyph width at the preview's small text size.
+const CODE_BLOCK_CELL_WIDTH_PX: f32 = 8.4;
 const COPY_FEEDBACK_DURATION_SECS: u64 = 2;
 
 static COPY_FEEDBACK: LazyLock<Mutex<HashMap<usize, usize>>> =
@@ -42,6 +47,7 @@ pub fn render_code_block(
 
   // Prepare display text: strip trailing newline
   let display_value = code_block_display_value(code);
+  let code_content_width = code_block_content_width(&display_value);
   let text: SharedString = display_value.clone().into();
 
   // Language label
@@ -125,6 +131,7 @@ pub fn render_code_block(
   // Code content scrolls horizontally for long lines, but always participates
   // in the page's vertical scrolling rather than creating a nested Y scroller.
   let code_id: SharedString = format!("md-code-{code_block_id:x}").into();
+  let scroll_state = options.horizontal_scroll_state(code_block_id);
   let code_font = Font {
     family: theme.code_font_family.clone(),
     features: Default::default(),
@@ -135,6 +142,8 @@ pub fn render_code_block(
 
   let mut code_area = div()
     .id(code_id)
+    .w_full()
+    .min_w_0()
     .px(px(CODE_BLOCK_PADDING_X_PX))
     .pt(px(CODE_BLOCK_PADDING_TOP_PX))
     .pb(px(CODE_BLOCK_PADDING_BOTTOM_PX))
@@ -142,14 +151,23 @@ pub fn render_code_block(
     .text_color(theme.foreground)
     .font(code_font.clone())
     .whitespace_nowrap()
-    .overflow_x_scroll();
+    .overflow_x_scroll()
+    .scrollbar_width(px(10.0))
+    .track_scroll(&scroll_state.handle)
+    .on_scroll_wheel(|event, _, cx| stop_horizontal_scroll_propagation(event, cx));
+  code_area.style().restrict_scroll_to_axis = Some(true);
 
   // Keep the indentation-dot renderer when explicitly enabled. The normal Aster
   // preview path uses SelectableText so code supports click-drag selection and
   // copies the selected range on mouse-up just like paragraph text.
   if options.show_indentation_dots {
     let dot_color = theme.muted_foreground.opacity(INDENT_DOT_OPACITY);
-    code_area = code_area.child(CodeBlockText::new(text, dot_color));
+    code_area = code_area.child(
+      div()
+        .min_w(px(code_content_width))
+        .flex_none()
+        .child(CodeBlockText::new(text, dot_color)),
+    );
   } else {
     let text_id = options.selection_state.next_text_id();
     let runs = vec![TextRun {
@@ -160,22 +178,41 @@ pub fn render_code_block(
       strikethrough: None,
       background_color: None,
     }];
-    code_area = code_area.child(SelectableText::new(
-      text,
-      runs,
-      Vec::new(),
-      options.selection_state.clone(),
-      options.focus_handle.clone(),
-      options.search_query.clone(),
-      options.search_highlight_color,
-      None,
-      text_id,
-    ));
+    code_area = code_area.child(
+      div()
+        .min_w(px(code_content_width))
+        .flex_none()
+        .child(
+          SelectableText::new(
+            text,
+            runs,
+            Vec::new(),
+            options.selection_state.clone(),
+            options.focus_handle.clone(),
+            options.search_query.clone(),
+            options.search_highlight_color,
+            None,
+            text_id,
+          )
+          .with_intrinsic_width(),
+        ),
+    );
   }
 
   // Wrap code area + copy button in a relative container so the button
   // is positioned relative to the code area (below the header).
-  let code_wrapper = div().relative().child(code_area).child(copy_button);
+  let code_wrapper = div()
+    .relative()
+    .w_full()
+    .min_w_0()
+    .child(code_area)
+    .child(render_interactive_scrollbar(
+      InteractiveScrollbarAxis::Horizontal,
+      scroll_state.scrollbar,
+      scroll_state.handle,
+      theme.muted_foreground,
+    ))
+    .child(copy_button);
 
   container.child(code_wrapper).into_any_element()
 }
@@ -212,6 +249,19 @@ fn code_block_display_value(code: &CodeBlock) -> String {
   // Expand tabs to 4 spaces
   value = expand_tabs(&value);
   value
+}
+
+/// Estimates the minimum width required by the longest rendered code line.
+fn code_block_content_width(text: &str) -> f32 {
+  text
+    .lines()
+    .map(|line| {
+      line.chars()
+        .map(|ch| if ch.is_ascii() { 1usize } else { 2usize })
+        .sum::<usize>() as f32
+        * CODE_BLOCK_CELL_WIDTH_PX
+    })
+    .fold(0.0f32, f32::max)
 }
 
 /// Expand tab characters to spaces (4-space tab stops).
@@ -471,6 +521,22 @@ mod tests {
       value: "no newline".into(),
     };
     assert_eq!(code_block_display_value(&code), "no newline");
+  }
+
+  #[test]
+  fn content_width_uses_the_longest_line() {
+    assert_eq!(
+      code_block_content_width("short\nabcdefghij"),
+      10.0 * CODE_BLOCK_CELL_WIDTH_PX
+    );
+  }
+
+  #[test]
+  fn content_width_counts_wide_characters_as_two_cells() {
+    assert_eq!(
+      code_block_content_width("部署abc"),
+      7.0 * CODE_BLOCK_CELL_WIDTH_PX
+    );
   }
 
   #[test]

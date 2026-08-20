@@ -160,7 +160,7 @@ impl Theme {
             code_background: colors.code_block_bg,
             border: colors.border,
             link: Self::control_accent(),
-            accent: colors.accent,
+            accent: Self::selection_bg(),
         }
     }
 }

@@ -5,19 +5,25 @@ pub mod code_block;
 pub mod code_preview;
 pub mod image;
 pub mod inline;
+pub mod interactive_scrollbar;
 pub mod selectable_text;
 pub mod table;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use gpui::{AnyElement, App, FocusHandle, Hsla, SharedString, div, prelude::*};
-
+use gpui::{AnyElement, App, FocusHandle, Hsla, ScrollHandle, SharedString, div, prelude::*};
 use crate::github::GithubCodeReferencePreview;
 use crate::github::GithubIssueReferenceContext;
 use crate::types::{CodeBlock, ParsedMarkdown, Table};
+
+pub use interactive_scrollbar::{
+  InteractiveScrollbarAxis, InteractiveScrollbarState, render_interactive_scrollbar,
+};
 
 /// A link click handler.
 pub type LinkHandlerFn = dyn Fn(&str, &mut gpui::Window, &mut App) + Send + Sync;
@@ -558,6 +564,29 @@ impl MarkdownTheme {
 /// `gpui::img(url)` directly. Useful for auth headers, custom caching, etc.
 pub type ImageLoaderFn = dyn Fn(&str) -> gpui::ImageSource + Send + Sync;
 
+/// Persistent state shared by a rendered horizontal scroll area and its visible scrollbar.
+#[derive(Clone, Default)]
+pub(crate) struct HorizontalScrollState {
+  /// Offset and viewport measurements maintained by GPUI's scroll container.
+  pub handle: ScrollHandle,
+  /// Hover and drag state maintained by the interactive scrollbar.
+  pub scrollbar: InteractiveScrollbarState,
+}
+
+/// Stores horizontal scroll state across Markdown preview render passes.
+#[derive(Clone, Default)]
+pub(crate) struct HorizontalScrollStates {
+  states: Rc<RefCell<HashMap<usize, HorizontalScrollState>>>,
+}
+
+impl HorizontalScrollStates {
+  /// Returns the persistent scroll state associated with one parsed block.
+  pub fn state_for(&self, block_id: usize) -> HorizontalScrollState {
+    let mut states = self.states.borrow_mut();
+    states.entry(block_id).or_default().clone()
+  }
+}
+
 /// Options for rendering markdown.
 #[derive(Clone, Default)]
 pub struct MarkdownRenderOptions {
@@ -608,6 +637,8 @@ pub struct MarkdownRenderOptions {
   pub(crate) search_query: Option<SharedString>,
   /// Background color used for rendered Markdown search matches.
   pub(crate) search_highlight_color: Option<Hsla>,
+  /// Persistent handles for tables and code blocks with horizontal overflow.
+  pub(crate) horizontal_scroll_states: HorizontalScrollStates,
 }
 
 impl MarkdownRenderOptions {
@@ -688,6 +719,11 @@ impl MarkdownRenderOptions {
   /// Get the theme, falling back to dark theme default.
   pub fn theme(&self) -> &MarkdownTheme {
     self.theme.as_ref().unwrap_or(&DEFAULT_DARK_THEME)
+  }
+
+  /// Returns persistent scrollbar state for a rendered table or code block.
+  pub(crate) fn horizontal_scroll_state(&self, block_id: usize) -> HorizontalScrollState {
+    self.horizontal_scroll_states.state_for(block_id)
   }
 }
 

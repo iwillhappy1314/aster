@@ -15,6 +15,9 @@ use gpui::{
     UTF16Selection, Window, anchored, canvas, combine_highlights, deferred, div,
     fill, point, px, size,
 };
+use gpui_gfm::{
+    InteractiveScrollbarAxis, InteractiveScrollbarState, render_interactive_scrollbar,
+};
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -137,10 +140,8 @@ pub struct EditorView {
     caret_visible: bool,
     blink_task: Option<gpui::Task<()>>,
     scroll_handle: ScrollHandle,
-    /// Whether the editor's right-edge scroll indicator is currently visible.
-    scroll_indicator_visible: bool,
-    /// Monotonic revision used to prevent an older hide timer from hiding a newer scroll event.
-    scroll_indicator_revision: u64,
+    /// Hover and drag state for the editor's custom vertical scrollbar.
+    scrollbar_state: InteractiveScrollbarState,
     /// Cached text with revision to avoid repeated rope-to-string conversions.
     cached_text: Option<(u64, Arc<str>)>,
     /// Cached source/display projection for the current document + inline parse revisions.
@@ -180,8 +181,7 @@ impl EditorView {
             caret_visible: true,
             blink_task: None,
             scroll_handle: ScrollHandle::new(),
-            scroll_indicator_visible: false,
-            scroll_indicator_revision: 0,
+            scrollbar_state: InteractiveScrollbarState::default(),
             cached_text: None,
             cached_projection: None,
             marked_range: None,
@@ -226,38 +226,6 @@ impl EditorView {
                 });
             }
         }));
-    }
-
-    /// Shows the scroll indicator briefly after a wheel-scroll event.
-    fn reveal_scroll_indicator(&mut self, cx: &mut Context<Self>) {
-        if self.document.read(cx).rope.len_bytes() > HEAVY_DOCUMENT_BYTES {
-            // The scroll container already has GPUI's native scrollbar. Avoid invalidating
-            // the whole editor for the decorative transient indicator on large documents.
-            if self.scroll_indicator_visible {
-                self.scroll_indicator_visible = false;
-                cx.notify();
-            }
-            return;
-        }
-
-        self.scroll_indicator_visible = true;
-        self.scroll_indicator_revision = self.scroll_indicator_revision.wrapping_add(1);
-        let revision = self.scroll_indicator_revision;
-        let entity = cx.entity();
-
-        cx.spawn(async move |_view, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(1_200))
-                .await;
-            let _ = entity.update(cx, |view, cx| {
-                if view.scroll_indicator_revision == revision {
-                    view.scroll_indicator_visible = false;
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
-        cx.notify();
     }
 
     /// Scrolls the editor so the current cursor is visible.
@@ -1083,9 +1051,8 @@ impl Render for EditorView {
         let outline_callback = self.on_outline_viewport_change.clone();
         let outline_scroll_handle = self.scroll_handle.clone();
         let outline_projection = projection.clone();
-        let has_multiple_lines = text_owned.as_ref().lines().nth(1).is_some();
         let editor_scroll_handle = self.scroll_handle.clone();
-        let show_scroll_indicator = self.scroll_indicator_visible;
+        let editor_scrollbar_state = self.scrollbar_state.clone();
         let input_enabled = !self.search_active;
         let input_focus_handle = focus_handle.clone();
         let input_entity = cx.entity();
@@ -1126,9 +1093,6 @@ impl Render for EditorView {
                     .scrollbar_width(px(10.))
                     .track_scroll(&self.scroll_handle)
                     .track_focus(&focus_handle)
-                    .on_scroll_wheel(cx.listener(|this, _: &gpui::ScrollWheelEvent, _, cx| {
-                        this.reveal_scroll_indicator(cx);
-                    }))
                     .on_action({
                         let doc_handle = self.document.clone();
                         move |_: &SelectAll, _window: &mut Window, cx_app: &mut App| {
@@ -1607,52 +1571,13 @@ impl Render for EditorView {
                     }),
             )
             .children(context_menu)
-            // Draw the indicator in the non-scrolling parent, so it cannot be clipped or
-            // translated along with document content.
             .child(
-                canvas(
-                    move |_, _, _| {},
-                    move |bounds: Bounds<_>, (), window: &mut Window, _cx: &mut App| {
-                        if !show_scroll_indicator {
-                            return;
-                        }
-                        let viewport_height = editor_scroll_handle.bounds().size.height;
-                        let max_offset = editor_scroll_handle.max_offset().height;
-                        if viewport_height <= px(0.)
-                            || (max_offset <= px(0.) && !has_multiple_lines)
-                        {
-                            return;
-                        }
-
-                        let content_height = viewport_height + max_offset;
-                        let thumb_height = if max_offset > px(0.) {
-                            (viewport_height / content_height * bounds.size.height)
-                                .max(px(48.))
-                                .min(bounds.size.height)
-                        } else {
-                            px(48.).min(bounds.size.height)
-                        };
-                        let travel = bounds.size.height - thumb_height;
-                        let progress = if max_offset > px(0.) {
-                            (-editor_scroll_handle.offset().y / max_offset).clamp(0., 1.)
-                        } else {
-                            0.
-                        };
-                        let top = bounds.origin.y + travel * progress;
-
-                        window.paint_quad(fill(
-                            Bounds {
-                                origin: point(bounds.right() - px(8.), top),
-                                size: size(px(6.), thumb_height),
-                            },
-                            Theme::muted(),
-                        ));
-                    },
-                )
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full(),
+                render_interactive_scrollbar(
+                    InteractiveScrollbarAxis::Vertical,
+                    editor_scrollbar_state,
+                    editor_scroll_handle,
+                    Theme::muted().into(),
+                ),
             )
     }
 }

@@ -29,9 +29,10 @@ pub use html::{render_html, render_markdown_html, render_markdown_html_document}
 pub use parse::{parse_gfm, parse_markdown};
 #[cfg(feature = "gpui-render")]
 pub use render::{
-  DetailsState, ImageLoaderFn, ListItemView, MarkdownRenderOptions, MarkdownTheme, RenderOverrides,
-  RenderedMarkdownBlocks, render_markdown, render_markdown_blocks_cached, render_markdown_cached,
-  render_parsed_markdown, render_parsed_markdown_blocks,
+  DetailsState, ImageLoaderFn, InteractiveScrollbarAxis, InteractiveScrollbarState, ListItemView,
+  MarkdownRenderOptions, MarkdownTheme, RenderOverrides, RenderedMarkdownBlocks,
+  render_interactive_scrollbar, render_markdown, render_markdown_blocks_cached,
+  render_markdown_cached, render_parsed_markdown, render_parsed_markdown_blocks,
 };
 #[cfg(feature = "gpui-render")]
 pub use typography::{heading_font_size, heading_font_weight};

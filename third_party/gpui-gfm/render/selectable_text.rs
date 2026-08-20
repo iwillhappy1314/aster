@@ -13,7 +13,7 @@ use gpui::{
   GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId,
   FocusHandle, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
   SharedString,
-  StatefulInteractiveElement, StyledText, TextRun, Window, anchored, deferred, div, prelude::*, px,
+  StyledText, TextRun, Window, anchored, deferred, div, prelude::*, px,
 };
 
 use super::{
@@ -112,6 +112,7 @@ impl ContextMenuTheme {
 pub struct SelectableText {
   inner: SelectableTextElement,
   menu_theme: ContextMenuTheme,
+  fills_available_width: bool,
 }
 
 impl SelectableText {
@@ -145,7 +146,14 @@ impl SelectableText {
         last_search_query: None,
       },
       menu_theme,
+      fills_available_width: true,
     }
+  }
+
+  /// Keeps the text's intrinsic width so a scroll container can expose long lines.
+  pub fn with_intrinsic_width(mut self) -> Self {
+    self.fills_available_width = false;
+    self
   }
 }
 
@@ -889,7 +897,11 @@ impl IntoElement for SelectableText {
 
     let mut wrapper = div()
       .id(("preview-selectable-text", text_id))
-      .w_full()
+      .when(self.fills_available_width, |this| this.w_full())
+      // A code block needs the text element to retain its measured width;
+      // otherwise flex layout shrinks it to the viewport and no overflow exists
+      // for the parent scroll container to reveal.
+      .when(!self.fills_available_width, |this| this.flex_none())
       .child(self.inner);
 
     if let Some(context) = menu_context {
