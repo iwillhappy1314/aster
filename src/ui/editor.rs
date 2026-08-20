@@ -48,7 +48,7 @@ struct DisplayProjection {
 impl DisplayProjection {
     fn from_source(source: &str, spans: &[SyntaxSpan]) -> Self {
         let source_len = source.len();
-        let hidden = merged_hidden_ranges(spans);
+        let hidden = merged_hidden_ranges(source, spans);
         if hidden.is_empty() {
             return Self {
                 display_text: source.to_string(),
@@ -1075,6 +1075,15 @@ impl Render for EditorView {
             let inline = self.inline_markdown.read(cx);
             (inline.spans.clone(), inline.source_revision)
         };
+        // Large documents are parsed asynchronously, so their spans can temporarily
+        // describe the previous document revision. Never apply stale byte ranges to
+        // the current source string.
+        let inline_spans_are_current = inline_revision == doc_revision;
+        let render_spans: &[SyntaxSpan] = if inline_spans_are_current {
+            inline_spans.as_ref().as_slice()
+        } else {
+            &[]
+        };
         let projection = if let Some((cached_doc_revision, cached_inline_revision, cached)) =
             &self.cached_projection
             && *cached_doc_revision == doc_revision
@@ -1084,15 +1093,17 @@ impl Render for EditorView {
         } else {
             let projection = Arc::new(DisplayProjection::from_source(
                 text_owned.as_ref(),
-                inline_spans.as_ref(),
+                render_spans,
             ));
             self.cached_projection = Some((doc_revision, inline_revision, projection.clone()));
             projection
         };
         let cursor_display_byte = projection.source_to_display_byte(cursor_source_byte);
-        let syntax_highlights = projection.project_highlights(
-            self.inline_syntax_highlights(inline_spans.as_ref(), markdown_style),
-        );
+        let syntax_highlights = if inline_spans_are_current {
+            projection.project_highlights(self.inline_syntax_highlights(render_spans, markdown_style))
+        } else {
+            Vec::new()
+        };
         let (search_highlights, search_match_count) =
             self.search_highlights(text_owned.as_ref(), doc_revision);
         let search_highlights = projection.project_highlights(search_highlights);
@@ -1792,11 +1803,16 @@ fn is_inline_hidden_kind(kind: SyntaxKind) -> bool {
     )
 }
 
-fn merged_hidden_ranges(spans: &[SyntaxSpan]) -> Vec<Range<usize>> {
+fn merged_hidden_ranges(source: &str, spans: &[SyntaxSpan]) -> Vec<Range<usize>> {
+    let source_len = source.len();
     let mut hidden = spans
         .iter()
         .filter(|span| is_inline_hidden_kind(span.kind))
-        .map(|span| span.range.clone())
+        .filter_map(|span| {
+            let start = floor_char_boundary(source, span.range.start.min(source_len));
+            let end = ceil_char_boundary(source, span.range.end.min(source_len));
+            (start < end).then_some(start..end)
+        })
         .collect::<Vec<_>>();
     if hidden.is_empty() {
         return hidden;
@@ -1816,6 +1832,22 @@ fn merged_hidden_ranges(spans: &[SyntaxSpan]) -> Vec<Range<usize>> {
     }
     merged.push(current);
     merged
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
 }
 
 fn pop_last_char(s: &mut String) {
@@ -1992,6 +2024,31 @@ mod tests {
             projection.display_to_source_byte(display_boundary),
             source_boundary
         );
+    }
+
+    #[test]
+    fn display_projection_tolerates_stale_utf8_hidden_range() {
+        let source = "a中b";
+        let spans = vec![SyntaxSpan {
+            // Deliberately points into the middle of the 3-byte UTF-8 encoding of `中`.
+            range: 2..3,
+            kind: SyntaxKind::EmphasisMarker,
+        }];
+
+        let projection = DisplayProjection::from_source(source, &spans);
+        assert_eq!(projection.display_text, "ab");
+    }
+
+    #[test]
+    fn display_projection_ignores_stale_range_beyond_source() {
+        let source = "short";
+        let spans = vec![SyntaxSpan {
+            range: 100..120,
+            kind: SyntaxKind::EmphasisMarker,
+        }];
+
+        let projection = DisplayProjection::from_source(source, &spans);
+        assert_eq!(projection.display_text, source);
     }
 
     #[test]
