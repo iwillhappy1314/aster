@@ -616,6 +616,49 @@ fn escape_markdown_label(label: &str) -> String {
         .replace(']', "\\]")
 }
 
+fn preview_image_source(source: &str, document_dir: &Path) -> gpui::ImageSource {
+    if let Ok(url) = url::Url::parse(source) {
+        if url.scheme() == "file" {
+            if let Ok(path) = url.to_file_path() {
+                return path.into();
+            }
+        }
+        return source.to_string().into();
+    }
+
+    if source.starts_with("//") {
+        return source.to_string().into();
+    }
+
+    let source_path = Path::new(source);
+    let resolved = if source_path.is_absolute() {
+        source_path.to_path_buf()
+    } else {
+        document_dir.join(source_path)
+    };
+    resolved.into()
+}
+
+fn open_preview_link(target: &str, document_dir: &Path, cx: &mut App) {
+    if target.starts_with('#') || target.starts_with("//") || url::Url::parse(target).is_ok() {
+        cx.open_url(target);
+        return;
+    }
+
+    let target_path = Path::new(target);
+    let resolved = if target_path.is_absolute() {
+        target_path.to_path_buf()
+    } else {
+        document_dir.join(target_path)
+    };
+
+    if let Ok(file_url) = url::Url::from_file_path(resolved) {
+        cx.open_url(file_url.as_str());
+    } else {
+        cx.open_url(target);
+    }
+}
+
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Install the Outline reveal callback once. The editor uses TextLayout's
@@ -985,10 +1028,29 @@ impl Render for RootView {
                             code_font_family: "Menlo".into(),
                             is_dark: Theme::is_dark(),
                         };
-                        let markdown_options = self
+                        let mut markdown_options = self
                             .preview_markdown_options
                             .clone()
                             .with_theme(markdown_theme);
+                        if let Some(document_dir) = doc_path
+                            .as_ref()
+                            .and_then(|path| path.parent())
+                            .map(|path| path.as_std_path().to_path_buf())
+                        {
+                            let image_base = document_dir.clone();
+                            markdown_options = markdown_options.with_image_loader(
+                                std::sync::Arc::new(move |source| {
+                                    preview_image_source(source, &image_base)
+                                }),
+                            );
+
+                            let link_base = document_dir;
+                            markdown_options = markdown_options.with_on_link(
+                                std::sync::Arc::new(move |target, _window, cx| {
+                                    open_preview_link(target, &link_base, cx);
+                                }),
+                            );
+                        }
                         let markdown_blocks = render_markdown_blocks_cached(
                             &doc_text,
                             &markdown_options,
