@@ -355,14 +355,27 @@ impl Element for SelectableTextElement {
       let selection_state = selection_state.clone();
       let text_layout = text_layout.clone();
       move |event: &MouseMoveEvent, phase, window, _cx| {
-        if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
+        if phase != DispatchPhase::Bubble {
           return;
         }
 
-        let Some(active) = active_cross_block_selection(&selection_state) else {
+        let Some(mut active) = active_cross_block_selection(&selection_state) else {
           return;
         };
         if !active.dragging {
+          return;
+        }
+
+        // Mouse-up can happen outside a text hitbox, so its handler may never
+        // finalise the drag. Trust the platform's current button state before
+        // extending the selection on a later mouse move.
+        if event.pressed_button != Some(MouseButton::Left) {
+          active.dragging = false;
+          set_cross_block_selection(&selection_state, active);
+          return;
+        }
+
+        if !hitbox.is_hovered(window) {
           return;
         }
 
