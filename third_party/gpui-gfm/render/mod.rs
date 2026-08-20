@@ -660,6 +660,11 @@ impl MarkdownRenderOptions {
     self
   }
 
+  /// Sets the background color used when rendered Markdown text is selected.
+  pub fn set_selection_color(&mut self, color: Hsla) {
+    self.selection_state.set_selection_color(color);
+  }
+
   /// Get the theme, falling back to dark theme default.
   pub fn theme(&self) -> &MarkdownTheme {
     self.theme.as_ref().unwrap_or(&DEFAULT_DARK_THEME)

@@ -1,6 +1,7 @@
 use crate::commands::{
-    FontSizeDecrease, FontSizeIncrease, FontSizeReset, NewFile, OpenFile, OutlinePositionLeft,
-    OutlinePositionRight, SaveFile, SaveFileAs, ToggleOutline, TogglePreview,
+    Copy, FontSizeDecrease, FontSizeIncrease, FontSizeReset, NewFile, OpenFile,
+    OutlinePositionLeft, OutlinePositionRight, SaveFile, SaveFileAs, SelectAll, ToggleOutline,
+    TogglePreview,
 };
 use crate::model::document::DocumentState;
 use crate::model::inline_markdown::InlineMarkdownState;
@@ -17,9 +18,10 @@ use crate::ui::theme::Theme;
 use camino::Utf8PathBuf;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, Bounds, Context, Entity, ExternalPaths, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent, ParentElement, Render, ScrollHandle,
-    StatefulInteractiveElement, Styled, Window, canvas, div, fill, point, px, size,
+    App, Bounds, ClipboardItem, Context, Entity, ExternalPaths, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Render,
+    ScrollHandle, StatefulInteractiveElement, Styled, Window, canvas, div, fill, point, px,
+    size,
 };
 use gpui_component::notification::NotificationList;
 use gpui_gfm::{
@@ -407,6 +409,24 @@ impl RootView {
         cx.notify();
     }
 
+    /// Selects the complete document for shortcuts handled outside the source editor.
+    fn select_all_document(&mut self, cx: &mut Context<Self>) {
+        let _ = self.document.update(cx, |document, cx| {
+            document.select_all();
+            cx.notify();
+        });
+    }
+
+    /// Copies the document's current selection to the system clipboard.
+    fn copy_document_selection(&self, cx: &mut Context<Self>) {
+        let Some(selection) = self.document.read(cx).selection_range() else {
+            return;
+        };
+
+        let text = self.document.read(cx).slice_chars(selection);
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
     /// Shows the preview scroll indicator briefly after a wheel-scroll event.
     fn reveal_preview_scroll_indicator(&mut self, cx: &mut Context<Self>) {
         self.preview_scroll_indicator_visible = true;
@@ -792,12 +812,12 @@ impl Render for RootView {
             Theme::border()
         };
         let outline_toggle_color = if self.outline_visible {
-            Theme::accent()
+            Theme::control_accent()
         } else {
             Theme::muted()
         };
         let mode_toggle_color = if self.preview_visible {
-            Theme::accent()
+            Theme::control_accent()
         } else {
             Theme::muted()
         };
@@ -815,8 +835,10 @@ impl Render for RootView {
             .flex_shrink_0()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|_, _: &MouseDownEvent, window, _| {
-                    window.start_window_move();
+                cx.listener(|_, event: &MouseDownEvent, window, _| {
+                    if event.click_count == 1 {
+                        window.start_window_move();
+                    }
                 }),
             )
             .child(
@@ -824,6 +846,7 @@ impl Render for RootView {
                     .id("outline-toggle")
                     .p(px(5.))
                     .rounded(px(4.))
+                    .occlude()
                     .cursor_pointer()
                     .hover(|this| this.bg(Theme::panel_alt()).text_color(Theme::text()))
                     .on_mouse_down(
@@ -832,6 +855,10 @@ impl Render for RootView {
                             cx.stop_propagation();
                             this.toggle_outline(cx);
                         }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|_, _: &MouseUpEvent, _, cx| cx.stop_propagation()),
                     )
                     .child(
                         div()
@@ -864,6 +891,7 @@ impl Render for RootView {
                     .id("preview-toggle")
                     .p(px(5.))
                     .rounded(px(4.))
+                    .occlude()
                     .cursor_pointer()
                     .hover(|this| this.bg(Theme::panel_alt()).text_color(Theme::text()))
                     .on_mouse_down(
@@ -872,6 +900,10 @@ impl Render for RootView {
                             cx.stop_propagation();
                             this.toggle_preview(cx);
                         }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|_, _: &MouseUpEvent, _, cx| cx.stop_propagation()),
                     )
                     // Use native geometry instead of an asset-backed SVG so the control is
                     // always visible in the packaged application.
@@ -947,6 +979,16 @@ impl Render for RootView {
             }))
             .on_action(cx.listener(|this, _: &TogglePreview, _window, cx| {
                 this.toggle_preview(cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectAll, _window, cx| {
+                if this.preview_visible {
+                    this.select_all_document(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &Copy, _window, cx| {
+                if this.preview_visible {
+                    this.copy_document_selection(cx);
+                }
             }))
             // Handle sidebar resize drag at root level so we don't lose events
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
@@ -1032,6 +1074,7 @@ impl Render for RootView {
                             .preview_markdown_options
                             .clone()
                             .with_theme(markdown_theme);
+                        markdown_options.set_selection_color(Theme::selection_bg().into());
                         if let Some(document_dir) = doc_path
                             .as_ref()
                             .and_then(|path| path.parent())

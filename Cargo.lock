@@ -260,6 +260,7 @@ dependencies = [
  "gpui-component",
  "gpui-gfm",
  "notify 8.2.0",
+ "objc2-app-kit",
  "once_cell",
  "pulldown-cmark",
  "rfd",

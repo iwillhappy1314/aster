@@ -3,4 +3,5 @@ pub mod fs;
 pub mod inline_markdown;
 pub mod settings;
 pub mod syntax;
+pub mod system_colors;
 pub mod tasks;

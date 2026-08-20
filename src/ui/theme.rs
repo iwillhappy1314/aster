@@ -1,4 +1,4 @@
-use crate::services::settings;
+use crate::services::{settings, system_colors};
 use gpui::{Rgba, rgb, rgba};
 use serde::{Deserialize, Serialize};
 
@@ -143,7 +143,11 @@ impl Theme {
         current_colors().accent
     }
     pub fn selection_bg() -> Rgba {
-        current_colors().selection_bg
+        system_colors::selection_background(current_colors().selection_bg)
+    }
+    /// Returns the system control accent for toolbar and navigation active states.
+    pub fn control_accent() -> Rgba {
+        system_colors::control_accent(current_colors().accent)
     }
 
     /// Markdown colors shared by the editor's inline styling and the preview renderer.
@@ -155,7 +159,7 @@ impl Theme {
             background: colors.bg,
             code_background: colors.code_block_bg,
             border: colors.border,
-            link: colors.accent,
+            link: Self::control_accent(),
             accent: colors.accent,
         }
     }
