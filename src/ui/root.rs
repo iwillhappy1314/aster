@@ -1525,7 +1525,7 @@ impl Render for RootView {
 
 #[cfg(test)]
 mod tests {
-    use super::document_title;
+    use super::{document_title, preview_find_char_range_to_utf16, utf16_offset_to_char_offset};
     use camino::Utf8PathBuf;
 
     #[test]
@@ -1538,5 +1538,18 @@ mod tests {
     #[test]
     fn document_title_uses_default_name_for_new_documents() {
         assert_eq!(document_title(None, false), "untitled.md");
+    }
+
+    #[test]
+    fn preview_find_utf16_mapping_preserves_chinese_character_boundaries() {
+        let query = "中文🙂";
+
+        assert_eq!(utf16_offset_to_char_offset(query, 1), 1);
+        assert_eq!(utf16_offset_to_char_offset(query, 2), 2);
+        assert_eq!(utf16_offset_to_char_offset(query, 3), 2);
+        assert_eq!(
+            preview_find_char_range_to_utf16(query, &(1..3)),
+            1..4
+        );
     }
 }
