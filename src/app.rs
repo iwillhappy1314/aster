@@ -290,6 +290,8 @@ fn build_root_view(
     cx: &mut App,
     initial_path: Option<Utf8PathBuf>,
 ) -> gpui::Entity<RootView> {
+    let preview_visible =
+        initial_preview_visible(initial_path.is_some(), settings::get_preview_visible());
     let document = cx.new(|_| RootView::new_document());
     let inline_markdown = cx.new(|_| RootView::new_inline_markdown());
     let notifications = cx.new(|cx| NotificationList::new(window, cx));
@@ -315,8 +317,14 @@ fn build_root_view(
             editor_view,
             file_explorer_view,
             notifications,
+            preview_visible,
         )
     })
+}
+
+/// Resolves the initial mode: blank documents always edit, existing documents use the preference.
+fn initial_preview_visible(has_initial_path: bool, remembered_preview_visible: bool) -> bool {
+    has_initial_path && remembered_preview_visible
 }
 
 fn install_should_close_prompt(
@@ -427,4 +435,20 @@ fn open_path_in_active_window_or_new(cx: &mut App, path: Utf8PathBuf) {
     }
 
     let _ = open_window(cx, Some(path));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::initial_preview_visible;
+
+    #[test]
+    fn blank_document_always_starts_in_editor_mode() {
+        assert!(!initial_preview_visible(false, true));
+    }
+
+    #[test]
+    fn existing_document_uses_remembered_preview_mode() {
+        assert!(initial_preview_visible(true, true));
+        assert!(!initial_preview_visible(true, false));
+    }
 }

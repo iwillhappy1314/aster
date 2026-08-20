@@ -103,6 +103,7 @@ impl RootView {
         editor_view: Entity<crate::ui::editor::EditorView>,
         file_explorer_view: Entity<crate::ui::file_explorer::FileExplorerView>,
         notifications: Entity<NotificationList>,
+        preview_visible: bool,
     ) -> Self {
         Self {
             document,
@@ -118,7 +119,7 @@ impl RootView {
             sidebar_width: 300.0,
             resizing_sidebar: false,
             outline_visible: settings::get_outline_visible(),
-            preview_visible: settings::get_preview_visible(),
+            preview_visible,
             preview_focus_handle: None,
             focus_preview_on_render: true,
             preview_find_active: false,
@@ -282,6 +283,7 @@ impl RootView {
     fn open_path_internal(&mut self, path: &camino::Utf8PathBuf, cx: &mut Context<Self>) {
         match read_to_string(path) {
             Ok(text) => {
+                self.restore_remembered_preview_mode();
                 let _ = self.document.update(cx, |d, cx| {
                     d.path = Some(path.clone());
                     d.set_text(&text);
@@ -303,9 +305,7 @@ impl RootView {
             return;
         }
 
-        if self.preview_visible {
-            self.toggle_preview(cx);
-        }
+        self.force_editor_mode_for_new_file(cx);
 
         let _ = self.document.update(cx, |d, cx| {
             d.path = None;
@@ -442,6 +442,21 @@ impl RootView {
         settings::set_preview_visible(self.preview_visible);
         self.focus_preview_on_render = self.preview_visible;
         cx.notify();
+    }
+
+    /// Forces a newly created document into source editing without changing the saved preference.
+    fn force_editor_mode_for_new_file(&mut self, cx: &mut Context<Self>) {
+        self.preview_visible = false;
+        self.preview_find_active = false;
+        self.focus_preview_on_render = false;
+        cx.notify();
+    }
+
+    /// Restores the saved mode when an existing document is opened in this window.
+    fn restore_remembered_preview_mode(&mut self) {
+        self.preview_visible = settings::get_preview_visible();
+        self.preview_find_active = false;
+        self.focus_preview_on_render = self.preview_visible;
     }
 
     /// Opens the Find panel while keeping the rendered Markdown preview visible.
