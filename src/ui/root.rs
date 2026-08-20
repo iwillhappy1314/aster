@@ -303,6 +303,10 @@ impl RootView {
             return;
         }
 
+        if self.preview_visible {
+            self.toggle_preview(cx);
+        }
+
         let _ = self.document.update(cx, |d, cx| {
             d.path = None;
             d.set_text("");
