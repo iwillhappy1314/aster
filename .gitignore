@@ -4,3 +4,4 @@ tickets.md
 *.dmg
 .DS_Store
 /macos/quicklook-rust/Cargo.lock
+/macos/quicklook-rust/target/

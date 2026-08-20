@@ -8,10 +8,11 @@ use crate::ui::text_utils::ellipsize_chars;
 use crate::ui::theme::{MarkdownStyle, Theme};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontStyle, FontWeight,
-    HighlightStyle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ParentElement, Render, ScrollHandle, StatefulInteractiveElement, Styled,
-    UnderlineStyle, Window, canvas, combine_highlights, div, fill, point, px, size,
+    AnyElement, App, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontStyle,
+    FontWeight, HighlightStyle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render, ScrollHandle,
+    StatefulInteractiveElement, Styled, UnderlineStyle, Window, anchored, canvas,
+    combine_highlights, deferred, div, fill, point, px, size,
 };
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
@@ -196,6 +197,8 @@ pub struct EditorView {
     pending_outline_reveal_byte: Option<usize>,
     /// Reports the source byte crossing the editor viewport activation line.
     on_outline_viewport_change: Option<OutlineViewportCallback>,
+    /// Window-space position of the editor's lightweight right-click menu.
+    context_menu_position: Option<Point<Pixels>>,
 }
 
 impl EditorView {
@@ -220,6 +223,7 @@ impl EditorView {
             pending_scroll_to_byte: None,
             pending_outline_reveal_byte: None,
             on_outline_viewport_change: None,
+            context_menu_position: None,
         }
     }
 
@@ -577,6 +581,120 @@ fn reveal_source_byte_after_layout(
     }
 }
 
+fn editor_context_menu_item<F>(
+    id: &'static str,
+    label: &'static str,
+    disabled: bool,
+    on_click: F,
+) -> AnyElement
+where
+    F: Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+{
+    div()
+        .id(id)
+        .w_full()
+        .h(px(30.))
+        .px(px(10.))
+        .flex()
+        .items_center()
+        .rounded(px(5.))
+        .text_sm()
+        .text_color(if disabled { Theme::muted() } else { Theme::text() })
+        .when(!disabled, |this| {
+            this.cursor_pointer()
+                .hover(|style| style.bg(Theme::panel_alt()))
+                .on_mouse_down(MouseButton::Left, on_click)
+        })
+        .child(label)
+        .into_any_element()
+}
+
+fn close_editor_context_menu(editor: &Entity<EditorView>, cx: &mut App) {
+    let _ = editor.update(cx, |view, cx| {
+        view.context_menu_position = None;
+        cx.notify();
+    });
+}
+
+fn build_editor_context_menu(
+    position: Point<Pixels>,
+    has_selection: bool,
+    editor: Entity<EditorView>,
+) -> AnyElement {
+    let cut_editor = editor.clone();
+    let cut = editor_context_menu_item("editor-context-cut", "Cut", !has_selection, move |_, window, cx| {
+        window.dispatch_action(Box::new(Cut), cx);
+        close_editor_context_menu(&cut_editor, cx);
+        cx.stop_propagation();
+    });
+
+    let copy_editor = editor.clone();
+    let copy = editor_context_menu_item(
+        "editor-context-copy",
+        "Copy",
+        !has_selection,
+        move |_, window, cx| {
+            window.dispatch_action(Box::new(Copy), cx);
+            close_editor_context_menu(&copy_editor, cx);
+            cx.stop_propagation();
+        },
+    );
+
+    let paste_editor = editor.clone();
+    let paste = editor_context_menu_item(
+        "editor-context-paste",
+        "Paste",
+        false,
+        move |_, window, cx| {
+            window.dispatch_action(Box::new(Paste), cx);
+            close_editor_context_menu(&paste_editor, cx);
+            cx.stop_propagation();
+        },
+    );
+
+    let select_all_editor = editor.clone();
+    let select_all = editor_context_menu_item(
+        "editor-context-select-all",
+        "Select All",
+        false,
+        move |_, window, cx| {
+            window.dispatch_action(Box::new(SelectAll), cx);
+            close_editor_context_menu(&select_all_editor, cx);
+            cx.stop_propagation();
+        },
+    );
+
+    let menu = div()
+        .id("editor-context-menu")
+        .w(px(180.))
+        .p(px(4.))
+        .rounded(px(8.))
+        .bg(Theme::panel())
+        .border_1()
+        .border_color(Theme::border())
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(cut)
+        .child(copy)
+        .child(paste)
+        .child(
+            div()
+                .h(px(1.))
+                .mx(px(6.))
+                .my(px(4.))
+                .bg(Theme::border()),
+        )
+        .child(select_all);
+
+    deferred(
+        anchored()
+            .position(position)
+            .snap_to_window_with_margin(px(8.))
+            .child(menu),
+    )
+    .with_priority(2)
+    .into_any_element()
+}
+
 impl Focusable for EditorView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle
@@ -623,6 +741,7 @@ impl Render for EditorView {
         let doc = self.document.read(cx);
         let cursor_source_byte = doc.char_to_byte(doc.cursor);
         let show_caret = doc.selection.is_none();
+        let has_selection = doc.selection_range().is_some();
         let draw_caret = show_caret && is_focused && self.caret_visible;
         let inline_spans = {
             let inline = self.inline_markdown.read(cx);
@@ -675,6 +794,9 @@ impl Render for EditorView {
         let has_multiple_lines = text_owned.lines().nth(1).is_some();
         let editor_scroll_handle = self.scroll_handle.clone();
         let show_scroll_indicator = self.scroll_indicator_visible;
+        let context_menu = self
+            .context_menu_position
+            .map(|position| build_editor_context_menu(position, has_selection, cx.entity()));
 
         let search_match_display = if search_match_count == 0 {
             0
@@ -687,6 +809,11 @@ impl Render for EditorView {
             .flex_1()
             .min_w(px(0.))
             .min_h(px(0.))
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                if this.context_menu_position.take().is_some() {
+                    cx.notify();
+                }
+            }))
             .child(
                 div()
                     .id("editor_scroll")
@@ -810,6 +937,14 @@ impl Render for EditorView {
                             this.jump_search(cx, false);
                         }
                     }))
+                    .on_mouse_down(MouseButton::Right, {
+                        let focus_handle = focus_handle.clone();
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            focus_handle.focus(window);
+                            this.context_menu_position = Some(event.position);
+                            cx.notify();
+                        })
+                    })
                     .on_mouse_down(MouseButton::Left, {
                         let focus_handle = focus_handle.clone();
                         let doc_handle = self.document.clone();
@@ -1185,6 +1320,7 @@ impl Render for EditorView {
                         )
                     }),
             )
+            .children(context_menu)
             // Draw the indicator in the non-scrolling parent, so it cannot be clipped or
             // translated along with document content.
             .child(
