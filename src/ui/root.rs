@@ -36,6 +36,16 @@ const INLINE_SYNC_PARSE_MAX_BYTES: usize = 64 * 1024;
 /// Height reserved for macOS native titlebar controls.
 const NATIVE_TITLEBAR_HEIGHT: f32 = 38.0;
 
+/// Returns the file name displayed in the custom title bar, including its unsaved marker.
+fn document_title(path: Option<&Utf8PathBuf>, is_dirty: bool) -> String {
+    let name = path
+        .and_then(|path| path.file_name())
+        .unwrap_or("untitled.md");
+    let dirty = if is_dirty { " •" } else { "" };
+
+    format!("{name}{dirty}")
+}
+
 pub struct RootView {
     document: Entity<DocumentState>,
     inline_markdown: Entity<InlineMarkdownState>,
@@ -797,14 +807,8 @@ impl Render for RootView {
 
         // Use size_full() instead of explicit pixel dimensions to ensure proper layout
 
-        let window_title = {
-            let name = doc_path
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .unwrap_or("untitled.md");
-            let dirty = if doc_dirty { " •" } else { "" };
-            format!("{name}{dirty} — Aster")
-        };
+        let document_title = document_title(doc_path.as_ref(), doc_dirty);
+        let window_title = format!("{document_title} — Aster");
         window.set_window_title(&window_title);
 
         let outline_position = settings::get_outline_position();
@@ -825,6 +829,7 @@ impl Render for RootView {
         };
         let top_chrome = div()
             .id("window-chrome")
+            .relative()
             // Keep document content clear of the macOS window controls and provide a safe
             // drag area that contains no application controls.
             .h(px(NATIVE_TITLEBAR_HEIGHT))
@@ -834,10 +839,24 @@ impl Render for RootView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|_, event: &MouseDownEvent, window, _| {
-                    if event.click_count == 1 {
-                        window.start_window_move();
-                    }
-                }),
+                if event.click_count == 1 {
+                    window.start_window_move();
+                }
+            }),
+            )
+            .child(
+                div()
+                    .id("window-title")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_sm()
+                    .text_color(Theme::muted())
+                    .child(document_title),
             );
 
         let floating_controls = div()
@@ -1192,5 +1211,23 @@ impl Render for RootView {
             )
             .child(floating_controls)
             .child(self.notifications.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::document_title;
+    use camino::Utf8PathBuf;
+
+    #[test]
+    fn document_title_uses_file_name_and_unsaved_marker() {
+        let path = Utf8PathBuf::from("/notes/project-plan.md");
+
+        assert_eq!(document_title(Some(&path), true), "project-plan.md •");
+    }
+
+    #[test]
+    fn document_title_uses_default_name_for_new_documents() {
+        assert_eq!(document_title(None, false), "untitled.md");
     }
 }

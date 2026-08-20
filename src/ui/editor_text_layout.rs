@@ -5,7 +5,10 @@ use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 
 const EMPTY_LINE_PLACEHOLDER: &str = "\u{200B}";
-const LINE_NUMBER_GUTTER_WIDTH: f32 = 44.0;
+const LINE_NUMBER_GUTTER_GAP: f32 = 12.0;
+const LINE_NUMBER_GUTTER_LEFT_INSET: f32 = 4.0;
+const MIN_LINE_NUMBER_GUTTER_WIDTH: f32 = 16.0;
+const MONOSPACE_DIGIT_WIDTH_RATIO: f32 = 0.6;
 
 #[derive(Clone)]
 struct EditorLineLayout {
@@ -94,6 +97,7 @@ impl EditorTextLayout {
 pub struct EditorTextRender {
     pub element: AnyElement,
     pub layout: EditorTextLayout,
+    pub left_padding: f32,
 }
 
 /// Builds one `StyledText` per source line so headings can use their canonical
@@ -106,6 +110,10 @@ pub fn render_editor_text(
 ) -> EditorTextRender {
     let display_ranges = display_line_ranges(display_text);
     let heading_levels = markdown_heading_levels(source_text);
+    let line_number_gutter_width =
+        line_number_gutter_width(display_ranges.len(), body_font_size);
+    let left_padding =
+        LINE_NUMBER_GUTTER_LEFT_INSET + line_number_gutter_width + LINE_NUMBER_GUTTER_GAP;
 
     let mut container = div().relative().w_full().min_w_0().flex().flex_col();
     let mut layouts = Vec::with_capacity(display_ranges.len());
@@ -158,8 +166,8 @@ pub fn render_editor_text(
                     .absolute()
                     .top_0()
                     .right_full()
-                    .mr(px(12.))
-                    .w(px(LINE_NUMBER_GUTTER_WIDTH))
+                    .mr(px(LINE_NUMBER_GUTTER_GAP))
+                    .w(px(line_number_gutter_width))
                     .text_right()
                     .text_size(px(body_font_size))
                     .text_color(crate::ui::theme::Theme::muted())
@@ -179,7 +187,15 @@ pub fn render_editor_text(
             lines: layouts,
             display_len: display_text.len(),
         },
+        left_padding,
     }
+}
+
+/// Calculates the gutter width needed to render the largest visible line number.
+fn line_number_gutter_width(line_count: usize, body_font_size: f32) -> f32 {
+    let digit_count = line_count.max(1).to_string().len() as f32;
+    (digit_count * body_font_size * MONOSPACE_DIGIT_WIDTH_RATIO + 4.0)
+        .max(MIN_LINE_NUMBER_GUTTER_WIDTH)
 }
 
 fn display_line_ranges(text: &str) -> Vec<Range<usize>> {
@@ -226,6 +242,13 @@ mod tests {
     #[test]
     fn line_ranges_keep_empty_lines_and_trailing_line() {
         assert_eq!(display_line_ranges("a\n\nb\n"), vec![0..1, 2..2, 3..4, 5..5]);
+    }
+
+    #[test]
+    fn line_number_gutter_expands_for_larger_line_numbers() {
+        assert_eq!(line_number_gutter_width(9, 16.0), 16.0);
+        assert_eq!(line_number_gutter_width(10, 16.0), 23.2);
+        assert_eq!(line_number_gutter_width(1_000, 16.0), 42.4);
     }
 
     #[test]

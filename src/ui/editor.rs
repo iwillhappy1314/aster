@@ -1068,6 +1068,7 @@ impl Render for EditorView {
             &safe_highlights,
             settings::get_font_size(),
         );
+        let editor_left_padding = editor_text.left_padding;
         let text_layout = editor_text.layout.clone();
         let editor_text_element = editor_text.element;
         self.input_layout = Some(text_layout.clone());
@@ -1114,7 +1115,7 @@ impl Render for EditorView {
                     .relative()
                     .size_full()
                     .bg(Theme::panel())
-                    .pl(px(88.))
+                    .pl(px(editor_left_padding))
                     .pr(px(32.))
                     .py(px(24.))
                     .text_size(px(settings::get_font_size()))
