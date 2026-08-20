@@ -19,7 +19,7 @@ use camino::Utf8PathBuf;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     App, Bounds, ClipboardItem, Context, Entity, ExternalPaths, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Render,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Render,
     ScrollHandle, StatefulInteractiveElement, Styled, Window, canvas, div, fill, point, px,
     size,
 };
@@ -33,6 +33,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const INLINE_SYNC_PARSE_MAX_BYTES: usize = 64 * 1024;
+/// Height reserved for macOS native titlebar controls.
+const NATIVE_TITLEBAR_HEIGHT: f32 = 38.0;
 
 pub struct RootView {
     document: Entity<DocumentState>,
@@ -806,11 +808,6 @@ impl Render for RootView {
         window.set_window_title(&window_title);
 
         let outline_position = settings::get_outline_position();
-        let resize_line_color = if self.resizing_sidebar {
-            gpui::rgba(0x2d7fd299)
-        } else {
-            Theme::border()
-        };
         let outline_toggle_color = if self.outline_visible {
             Theme::control_accent()
         } else {
@@ -821,17 +818,18 @@ impl Render for RootView {
         } else {
             Theme::muted()
         };
-
+        let resize_line_color = if self.resizing_sidebar {
+            gpui::rgba(0x2d7fd299)
+        } else {
+            Theme::border()
+        };
         let top_chrome = div()
             .id("window-chrome")
-            .h(px(38.))
+            // Keep document content clear of the macOS window controls and provide a safe
+            // drag area that contains no application controls.
+            .h(px(NATIVE_TITLEBAR_HEIGHT))
             .w_full()
             .bg(Theme::bg())
-            .flex()
-            .items_center()
-            .justify_end()
-            .gap_3()
-            .pr(px(12.))
             .flex_shrink_0()
             .on_mouse_down(
                 MouseButton::Left,
@@ -840,25 +838,38 @@ impl Render for RootView {
                         window.start_window_move();
                     }
                 }),
-            )
+            );
+
+        let floating_controls = div()
+            .id("floating-view-controls")
+            .absolute()
+            .right(px(16.))
+            .bottom(px(16.))
+            .p(px(4.))
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(Theme::border())
+            .bg(Theme::panel_alt())
+            .occlude()
             .child(
                 div()
-                    .id("outline-toggle")
-                    .p(px(5.))
-                    .rounded(px(4.))
-                    .occlude()
+                    .id("floating-outline-toggle")
+                    .size(px(28.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(5.))
                     .cursor_pointer()
-                    .hover(|this| this.bg(Theme::panel_alt()).text_color(Theme::text()))
+                    .hover(|this| this.bg(Theme::bg()))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, _, cx| {
                             cx.stop_propagation();
                             this.toggle_outline(cx);
                         }),
-                    )
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|_, _: &MouseUpEvent, _, cx| cx.stop_propagation()),
                     )
                     .child(
                         div()
@@ -871,29 +882,20 @@ impl Render for RootView {
                             .rounded(px(3.))
                             .border_1()
                             .border_color(outline_toggle_color)
-                            .child(
-                                div()
-                                    .w(px(5.))
-                                    .h_full()
-                                    .when(outline_position == OutlinePosition::Left, |this| {
-                                        this.border_r_1()
-                                    })
-                                    .when(outline_position == OutlinePosition::Right, |this| {
-                                        this.border_l_1()
-                                    })
-                                    .border_color(outline_toggle_color),
-                            )
+                            .child(div().w(px(5.)).h_full().bg(outline_toggle_color))
                             .child(div().flex_1()),
                     ),
             )
             .child(
                 div()
-                    .id("preview-toggle")
-                    .p(px(5.))
-                    .rounded(px(4.))
-                    .occlude()
+                    .id("floating-preview-toggle")
+                    .size(px(28.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(5.))
                     .cursor_pointer()
-                    .hover(|this| this.bg(Theme::panel_alt()).text_color(Theme::text()))
+                    .hover(|this| this.bg(Theme::bg()))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, _, cx| {
@@ -901,12 +903,6 @@ impl Render for RootView {
                             this.toggle_preview(cx);
                         }),
                     )
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|_, _: &MouseUpEvent, _, cx| cx.stop_propagation()),
-                    )
-                    // Use native geometry instead of an asset-backed SVG so the control is
-                    // always visible in the packaged application.
                     .child(
                         div()
                             .w(px(16.))
@@ -1194,6 +1190,7 @@ impl Render for RootView {
                             .into_any_element()
                     }),
             )
+            .child(floating_controls)
             .child(self.notifications.clone())
     }
 }

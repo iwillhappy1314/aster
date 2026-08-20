@@ -1,6 +1,6 @@
 #!/bin/bash
 # build-dmg.sh - Build Aster and embed the Markdown Quick Look extension.
-# Usage: ./scripts/build-dmg.sh [arm64|x86_64|universal]
+# Usage: ./scripts/build-dmg.sh [arm64|x86_64|universal] [--no-install]
 
 set -euo pipefail
 
@@ -16,6 +16,9 @@ cd "$ROOT_DIR"
 APP_NAME="Aster"
 VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
 SIGN_IDENTITY="${ASTER_CODESIGN_IDENTITY:--}"
+INSTALL_DIR="/Applications"
+INSTALL_APP="${INSTALL_DIR}/${APP_NAME}.app"
+INSTALL_AFTER_BUILD=true
 
 get_target_dir() {
     if command -v cargo >/dev/null 2>&1; then
@@ -107,6 +110,83 @@ create_dmg() {
     echo -e "${GREEN}Created: ${dmg_name} ($(du -h "$dmg_name" | cut -f1))${NC}"
 }
 
+stop_running_app() {
+    local remaining_pids
+
+    remaining_pids=$(pgrep -x "$APP_NAME" || true)
+    if [ -z "$remaining_pids" ]; then
+        return
+    fi
+
+    echo -e "${YELLOW}Stopping running ${APP_NAME} instance(s)...${NC}"
+    kill $remaining_pids 2>/dev/null || true
+
+    for _ in {1..20}; do
+        sleep 0.25
+        remaining_pids=$(pgrep -x "$APP_NAME" || true)
+        if [ -z "$remaining_pids" ]; then
+            return
+        fi
+    done
+
+    echo -e "${YELLOW}Force-stopping remaining ${APP_NAME} instance(s)...${NC}"
+    kill -KILL $remaining_pids 2>/dev/null || true
+
+    for _ in {1..20}; do
+        sleep 0.25
+        remaining_pids=$(pgrep -x "$APP_NAME" || true)
+        if [ -z "$remaining_pids" ]; then
+            return
+        fi
+    done
+
+    echo -e "${RED}Could not stop all running ${APP_NAME} instance(s): ${remaining_pids}${NC}" >&2
+    exit 1
+}
+
+install_app_bundle() {
+    local source_app="$1"
+    local staging_dir
+    local staged_app
+    local previous_app
+
+    if [ ! -d "$source_app" ]; then
+        echo -e "${RED}App bundle not found: $source_app${NC}" >&2
+        exit 1
+    fi
+
+    if [ ! -d "$INSTALL_DIR" ]; then
+        echo -e "${RED}Install directory not found: $INSTALL_DIR${NC}" >&2
+        exit 1
+    fi
+
+    staging_dir=$(mktemp -d "$INSTALL_DIR/.${APP_NAME}-install.XXXXXX")
+    staged_app="$staging_dir/${APP_NAME}.app"
+    previous_app="$INSTALL_DIR/.${APP_NAME}.app.previous.$$"
+
+    trap 'rm -rf "$staging_dir" "$previous_app"' RETURN
+    /usr/bin/ditto --rsrc --extattr "$source_app" "$staged_app"
+
+    stop_running_app
+
+    if [ -e "$INSTALL_APP" ]; then
+        mv "$INSTALL_APP" "$previous_app"
+    fi
+
+    if ! mv "$staged_app" "$INSTALL_APP"; then
+        if [ -e "$previous_app" ]; then
+            mv "$previous_app" "$INSTALL_APP"
+        fi
+        echo -e "${RED}Failed to install ${APP_NAME}. Restored the previous app bundle.${NC}" >&2
+        exit 1
+    fi
+
+    rm -rf "$previous_app"
+    rmdir "$staging_dir"
+    trap - RETURN
+    echo -e "${GREEN}Installed: ${INSTALL_APP}${NC}"
+}
+
 build_arch() {
     local arch="$1"
     local rust_target
@@ -153,7 +233,22 @@ if ! command -v cargo-bundle >/dev/null 2>&1; then
     cargo install cargo-bundle
 fi
 
-ARCH="${1:-$(uname -m)}"
+ARCH="$(uname -m)"
+for argument in "$@"; do
+    case "$argument" in
+        arm64|aarch64|x86_64|intel|universal)
+            ARCH="$argument"
+            ;;
+        --no-install)
+            INSTALL_AFTER_BUILD=false
+            ;;
+        *)
+            echo -e "${RED}Unknown argument '$argument'${NC}" >&2
+            echo "Usage: $0 [arm64|x86_64|universal] [--no-install]" >&2
+            exit 1
+            ;;
+    esac
+done
 
 case "$ARCH" in
     arm64|aarch64|x86_64|intel)
@@ -163,6 +258,9 @@ case "$ARCH" in
             *) SUFFIX="x86_64" ;;
         esac
         create_dmg "$BUNDLE_DIR" "$SUFFIX"
+        if [ "$INSTALL_AFTER_BUILD" = true ]; then
+            install_app_bundle "$BUNDLE_DIR/${APP_NAME}.app"
+        fi
         ;;
 
     universal)
@@ -190,11 +288,14 @@ case "$ARCH" in
 
         sign_app_bundle "$UNIVERSAL_APP"
         create_dmg "$UNIVERSAL_DIR" "universal"
+        if [ "$INSTALL_AFTER_BUILD" = true ]; then
+            install_app_bundle "$UNIVERSAL_APP"
+        fi
         ;;
 
     *)
         echo -e "${RED}Unknown architecture '$ARCH'${NC}" >&2
-        echo "Usage: $0 [arm64|x86_64|universal]" >&2
+        echo "Usage: $0 [arm64|x86_64|universal] [--no-install]" >&2
         exit 1
         ;;
 esac
