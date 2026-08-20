@@ -18,6 +18,7 @@ pub mod html;
 pub mod parse;
 #[cfg(feature = "gpui-render")]
 pub mod render;
+#[cfg(feature = "gpui-render")]
 pub mod typography;
 pub mod types;
 
@@ -32,5 +33,6 @@ pub use render::{
   RenderedMarkdownBlocks, render_markdown, render_markdown_blocks_cached, render_markdown_cached,
   render_parsed_markdown, render_parsed_markdown_blocks,
 };
+#[cfg(feature = "gpui-render")]
 pub use typography::{heading_font_size, heading_font_weight};
 pub use types::ParsedMarkdown;
