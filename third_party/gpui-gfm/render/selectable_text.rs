@@ -1,21 +1,23 @@
 //! Selectable text element — wraps `StyledText` and adds click-drag text selection.
 //!
-//! When the user drags across the text the selected range is highlighted and
-//! copied to the system clipboard on mouse-up.
+//! Selection stays highlighted after mouse-up. Copying is explicit via the
+//! context menu (or a host-provided keyboard action), matching normal macOS
+//! text-selection behaviour.
 
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use gpui::{
-  App, ClipboardItem, CursorStyle, DispatchPhase, Element, ElementId, GlobalElementId, Hitbox,
-  HitboxBehavior, InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent,
-  MouseMoveEvent, MouseUpEvent, SharedString, StyledText, TextRun, Window,
+  AnyElement, App, ClipboardItem, CursorStyle, DispatchPhase, Element, ElementId,
+  GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId,
+  MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString,
+  StatefulInteractiveElement, StyledText, TextRun, Window, anchored, deferred, div, prelude::*, px,
 };
 
 use super::{
-  LinkHandlerFn, SelectionMode, SelectionState, apply_selection_to_runs, clamp_to_char_boundary,
-  line_range_at, word_range_at,
+  LinkHandlerFn, MarkdownRenderOptions, SelectionMode, SelectionState, apply_selection_to_runs,
+  clamp_to_char_boundary, line_range_at, word_range_at,
 };
 
 /// A link range within the text.
@@ -38,20 +40,110 @@ struct CrossBlockSelection {
   initial_range: Option<Range<usize>>,
 }
 
+#[derive(Clone, Debug)]
+struct TextContextMenu {
+  owner_text_id: usize,
+  position: Point<Pixels>,
+  link: Option<String>,
+}
+
 #[derive(Default)]
 struct CrossBlockState {
   selection: Option<CrossBlockSelection>,
   texts: HashMap<usize, String>,
+  context_menu: Option<TextContextMenu>,
 }
 
 static CROSS_BLOCK_SELECTIONS: LazyLock<Mutex<HashMap<usize, CrossBlockState>>> =
   LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// A text element that supports click-drag selection and clipboard copy.
-///
-/// Delegates layout and painting to [`StyledText`] but intercepts mouse events
-/// in the `paint` phase to track selection state.
+#[derive(Clone, Copy)]
+struct ContextMenuTheme {
+  background: Hsla,
+  foreground: Hsla,
+  muted_foreground: Hsla,
+  border: Hsla,
+  hover: Hsla,
+}
+
+impl ContextMenuTheme {
+  fn from_runs(runs: &[TextRun]) -> Self {
+    let foreground = runs.first().map(|run| run.color).unwrap_or(Hsla {
+      h: 0.0,
+      s: 0.0,
+      l: 0.15,
+      a: 1.0,
+    });
+    let is_dark = foreground.l > 0.55;
+    let background = Hsla {
+      h: 0.0,
+      s: 0.0,
+      l: if is_dark { 0.12 } else { 0.99 },
+      a: 1.0,
+    };
+    let hover = Hsla {
+      h: 0.0,
+      s: 0.0,
+      l: if is_dark { 0.20 } else { 0.93 },
+      a: 1.0,
+    };
+    let muted_foreground = Hsla {
+      a: 0.62,
+      ..foreground
+    };
+    let border = Hsla {
+      a: if is_dark { 0.24 } else { 0.16 },
+      ..foreground
+    };
+
+    Self {
+      background,
+      foreground,
+      muted_foreground,
+      border,
+      hover,
+    }
+  }
+}
+
+/// Public wrapper that adds the preview context menu around the custom
+/// selectable element without depending on a separate UI component library.
 pub struct SelectableText {
+  inner: SelectableTextElement,
+  menu_theme: ContextMenuTheme,
+}
+
+impl SelectableText {
+  pub fn new(
+    text: SharedString,
+    base_runs: Vec<TextRun>,
+    link_ranges: Vec<LinkRange>,
+    selection_state: SelectionState,
+    on_link: Option<Arc<LinkHandlerFn>>,
+    text_id: usize,
+  ) -> Self {
+    register_cross_block_text(&selection_state, text_id, text.as_ref());
+    let menu_theme = ContextMenuTheme::from_runs(&base_runs);
+    let styled_text = StyledText::new(text.clone()).with_runs(base_runs.clone());
+    Self {
+      inner: SelectableTextElement {
+        text,
+        base_runs,
+        link_ranges,
+        selection_state,
+        on_link,
+        text_id,
+        styled_text,
+        last_selection: None,
+      },
+      menu_theme,
+    }
+  }
+}
+
+/// The low-level text element. The outer [`SelectableText`] wrapper supplies
+/// the preview context menu without changing text layout.
+struct SelectableTextElement {
   /// The text content.
   text: SharedString,
   /// Styled text runs (without selection highlight).
@@ -70,29 +162,7 @@ pub struct SelectableText {
   last_selection: Option<Range<usize>>,
 }
 
-impl SelectableText {
-  pub fn new(
-    text: SharedString,
-    base_runs: Vec<TextRun>,
-    link_ranges: Vec<LinkRange>,
-    selection_state: SelectionState,
-    on_link: Option<Arc<LinkHandlerFn>>,
-    text_id: usize,
-  ) -> Self {
-    register_cross_block_text(&selection_state, text_id, text.as_ref());
-    let styled_text = StyledText::new(text.clone()).with_runs(base_runs.clone());
-    Self {
-      text,
-      base_runs,
-      link_ranges,
-      selection_state,
-      on_link,
-      text_id,
-      styled_text,
-      last_selection: None,
-    }
-  }
-
+impl SelectableTextElement {
   /// Rebuild the styled text runs if the selection changed.
   fn ensure_runs_up_to_date(&mut self) {
     let selection = cross_block_selection_range(
@@ -120,7 +190,7 @@ impl SelectableText {
   }
 }
 
-impl Element for SelectableText {
+impl Element for SelectableTextElement {
   type RequestLayoutState = ();
   type PrepaintState = Hitbox;
 
@@ -205,6 +275,7 @@ impl Element for SelectableText {
           return;
         }
 
+        clear_context_menu(&selection_state);
         let index = text_layout
           .index_for_position(event.position)
           .unwrap_or_else(|ix| ix);
@@ -232,6 +303,44 @@ impl Element for SelectableText {
             dragging: true,
             mode,
             initial_range,
+          },
+        );
+        window.refresh();
+        cx.stop_propagation();
+      }
+    });
+
+    // Right-click: record the link under the pointer and the window-space menu
+    // position. The next render pass draws one lightweight GPUI menu owned by
+    // this text block.
+    let text_for_context = text.clone();
+    window.on_mouse_event({
+      let hitbox = hitbox.clone();
+      let selection_state = selection_state.clone();
+      let text_layout = text_layout.clone();
+      let link_ranges = link_ranges.clone();
+      move |event: &MouseDownEvent, phase, window, cx| {
+        if phase != DispatchPhase::Bubble
+          || event.button != MouseButton::Right
+          || !hitbox.is_hovered(window)
+        {
+          return;
+        }
+
+        let index = text_layout
+          .index_for_position(event.position)
+          .unwrap_or_else(|ix| ix);
+        let index = clamp_to_char_boundary(text_for_context.as_ref(), index.min(text_len));
+        let link = link_ranges
+          .iter()
+          .find(|lr| lr.range.contains(&index))
+          .map(|lr| lr.url.clone());
+        set_context_menu(
+          &selection_state,
+          TextContextMenu {
+            owner_text_id: text_id,
+            position: event.position,
+            link,
           },
         );
         window.refresh();
@@ -298,14 +407,13 @@ impl Element for SelectableText {
         let updated = selection_with_head(active, text_id, index, text_for_up.as_ref(), false);
         set_cross_block_selection(&selection_state, updated);
 
-        if let Some(selected) = cross_block_selected_text(&selection_state) {
-          if !selected.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(selected));
-          }
-        } else if let Some(link_url) = link_ranges
-          .iter()
-          .find(|lr| lr.range.contains(&index))
-          .map(|lr| lr.url.clone())
+        // A click on a link still activates it, but a real selection is left
+        // highlighted and does not overwrite the clipboard automatically.
+        if cross_block_selected_text(&selection_state).is_none()
+          && let Some(link_url) = link_ranges
+            .iter()
+            .find(|lr| lr.range.contains(&index))
+            .map(|lr| lr.url.clone())
         {
           if let Some(handler) = &on_link {
             handler(&link_url, window, cx);
@@ -334,7 +442,7 @@ fn register_cross_block_text(selection_state: &SelectionState, text_id: usize, t
   let mut all = CROSS_BLOCK_SELECTIONS.lock().unwrap();
   let state = all.entry(key).or_default();
   // Text IDs restart at zero on every render pass. Rebuild only the text registry;
-  // the logical selection can stay alive across repaints.
+  // the logical selection and context menu can stay alive across repaints.
   if text_id == 0 {
     state.texts.clear();
   }
@@ -353,6 +461,36 @@ fn set_cross_block_selection(selection_state: &SelectionState, selection: CrossB
     .entry(key)
     .or_default()
     .selection = Some(selection);
+}
+
+fn set_context_menu(selection_state: &SelectionState, menu: TextContextMenu) {
+  let key = selection_state_key(selection_state);
+  CROSS_BLOCK_SELECTIONS
+    .lock()
+    .unwrap()
+    .entry(key)
+    .or_default()
+    .context_menu = Some(menu);
+}
+
+fn clear_context_menu(selection_state: &SelectionState) {
+  let key = selection_state_key(selection_state);
+  if let Some(state) = CROSS_BLOCK_SELECTIONS.lock().unwrap().get_mut(&key) {
+    state.context_menu = None;
+  }
+}
+
+fn context_menu_for(
+  selection_state: &SelectionState,
+  text_id: usize,
+) -> Option<TextContextMenu> {
+  let key = selection_state_key(selection_state);
+  CROSS_BLOCK_SELECTIONS
+    .lock()
+    .unwrap()
+    .get(&key)
+    .and_then(|state| state.context_menu.clone())
+    .filter(|menu| menu.owner_text_id == text_id)
 }
 
 fn active_cross_block_selection(selection_state: &SelectionState) -> Option<CrossBlockSelection> {
@@ -465,20 +603,238 @@ fn cross_block_selected_text(selection_state: &SelectionState) -> Option<String>
     let Some(text) = state.texts.get(&text_id) else {
       continue;
     };
-    if let Some(range) = local_cross_block_range(active, text_id, text) {
-      if let Some(slice) = text.get(range) {
-        parts.push(slice.to_string());
-      }
+    if let Some(range) = local_cross_block_range(active, text_id, text)
+      && let Some(slice) = text.get(range)
+    {
+      parts.push(slice.to_string());
     }
   }
 
   if parts.is_empty() { None } else { Some(parts.join("\n")) }
 }
 
-impl IntoElement for SelectableText {
+fn select_all_cross_block(selection_state: &SelectionState) {
+  let key = selection_state_key(selection_state);
+  let mut all = CROSS_BLOCK_SELECTIONS.lock().unwrap();
+  let Some(state) = all.get_mut(&key) else {
+    return;
+  };
+  let Some(first_id) = state.texts.keys().copied().min() else {
+    return;
+  };
+  let Some(last_id) = state.texts.keys().copied().max() else {
+    return;
+  };
+  let last_len = state.texts.get(&last_id).map_or(0, String::len);
+
+  state.selection = Some(CrossBlockSelection {
+    anchor_text_id: first_id,
+    anchor: 0,
+    head_text_id: last_id,
+    head: last_len,
+    dragging: false,
+    mode: SelectionMode::Char,
+    initial_range: None,
+  });
+}
+
+fn context_menu_item<F>(
+  id: &'static str,
+  label: &'static str,
+  disabled: bool,
+  theme: ContextMenuTheme,
+  on_click: F,
+) -> AnyElement
+where
+  F: Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+{
+  div()
+    .id(id)
+    .w_full()
+    .h(px(30.))
+    .px(px(10.))
+    .flex()
+    .items_center()
+    .rounded(px(5.))
+    .text_sm()
+    .text_color(if disabled {
+      theme.muted_foreground
+    } else {
+      theme.foreground
+    })
+    .when(!disabled, |this| {
+      this
+        .cursor_pointer()
+        .hover(move |style| style.bg(theme.hover))
+        .on_mouse_down(MouseButton::Left, on_click)
+    })
+    .child(label)
+    .into_any_element()
+}
+
+fn build_context_menu(
+  context: TextContextMenu,
+  selection_state: SelectionState,
+  on_link: Option<Arc<LinkHandlerFn>>,
+  theme: ContextMenuTheme,
+) -> AnyElement {
+  let selected = cross_block_selected_text(&selection_state);
+  let copy_disabled = selected.as_ref().is_none_or(|text| text.is_empty());
+
+  let copy_state = selection_state.clone();
+  let copy_item = context_menu_item(
+    "preview-context-copy",
+    "Copy",
+    copy_disabled,
+    theme,
+    move |_, window, cx| {
+      if let Some(text) = cross_block_selected_text(&copy_state)
+        && !text.is_empty()
+      {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+      }
+      clear_context_menu(&copy_state);
+      window.refresh();
+      cx.stop_propagation();
+    },
+  );
+
+  let select_all_state = selection_state.clone();
+  let select_all_item = context_menu_item(
+    "preview-context-select-all",
+    "Select All",
+    false,
+    theme,
+    move |_, window, cx| {
+      select_all_cross_block(&select_all_state);
+      clear_context_menu(&select_all_state);
+      window.refresh();
+      cx.stop_propagation();
+    },
+  );
+
+  let mut menu = div()
+    .id("preview-context-menu")
+    .w(px(180.))
+    .p(px(4.))
+    .rounded(px(8.))
+    .bg(theme.background)
+    .border_1()
+    .border_color(theme.border)
+    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+    .child(copy_item)
+    .child(select_all_item);
+
+  if let Some(link_url) = context.link {
+    menu = menu.child(
+      div()
+        .h(px(1.))
+        .mx(px(6.))
+        .my(px(4.))
+        .bg(theme.border),
+    );
+
+    let open_url = link_url.clone();
+    let open_handler = on_link.clone();
+    let open_state = selection_state.clone();
+    menu = menu.child(context_menu_item(
+      "preview-context-open-link",
+      "Open Link",
+      false,
+      theme,
+      move |_, window, cx| {
+        if let Some(handler) = &open_handler {
+          handler(&open_url, window, cx);
+        } else {
+          cx.open_url(&open_url);
+        }
+        clear_context_menu(&open_state);
+        window.refresh();
+        cx.stop_propagation();
+      },
+    ));
+
+    let copy_link_state = selection_state.clone();
+    menu = menu.child(context_menu_item(
+      "preview-context-copy-link",
+      "Copy Link",
+      false,
+      theme,
+      move |_, window, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string(link_url.clone()));
+        clear_context_menu(&copy_link_state);
+        window.refresh();
+        cx.stop_propagation();
+      },
+    ));
+  }
+
+  deferred(
+    anchored()
+      .position(context.position)
+      .snap_to_window_with_margin(px(8.))
+      .child(menu),
+  )
+  .with_priority(2)
+  .into_any_element()
+}
+
+impl IntoElement for SelectableTextElement {
   type Element = Self;
 
   fn into_element(self) -> Self::Element {
     self
+  }
+}
+
+impl IntoElement for SelectableText {
+  type Element = AnyElement;
+
+  fn into_element(self) -> Self::Element {
+    let text_id = self.inner.text_id;
+    let selection_state = self.inner.selection_state.clone();
+    let on_link = self.inner.on_link.clone();
+    let menu_context = context_menu_for(&selection_state, text_id);
+
+    let mut wrapper = div()
+      .id(("preview-selectable-text", text_id))
+      .child(self.inner);
+
+    if let Some(context) = menu_context {
+      wrapper = wrapper.child(build_context_menu(
+        context,
+        selection_state,
+        on_link,
+        self.menu_theme,
+      ));
+    }
+
+    wrapper.into_any_element()
+  }
+}
+
+impl MarkdownRenderOptions {
+  /// Selected preview text across all registered Markdown text blocks.
+  pub fn selected_preview_text(&self) -> Option<String> {
+    cross_block_selected_text(&self.selection_state)
+  }
+
+  /// Select every registered preview text block.
+  pub fn select_all_preview_text(&self) {
+    select_all_cross_block(&self.selection_state);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn select_all_spans_registered_blocks() {
+    let state = SelectionState::default();
+    register_cross_block_text(&state, 0, "first");
+    register_cross_block_text(&state, 1, "second");
+    select_all_cross_block(&state);
+    assert_eq!(cross_block_selected_text(&state).as_deref(), Some("first\nsecond"));
   }
 }
