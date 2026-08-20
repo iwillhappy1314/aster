@@ -53,9 +53,11 @@ impl EditorTextLayout {
 
     fn line_for_index(&self, index: usize) -> Option<&EditorLineLayout> {
         let index = index.min(self.display_len);
+        let line_index = self
+            .lines
+            .partition_point(|line| line.display_range.end < index);
         self.lines
-            .iter()
-            .find(|line| index <= line.display_range.end)
+            .get(line_index)
             .or_else(|| self.lines.last())
     }
 
@@ -109,8 +111,17 @@ pub fn render_editor_text(
 
     let mut container = div().relative().w_full().min_w_0().flex().flex_col();
     let mut layouts = Vec::with_capacity(display_ranges.len());
+    let mut highlight_start = 0usize;
+
+    debug_assert!(highlights.windows(2).all(|pair| pair[0].0.start <= pair[1].0.start));
 
     for (line_index, display_range) in display_ranges.iter().enumerate() {
+        while highlight_start < highlights.len()
+            && highlights[highlight_start].0.end <= display_range.start
+        {
+            highlight_start += 1;
+        }
+
         let line_text = &display_text[display_range.clone()];
         let rendered_text = if line_text.is_empty() {
             EMPTY_LINE_PLACEHOLDER.to_string()
@@ -120,7 +131,7 @@ pub fn render_editor_text(
         let line_highlights = if line_text.is_empty() {
             Vec::new()
         } else {
-            highlights_for_line(highlights, display_range)
+            highlights_for_line(highlights, display_range, highlight_start)
         };
 
         let mut styled = StyledText::new(rendered_text.clone());
@@ -178,9 +189,12 @@ fn display_line_ranges(text: &str) -> Vec<Range<usize>> {
 fn highlights_for_line(
     highlights: &[(Range<usize>, HighlightStyle)],
     line: &Range<usize>,
+    start_at: usize,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
     highlights
         .iter()
+        .skip(start_at)
+        .take_while(|(range, _)| range.start < line.end)
         .filter_map(|(range, style)| {
             let start = range.start.max(line.start);
             let end = range.end.min(line.end);
@@ -206,8 +220,20 @@ mod tests {
     #[test]
     fn line_highlights_are_clipped_and_rebased() {
         let highlights = vec![(2..8, HighlightStyle::default())];
-        let result = highlights_for_line(&highlights, &(5..10));
+        let result = highlights_for_line(&highlights, &(5..10), 0);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, 0..3);
+    }
+
+    #[test]
+    fn line_highlights_start_from_rolling_cursor() {
+        let highlights = vec![
+            (0..2, HighlightStyle::default()),
+            (10..14, HighlightStyle::default()),
+            (30..34, HighlightStyle::default()),
+        ];
+        let result = highlights_for_line(&highlights, &(11..13), 1);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 0..2);
     }
 }

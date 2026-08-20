@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const CARET_WIDTH: f32 = 2.0;
+const HEAVY_DOCUMENT_BYTES: usize = 64 * 1024;
 
 pub type OutlineViewportCallback = Arc<dyn Fn(usize, &mut App)>;
 
@@ -116,25 +117,18 @@ impl DisplayProjection {
 
     fn source_to_display_byte(&self, source_byte: usize) -> usize {
         let source_byte = source_byte.min(self.source_len);
-        let mut mapped = 0usize;
-        for segment in &self.segments {
-            if source_byte < segment.source.start {
-                return mapped;
-            }
-            if source_byte <= segment.source.end {
-                if segment.hidden {
-                    return segment.display_start;
-                }
-                return segment.display_start + (source_byte - segment.source.start);
-            }
+        let segment_index = self
+            .segments
+            .partition_point(|segment| segment.source.end < source_byte);
+        let Some(segment) = self.segments.get(segment_index) else {
+            return self.display_text.len();
+        };
 
-            mapped = if segment.hidden {
-                segment.display_start
-            } else {
-                segment.display_start + segment.source.len()
-            };
+        if source_byte < segment.source.start || segment.hidden {
+            return segment.display_start;
         }
-        self.display_text.len()
+
+        segment.display_start + (source_byte - segment.source.start)
     }
 
     fn display_to_source_byte(&self, display_byte: usize) -> usize {
@@ -199,8 +193,10 @@ pub struct EditorView {
     scroll_indicator_visible: bool,
     /// Monotonic revision used to prevent an older hide timer from hiding a newer scroll event.
     scroll_indicator_revision: u64,
-    /// Cached text with revision to avoid repeated rope-to-string conversions
-    cached_text: Option<(u64, String)>,
+    /// Cached text with revision to avoid repeated rope-to-string conversions.
+    cached_text: Option<(u64, Arc<str>)>,
+    /// Cached source/display projection for the current document + inline parse revisions.
+    cached_projection: Option<(u64, u64, Arc<DisplayProjection>)>,
     /// Character range currently owned by the platform IME composition.
     marked_range: Option<Range<usize>>,
     /// Keeps the full IME composition as one undo transaction.
@@ -239,6 +235,7 @@ impl EditorView {
             scroll_indicator_visible: false,
             scroll_indicator_revision: 0,
             cached_text: None,
+            cached_projection: None,
             marked_range: None,
             ime_edit_active: false,
             input_layout: None,
@@ -265,8 +262,19 @@ impl EditorView {
                     .timer(Duration::from_millis(500))
                     .await;
                 let _ = entity.update(cx, |view, cx| {
-                    view.caret_visible = !view.caret_visible;
-                    cx.notify();
+                    let should_blink = {
+                        view.document.read(cx).rope.len_bytes() <= HEAVY_DOCUMENT_BYTES
+                    };
+
+                    if should_blink {
+                        view.caret_visible = !view.caret_visible;
+                        cx.notify();
+                    } else if !view.caret_visible {
+                        // Large documents keep a steady caret so the blink timer cannot
+                        // force a full editor render every 500 ms.
+                        view.caret_visible = true;
+                        cx.notify();
+                    }
                 });
             }
         }));
@@ -274,6 +282,16 @@ impl EditorView {
 
     /// Shows the scroll indicator briefly after a wheel-scroll event.
     fn reveal_scroll_indicator(&mut self, cx: &mut Context<Self>) {
+        if self.document.read(cx).rope.len_bytes() > HEAVY_DOCUMENT_BYTES {
+            // The scroll container already has GPUI's native scrollbar. Avoid invalidating
+            // the whole editor for the decorative transient indicator on large documents.
+            if self.scroll_indicator_visible {
+                self.scroll_indicator_visible = false;
+                cx.notify();
+            }
+            return;
+        }
+
         self.scroll_indicator_visible = true;
         self.scroll_indicator_revision = self.scroll_indicator_revision.wrapping_add(1);
         let revision = self.scroll_indicator_revision;
@@ -344,7 +362,7 @@ impl EditorView {
             .collect()
     }
 
-    fn current_text_and_revision(&mut self, cx: &mut Context<Self>) -> (String, u64) {
+    fn current_text_and_revision(&mut self, cx: &mut Context<Self>) -> (Arc<str>, u64) {
         let revision = self.document.read(cx).revision;
         if let Some((cached_revision, cached)) = &self.cached_text
             && *cached_revision == revision
@@ -352,7 +370,7 @@ impl EditorView {
             return (cached.clone(), revision);
         }
 
-        let text = self.document.read(cx).text();
+        let text = Arc::<str>::from(self.document.read(cx).text());
         self.cached_text = Some((revision, text.clone()));
         (text, revision)
     }
@@ -437,7 +455,10 @@ impl EditorView {
         }
 
         let (text, revision) = self.current_text_and_revision(cx);
-        let matches = self.ensure_search_cache(&text, revision).matches.clone();
+        let matches = self
+            .ensure_search_cache(text.as_ref(), revision)
+            .matches
+            .clone();
         let match_range = {
             let total = matches.len();
             if total == 0 {
@@ -467,7 +488,10 @@ impl EditorView {
         }
 
         let (text, revision) = self.current_text_and_revision(cx);
-        let total_matches = self.ensure_search_cache(&text, revision).matches.len();
+        let total_matches = self
+            .ensure_search_cache(text.as_ref(), revision)
+            .matches
+            .len();
         if total_matches == 0 {
             return;
         }
@@ -1030,10 +1054,10 @@ impl Render for EditorView {
                 if cached_rev == rev {
                     (text.clone(), rev)
                 } else {
-                    (doc.text(), rev)
+                    (Arc::<str>::from(doc.text()), rev)
                 }
             } else {
-                (doc.text(), rev)
+                (Arc::<str>::from(doc.text()), rev)
             }
         };
 
@@ -1047,20 +1071,30 @@ impl Render for EditorView {
         let show_caret = doc.selection.is_none();
         let has_selection = doc.selection_range().is_some();
         let draw_caret = show_caret && is_focused && self.caret_visible;
-        let inline_spans = {
+        let (inline_spans, inline_revision) = {
             let inline = self.inline_markdown.read(cx);
-            inline.spans.clone()
+            (inline.spans.clone(), inline.source_revision)
         };
-        let projection = Arc::new(DisplayProjection::from_source(
-            &text_owned,
-            inline_spans.as_ref(),
-        ));
+        let projection = if let Some((cached_doc_revision, cached_inline_revision, cached)) =
+            &self.cached_projection
+            && *cached_doc_revision == doc_revision
+            && *cached_inline_revision == inline_revision
+        {
+            cached.clone()
+        } else {
+            let projection = Arc::new(DisplayProjection::from_source(
+                text_owned.as_ref(),
+                inline_spans.as_ref(),
+            ));
+            self.cached_projection = Some((doc_revision, inline_revision, projection.clone()));
+            projection
+        };
         let cursor_display_byte = projection.source_to_display_byte(cursor_source_byte);
         let syntax_highlights = projection.project_highlights(
             self.inline_syntax_highlights(inline_spans.as_ref(), markdown_style),
         );
         let (search_highlights, search_match_count) =
-            self.search_highlights(&text_owned, doc_revision);
+            self.search_highlights(text_owned.as_ref(), doc_revision);
         let search_highlights = projection.project_highlights(search_highlights);
         let selection_highlights = projection.project_highlights(self.selection_highlights(&doc));
         drop(doc);
@@ -1080,7 +1114,7 @@ impl Render for EditorView {
         let safe_highlights = sanitize_highlights(&projection.display_text, all_highlights);
         let editor_text = render_editor_text(
             &projection.display_text,
-            &text_owned,
+            text_owned.as_ref(),
             &safe_highlights,
             settings::get_font_size(),
         );
@@ -1098,7 +1132,7 @@ impl Render for EditorView {
         let outline_callback = self.on_outline_viewport_change.clone();
         let outline_scroll_handle = self.scroll_handle.clone();
         let outline_projection = projection.clone();
-        let has_multiple_lines = text_owned.lines().nth(1).is_some();
+        let has_multiple_lines = text_owned.as_ref().lines().nth(1).is_some();
         let editor_scroll_handle = self.scroll_handle.clone();
         let show_scroll_indicator = self.scroll_indicator_visible;
         let input_enabled = !self.search_active;
@@ -1851,7 +1885,7 @@ fn sanitize_highlights(
     highlights: Vec<(Range<usize>, HighlightStyle)>,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
     let len = text.len();
-    highlights
+    let mut sanitized = highlights
         .into_iter()
         .filter_map(|(range, style)| {
             if range.start >= range.end || range.start >= len {
@@ -1874,7 +1908,10 @@ fn sanitize_highlights(
                 None
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    sanitized.sort_by_key(|(range, _)| (range.start, range.end));
+    sanitized
 }
 
 #[cfg(test)]
