@@ -33,6 +33,7 @@ pub struct SyntaxSpan {
 pub fn markdown_spans(source: &str) -> Vec<SyntaxSpan> {
     let mut spans = Vec::new();
     let mut offset = 0usize;
+    let mut active_fence: Option<(u8, usize)> = None;
 
     for raw_line in source.split_inclusive('\n') {
         let line = raw_line.trim_end_matches('\n').trim_end_matches('\r');
@@ -45,23 +46,19 @@ pub fn markdown_spans(source: &str) -> Vec<SyntaxSpan> {
         let leading = leading_whitespace_bytes(line);
         let content = &line[leading..];
         let content_start = offset + leading;
-        let mut skip_inline = false;
 
-        if let Some(fence_len) = fence_prefix_len(content) {
-            spans.push(SyntaxSpan {
-                range: content_start..(content_start + fence_len),
-                kind: SyntaxKind::CodeFence,
-            });
-            if content.len() > fence_len {
-                spans.push(SyntaxSpan {
-                    range: (content_start + fence_len)..(content_start + content.len()),
-                    kind: SyntaxKind::CodeFence,
-                });
+        if let Some((active_marker, active_len)) = active_fence {
+            if let Some((fence_marker, fence_len)) = fence_prefix(content)
+                && fence_marker == active_marker
+                && fence_len >= active_len
+            {
+                push_code_fence_spans(&mut spans, content_start, content, fence_len);
+                active_fence = None;
             }
-            skip_inline = true;
-        }
-
-        if !skip_inline {
+        } else if let Some((fence_marker, fence_len)) = fence_prefix(content) {
+            active_fence = Some((fence_marker, fence_len));
+            push_code_fence_spans(&mut spans, content_start, content, fence_len);
+        } else {
             if let Some((marker_len, _hashes)) = heading_prefix(content) {
                 spans.push(SyntaxSpan {
                     range: content_start..(content_start + marker_len),
@@ -104,6 +101,39 @@ pub fn markdown_spans(source: &str) -> Vec<SyntaxSpan> {
     spans
 }
 
+/// Returns the ATX heading level for each source line outside fenced code blocks.
+///
+/// The result preserves one entry per `split('\n')` line so it can be paired with
+/// the editor's line layout without remapping byte offsets.
+pub fn markdown_heading_levels(source: &str) -> Vec<Option<u8>> {
+    let mut active_fence: Option<(u8, usize)> = None;
+
+    source
+        .split('\n')
+        .map(|raw_line| {
+            let line = raw_line.trim_end_matches('\r');
+            let leading = leading_whitespace_bytes(line);
+            let content = &line[leading..];
+
+            if let Some((fence_marker, fence_len)) = fence_prefix(content) {
+                if let Some((active_marker, active_len)) = active_fence
+                    && fence_marker == active_marker
+                    && fence_len >= active_len
+                {
+                    active_fence = None;
+                } else if active_fence.is_none() {
+                    active_fence = Some((fence_marker, fence_len));
+                }
+                None
+            } else if active_fence.is_some() {
+                None
+            } else {
+                heading_prefix(content).map(|(_, hashes)| hashes as u8)
+            }
+        })
+        .collect()
+}
+
 /// Returns the ATX heading level (1–6) for a single Markdown source line.
 /// Leading indentation and trailing line endings are ignored.
 pub fn markdown_heading_level(raw_line: &str) -> Option<u8> {
@@ -119,13 +149,32 @@ fn leading_whitespace_bytes(line: &str) -> usize {
         .unwrap_or(line.len())
 }
 
-fn fence_prefix_len(content: &str) -> Option<usize> {
-    if content.starts_with("```") {
-        Some(3)
-    } else if content.starts_with("~~~") {
-        Some(3)
-    } else {
-        None
+fn fence_prefix(content: &str) -> Option<(u8, usize)> {
+    let marker = *content.as_bytes().first()?;
+    if marker != b'`' && marker != b'~' {
+        return None;
+    }
+
+    let length = content.bytes().take_while(|byte| *byte == marker).count();
+    (length >= 3).then_some((marker, length))
+}
+
+/// Marks a fenced code delimiter line and its optional language identifier.
+fn push_code_fence_spans(
+    spans: &mut Vec<SyntaxSpan>,
+    content_start: usize,
+    content: &str,
+    fence_len: usize,
+) {
+    spans.push(SyntaxSpan {
+        range: content_start..(content_start + fence_len),
+        kind: SyntaxKind::CodeFence,
+    });
+    if content.len() > fence_len {
+        spans.push(SyntaxSpan {
+            range: (content_start + fence_len)..(content_start + content.len()),
+            kind: SyntaxKind::CodeFence,
+        });
     }
 }
 
@@ -366,5 +415,30 @@ dn’t require a patchwork of vendors.
         assert_eq!(markdown_heading_level("###### H6"), Some(6));
         assert_eq!(markdown_heading_level("####### not a heading"), None);
         assert_eq!(markdown_heading_level("#missing-space"), None);
+    }
+
+    #[test]
+    fn code_block_comments_are_not_heading_tokens_or_layout_headings() {
+        let source = "# Document\n\n```env\n# Mail configuration\nMAIL_HOST=localhost\n```\n\n## After code\n";
+        let spans = markdown_spans(source);
+        let code_comment_start = source.find("# Mail configuration").unwrap();
+
+        assert!(!spans.iter().any(|span| {
+            span.kind == SyntaxKind::HeadingMarker && span.range.start == code_comment_start
+        }));
+        assert_eq!(
+            markdown_heading_levels(source),
+            vec![Some(1), None, None, None, None, None, None, Some(2), None]
+        );
+    }
+
+    #[test]
+    fn tilde_code_block_comments_are_not_layout_headings() {
+        let source = "~~~text\n# Not a heading\n~~~\n# Heading\n";
+
+        assert_eq!(
+            markdown_heading_levels(source),
+            vec![None, None, None, Some(1), None]
+        );
     }
 }

@@ -1,10 +1,11 @@
-use crate::services::syntax::markdown_heading_level;
+use crate::services::syntax::markdown_heading_levels;
 use gpui::{AnyElement, HighlightStyle, Pixels, Point, StyledText, div, prelude::*, px};
 use gpui_gfm::{heading_font_size, heading_font_weight};
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 
 const EMPTY_LINE_PLACEHOLDER: &str = "\u{200B}";
+const LINE_NUMBER_GUTTER_WIDTH: f32 = 44.0;
 
 #[derive(Clone)]
 struct EditorLineLayout {
@@ -104,10 +105,7 @@ pub fn render_editor_text(
     body_font_size: f32,
 ) -> EditorTextRender {
     let display_ranges = display_line_ranges(display_text);
-    let heading_levels = source_text
-        .split('\n')
-        .map(markdown_heading_level)
-        .collect::<Vec<_>>();
+    let heading_levels = markdown_heading_levels(source_text);
 
     let mut container = div().relative().w_full().min_w_0().flex().flex_col();
     let mut layouts = Vec::with_capacity(display_ranges.len());
@@ -145,7 +143,7 @@ pub fn render_editor_text(
         let layout = styled.layout().clone();
         let heading_level = heading_levels.get(line_index).copied().flatten();
 
-        let mut line = div().w_full().min_w_0();
+        let mut line = div().relative().w_full().min_w_0();
         if let Some(level) = heading_level {
             line = line
                 .text_size(heading_font_size(level))
@@ -153,7 +151,20 @@ pub fn render_editor_text(
         } else {
             line = line.text_size(px(body_font_size));
         }
-        line = line.child(styled);
+        line = line
+            .child(styled)
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_full()
+                    .mr(px(12.))
+                    .w(px(LINE_NUMBER_GUTTER_WIDTH))
+                    .text_right()
+                    .text_size(px(body_font_size))
+                    .text_color(crate::ui::theme::Theme::muted())
+                    .child((line_index + 1).to_string()),
+            );
 
         container = container.child(line);
         layouts.push(EditorLineLayout {
@@ -236,4 +247,5 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, 0..2);
     }
+
 }

@@ -9,10 +9,10 @@ use crate::ui::theme::{MarkdownStyle, Theme};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, HighlightStyle,
+    EntityInputHandler, FocusHandle, Focusable, FontWeight, HighlightStyle,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     ParentElement, Pixels, Point, Render, ScrollHandle, StatefulInteractiveElement, Styled,
-    UTF16Selection, UnderlineStyle, Window, anchored, canvas, combine_highlights, deferred, div,
+    UTF16Selection, Window, anchored, canvas, combine_highlights, deferred, div,
     fill, point, px, size,
 };
 use std::ops::Range;
@@ -46,72 +46,20 @@ struct DisplayProjection {
 }
 
 impl DisplayProjection {
-    fn from_source(source: &str, spans: &[SyntaxSpan]) -> Self {
+    /// Creates the editor's identity source projection.
+    ///
+    /// Edit mode intentionally displays every Markdown byte, so cursor, selection,
+    /// search, and IME offsets all use the original document source directly.
+    fn from_source(source: &str) -> Self {
         let source_len = source.len();
-        let hidden = merged_hidden_ranges(source, spans);
-        if hidden.is_empty() {
-            return Self {
-                display_text: source.to_string(),
-                source_len,
-                segments: vec![ProjectionSegment {
-                    source: 0..source_len,
-                    display_start: 0,
-                    hidden: false,
-                }],
-            };
-        }
-
-        let mut display_text = String::with_capacity(source_len);
-        let mut segments = Vec::new();
-        let mut source_ix = 0usize;
-        let mut display_ix = 0usize;
-
-        for hidden_range in hidden {
-            if hidden_range.start > source_ix {
-                let visible = source_ix..hidden_range.start;
-                let slice = &source[visible.clone()];
-                display_text.push_str(slice);
-                segments.push(ProjectionSegment {
-                    source: visible,
-                    display_start: display_ix,
-                    hidden: false,
-                });
-                display_ix += slice.len();
-            }
-
-            if hidden_range.end > hidden_range.start {
-                segments.push(ProjectionSegment {
-                    source: hidden_range.clone(),
-                    display_start: display_ix,
-                    hidden: true,
-                });
-            }
-            source_ix = hidden_range.end;
-        }
-
-        if source_ix < source_len {
-            let visible = source_ix..source_len;
-            let slice = &source[visible.clone()];
-            display_text.push_str(slice);
-            segments.push(ProjectionSegment {
-                source: visible,
-                display_start: display_ix,
-                hidden: false,
-            });
-        }
-
-        if segments.is_empty() {
-            segments.push(ProjectionSegment {
-                source: 0..0,
+        Self {
+            display_text: source.to_string(),
+            source_len,
+            segments: vec![ProjectionSegment {
+                source: 0..source_len,
                 display_start: 0,
                 hidden: false,
-            });
-        }
-
-        Self {
-            display_text,
-            source_len,
-            segments,
+            }],
         }
     }
 
@@ -352,13 +300,7 @@ impl EditorView {
     ) -> Vec<(Range<usize>, HighlightStyle)> {
         spans
             .iter()
-            .map(|span| {
-                let hide_markers = is_inline_hidden_kind(span.kind);
-                (
-                    span.range.clone(),
-                    syntax_style(span.kind, hide_markers, markdown_style),
-                )
-            })
+            .map(|span| (span.range.clone(), syntax_style(span.kind, markdown_style)))
             .collect()
     }
 
@@ -1091,10 +1033,7 @@ impl Render for EditorView {
         {
             cached.clone()
         } else {
-            let projection = Arc::new(DisplayProjection::from_source(
-                text_owned.as_ref(),
-                render_spans,
-            ));
+            let projection = Arc::new(DisplayProjection::from_source(text_owned.as_ref()));
             self.cached_projection = Some((doc_revision, inline_revision, projection.clone()));
             projection
         };
@@ -1175,7 +1114,7 @@ impl Render for EditorView {
                     .relative()
                     .size_full()
                     .bg(Theme::panel())
-                    .pl(px(32.))
+                    .pl(px(88.))
                     .pr(px(32.))
                     .py(px(24.))
                     .text_size(px(settings::get_font_size()))
@@ -1576,10 +1515,6 @@ impl Render for EditorView {
                                         );
                                     }
 
-                                    if !draw_caret {
-                                        return;
-                                    }
-
                                     let caret_pos =
                                         std::panic::catch_unwind(AssertUnwindSafe(|| {
                                             text_layout_for_caret
@@ -1599,6 +1534,18 @@ impl Render for EditorView {
                                         .ok()
                                         .unwrap_or(px(0.));
                                     if line_height <= px(0.) {
+                                        return;
+                                    }
+
+                                    window.paint_quad(fill(
+                                        Bounds {
+                                            origin: point(bounds.left(), caret_pos.y),
+                                            size: size(bounds.size.width, line_height),
+                                        },
+                                        hsla_with_alpha(Theme::selection_bg(), 0.14),
+                                    ));
+
+                                    if !draw_caret {
                                         return;
                                     }
 
@@ -1709,27 +1656,8 @@ impl Render for EditorView {
     }
 }
 
-fn syntax_style(
-    kind: SyntaxKind,
-    hide_markers: bool,
-    markdown_style: MarkdownStyle,
-) -> HighlightStyle {
-    if hide_markers {
-        let hidden_color = match kind {
-            SyntaxKind::InlineCodeMarker => markdown_style.code_background,
-            _ => Theme::panel(),
-        };
-        let hidden_background = match kind {
-            SyntaxKind::InlineCodeMarker => Some(markdown_style.code_background.into()),
-            _ => None,
-        };
-        return HighlightStyle {
-            color: Some(hidden_color.into()),
-            background_color: hidden_background,
-            ..Default::default()
-        };
-    }
-
+/// Returns source-code syntax colors without applying Markdown rich-text rendering.
+fn syntax_style(kind: SyntaxKind, markdown_style: MarkdownStyle) -> HighlightStyle {
     match kind {
         SyntaxKind::HeadingMarker => HighlightStyle {
             color: Some(markdown_style.muted_foreground.into()),
@@ -1753,7 +1681,6 @@ fn syntax_style(
         },
         SyntaxKind::InlineCodeMarker | SyntaxKind::InlineCode => HighlightStyle {
             color: Some(markdown_style.foreground.into()),
-            background_color: Some(markdown_style.code_background.into()),
             ..Default::default()
         },
         SyntaxKind::LinkTextDelimiter | SyntaxKind::LinkUrlDelimiter => HighlightStyle {
@@ -1762,92 +1689,18 @@ fn syntax_style(
         },
         SyntaxKind::LinkText => HighlightStyle {
             color: Some(markdown_style.link.into()),
-            underline: Some(UnderlineStyle {
-                thickness: px(1.),
-                color: Some(markdown_style.link.into()),
-                wavy: false,
-            }),
             ..Default::default()
         },
         SyntaxKind::LinkUrl => HighlightStyle {
             color: Some(markdown_style.muted_foreground.into()),
-            font_style: Some(FontStyle::Italic),
             ..Default::default()
         },
         SyntaxKind::EmphasisMarker => HighlightStyle {
             color: Some(markdown_style.muted_foreground.into()),
             ..Default::default()
         },
-        SyntaxKind::EmphasisText => HighlightStyle {
-            font_style: Some(FontStyle::Italic),
-            ..Default::default()
-        },
-        SyntaxKind::StrongText => HighlightStyle {
-            font_weight: Some(FontWeight::BOLD),
-            ..Default::default()
-        },
+        SyntaxKind::EmphasisText | SyntaxKind::StrongText => HighlightStyle::default(),
     }
-}
-
-fn is_inline_hidden_kind(kind: SyntaxKind) -> bool {
-    matches!(
-        kind,
-        SyntaxKind::HeadingMarker
-            | SyntaxKind::QuoteMarker
-            | SyntaxKind::InlineCodeMarker
-            | SyntaxKind::EmphasisMarker
-            | SyntaxKind::CodeFence
-            | SyntaxKind::LinkTextDelimiter
-            | SyntaxKind::LinkUrlDelimiter
-            | SyntaxKind::LinkUrl
-    )
-}
-
-fn merged_hidden_ranges(source: &str, spans: &[SyntaxSpan]) -> Vec<Range<usize>> {
-    let source_len = source.len();
-    let mut hidden = spans
-        .iter()
-        .filter(|span| is_inline_hidden_kind(span.kind))
-        .filter_map(|span| {
-            let start = floor_char_boundary(source, span.range.start.min(source_len));
-            let end = ceil_char_boundary(source, span.range.end.min(source_len));
-            (start < end).then_some(start..end)
-        })
-        .collect::<Vec<_>>();
-    if hidden.is_empty() {
-        return hidden;
-    }
-
-    hidden.sort_by_key(|r| (r.start, r.end));
-    let mut merged = Vec::with_capacity(hidden.len());
-    let mut current = hidden[0].clone();
-
-    for range in hidden.into_iter().skip(1) {
-        if range.start <= current.end {
-            current.end = current.end.max(range.end);
-        } else {
-            merged.push(current);
-            current = range;
-        }
-    }
-    merged.push(current);
-    merged
-}
-
-fn floor_char_boundary(text: &str, mut index: usize) -> usize {
-    index = index.min(text.len());
-    while index > 0 && !text.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
-}
-
-fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
-    index = index.min(text.len());
-    while index < text.len() && !text.is_char_boundary(index) {
-        index += 1;
-    }
-    index
 }
 
 fn pop_last_char(s: &mut String) {
@@ -1949,7 +1802,6 @@ fn sanitize_highlights(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::syntax::markdown_spans;
 
     #[test]
     fn find_matches_ascii_case_insensitive() {
@@ -1983,28 +1835,25 @@ mod tests {
     }
 
     #[test]
-    fn display_projection_removes_inline_markers_without_spacing_artifacts() {
-        let source = "2. **bold** there";
-        let spans = markdown_spans(source);
-        let projection = DisplayProjection::from_source(source, &spans);
-        assert_eq!(projection.display_text, "2. bold there");
+    fn display_projection_preserves_all_markdown_source() {
+        let source = "# Title\n2. **bold** [link](https://example.com)";
+        let projection = DisplayProjection::from_source(source);
+        assert_eq!(projection.display_text, source);
     }
 
     #[test]
-    fn display_projection_hides_heading_marker_and_following_space() {
+    fn display_projection_preserves_heading_marker_and_following_space() {
         let source = "# Hi";
-        let spans = markdown_spans(source);
-        let projection = DisplayProjection::from_source(source, &spans);
-        assert_eq!(projection.display_text, "Hi");
+        let projection = DisplayProjection::from_source(source);
+        assert_eq!(projection.display_text, source);
     }
 
     #[test]
-    fn display_projection_maps_link_end_after_hidden_target() {
+    fn display_projection_maps_link_end_to_source_end() {
         let source = "![cola-2.png](<assets/cola-2.png>)";
-        let spans = markdown_spans(source);
-        let projection = DisplayProjection::from_source(source, &spans);
+        let projection = DisplayProjection::from_source(source);
 
-        assert_eq!(projection.display_text, "!cola-2.png");
+        assert_eq!(projection.display_text, source);
         assert_eq!(
             projection.display_to_source_byte(projection.display_text.len()),
             source.len()
@@ -2012,42 +1861,20 @@ mod tests {
     }
 
     #[test]
-    fn display_projection_maps_link_boundary_to_following_source_text() {
+    fn display_projection_maps_each_source_byte_identically() {
         let source = "[Google](https://google.com) next";
-        let spans = markdown_spans(source);
-        let projection = DisplayProjection::from_source(source, &spans);
-        let display_boundary = "Google".len();
-        let source_boundary = source.find(" next").expect("trailing text");
+        let projection = DisplayProjection::from_source(source);
 
-        assert_eq!(projection.display_text, "Google next");
-        assert_eq!(
-            projection.display_to_source_byte(display_boundary),
-            source_boundary
-        );
+        for byte in 0..=source.len() {
+            assert_eq!(projection.source_to_display_byte(byte), byte);
+            assert_eq!(projection.display_to_source_byte(byte), byte);
+        }
     }
 
     #[test]
-    fn display_projection_tolerates_stale_utf8_hidden_range() {
-        let source = "a中b";
-        let spans = vec![SyntaxSpan {
-            // Deliberately points into the middle of the 3-byte UTF-8 encoding of `中`.
-            range: 2..3,
-            kind: SyntaxKind::EmphasisMarker,
-        }];
-
-        let projection = DisplayProjection::from_source(source, &spans);
-        assert_eq!(projection.display_text, "ab");
-    }
-
-    #[test]
-    fn display_projection_ignores_stale_range_beyond_source() {
-        let source = "short";
-        let spans = vec![SyntaxSpan {
-            range: 100..120,
-            kind: SyntaxKind::EmphasisMarker,
-        }];
-
-        let projection = DisplayProjection::from_source(source, &spans);
+    fn display_projection_keeps_utf8_source_intact() {
+        let source = "# 中文😀";
+        let projection = DisplayProjection::from_source(source);
         assert_eq!(projection.display_text, source);
     }
 
