@@ -1,12 +1,18 @@
 use std::ops::Range;
 
-/// Represents a single edit operation that can be undone/redone
-#[derive(Clone)]
+/// One primitive text mutation inside an undoable edit transaction.
+#[derive(Clone, Debug)]
+pub enum EditChange {
+    Insert { at: usize, text: String },
+    Delete { at: usize, text: String },
+}
+
+/// Represents a single edit transaction that can be undone/redone.
+///
+/// Only the changed text is retained; the full document is never snapshotted.
+#[derive(Clone, Debug)]
 pub struct EditOperation {
-    /// Full text before the edit
-    pub old_text: String,
-    /// Full text after the edit
-    pub new_text: String,
+    pub changes: Vec<EditChange>,
     /// Cursor position before the edit
     pub old_cursor: usize,
     /// Cursor position after the edit
@@ -50,7 +56,7 @@ impl UndoHistory {
         self.redo_stack.clear();
 
         // Enforce history limit
-        while self.undo_stack.len() > self.max_history {
+        if self.undo_stack.len() > self.max_history {
             self.undo_stack.remove(0);
         }
     }
@@ -59,8 +65,9 @@ impl UndoHistory {
     /// Returns the operation if available
     pub fn undo(&mut self) -> Option<EditOperation> {
         if let Some(op) = self.undo_stack.pop() {
-            self.redo_stack.push(op.clone());
-            Some(op)
+            let result = op.clone();
+            self.redo_stack.push(op);
+            Some(result)
         } else {
             None
         }
@@ -70,8 +77,9 @@ impl UndoHistory {
     /// Returns the operation if available
     pub fn redo(&mut self) -> Option<EditOperation> {
         if let Some(op) = self.redo_stack.pop() {
-            self.undo_stack.push(op.clone());
-            Some(op)
+            let result = op.clone();
+            self.undo_stack.push(op);
+            Some(result)
         } else {
             None
         }

@@ -4,7 +4,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
-use crate::model::undo::{EditOperation, UndoHistory};
+use crate::model::undo::{EditChange, EditOperation, UndoHistory};
 
 #[derive(Clone, Debug)]
 pub struct EditDelta {
@@ -39,7 +39,7 @@ pub struct DocumentState {
 /// Temporary state captured before an edit for undo history
 #[derive(Clone)]
 struct PendingEdit {
-    old_text: String,
+    changes: Vec<EditChange>,
     old_cursor: usize,
     old_selection: Option<Range<usize>>,
 }
@@ -144,6 +144,16 @@ impl DocumentState {
         let clamped = char_idx.min(self.rope.len_chars());
         let start_byte = self.rope.char_to_byte(clamped);
         self.rope.insert(clamped, text);
+
+        if !text.is_empty() {
+            if let Some(pending) = self.pending_edit.as_mut() {
+                pending.changes.push(EditChange::Insert {
+                    at: clamped,
+                    text: text.to_owned(),
+                });
+            }
+        }
+
         let new_end_char = clamped.saturating_add(text.chars().count());
         let new_end_byte = start_byte.saturating_add(text.len());
         self.bump_revision();
@@ -168,7 +178,16 @@ impl DocumentState {
         let old_end_char = range.end;
         let start_byte = self.rope.char_to_byte(range.start);
         let old_end_byte = self.rope.char_to_byte(range.end);
+        let deleted_text = self.rope.slice(range.clone()).to_string();
         self.rope.remove(range);
+
+        if let Some(pending) = self.pending_edit.as_mut() {
+            pending.changes.push(EditChange::Delete {
+                at: start_char,
+                text: deleted_text,
+            });
+        }
+
         self.bump_revision();
         self.dirty = true;
         self.last_edit = Some(EditDelta {
@@ -251,7 +270,7 @@ impl DocumentState {
     /// Begin recording an edit operation - call before making changes
     pub fn begin_edit(&mut self) {
         self.pending_edit = Some(PendingEdit {
-            old_text: self.text(),
+            changes: Vec::new(),
             old_cursor: self.cursor,
             old_selection: self.selection.clone(),
         });
@@ -260,9 +279,12 @@ impl DocumentState {
     /// Commit the pending edit to history - call after making changes
     pub fn commit_edit(&mut self) {
         if let Some(pending) = self.pending_edit.take() {
+            if pending.changes.is_empty() {
+                return;
+            }
+
             let op = EditOperation {
-                old_text: pending.old_text,
-                new_text: self.text(),
+                changes: pending.changes,
                 old_cursor: pending.old_cursor,
                 new_cursor: self.cursor,
                 old_selection: pending.old_selection,
@@ -275,7 +297,19 @@ impl DocumentState {
     /// Undo the last edit operation
     pub fn undo(&mut self) -> bool {
         if let Some(op) = self.undo_history.undo() {
-            self.rope = Rope::from_str(&op.old_text);
+            for change in op.changes.iter().rev() {
+                match change {
+                    EditChange::Insert { at, text } => {
+                        let end = at.saturating_add(text.chars().count());
+                        if *at < end && end <= self.rope.len_chars() {
+                            self.rope.remove(*at..end);
+                        }
+                    }
+                    EditChange::Delete { at, text } => {
+                        self.rope.insert((*at).min(self.rope.len_chars()), text);
+                    }
+                }
+            }
             self.cursor = op.old_cursor.min(self.rope.len_chars());
             self.selection = op.old_selection;
             self.selection_anchor = self.selection.as_ref().map(|r| {
@@ -294,7 +328,19 @@ impl DocumentState {
     /// Redo the last undone operation
     pub fn redo(&mut self) -> bool {
         if let Some(op) = self.undo_history.redo() {
-            self.rope = Rope::from_str(&op.new_text);
+            for change in &op.changes {
+                match change {
+                    EditChange::Insert { at, text } => {
+                        self.rope.insert((*at).min(self.rope.len_chars()), text);
+                    }
+                    EditChange::Delete { at, text } => {
+                        let end = at.saturating_add(text.chars().count());
+                        if *at < end && end <= self.rope.len_chars() {
+                            self.rope.remove(*at..end);
+                        }
+                    }
+                }
+            }
             self.cursor = op.new_cursor.min(self.rope.len_chars());
             self.selection = op.new_selection;
             self.selection_anchor = self.selection.as_ref().map(|r| {
@@ -348,5 +394,46 @@ mod selection_tests {
         assert_eq!(doc.selection_range(), Some(1..5));
         assert_eq!(doc.selection_anchor, Some(5));
         assert_eq!(doc.cursor, 1);
+    }
+
+    #[test]
+    fn undo_redo_insert_uses_delta_changes() {
+        let mut doc = DocumentState::new_empty();
+        doc.set_text("hello");
+        doc.save_snapshot();
+        doc.clear_undo_history();
+
+        doc.begin_edit();
+        doc.insert(5, " world");
+        doc.cursor = 11;
+        doc.commit_edit();
+
+        assert_eq!(doc.text(), "hello world");
+        assert!(doc.undo());
+        assert_eq!(doc.text(), "hello");
+        assert!(doc.redo());
+        assert_eq!(doc.text(), "hello world");
+    }
+
+    #[test]
+    fn undo_redo_replacement_restores_selection_text() {
+        let mut doc = DocumentState::new_empty();
+        doc.set_text("hello world");
+        doc.save_snapshot();
+        doc.clear_undo_history();
+        doc.set_selection(6, 11);
+
+        doc.begin_edit();
+        doc.delete_selection();
+        let at = doc.cursor;
+        doc.insert(at, "Aster");
+        doc.cursor = at + 5;
+        doc.commit_edit();
+
+        assert_eq!(doc.text(), "hello Aster");
+        assert!(doc.undo());
+        assert_eq!(doc.text(), "hello world");
+        assert!(doc.redo());
+        assert_eq!(doc.text(), "hello Aster");
     }
 }
