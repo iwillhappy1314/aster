@@ -26,6 +26,7 @@ use gpui_gfm::{
     MarkdownCache, MarkdownRenderOptions, MarkdownTheme, render_markdown_blocks_cached,
 };
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -330,13 +331,13 @@ impl RootView {
         }
 
         let document_path = self.document.read(cx).path.clone();
-        // ExternalPaths already represents paths supplied by the platform drag payload.
-        // Avoid metadata checks such as is_file(): they can fail for dropped paths before
-        // macOS has granted normal filesystem metadata access to the process.
         let snippets = paths
             .paths()
             .iter()
-            .map(|path| markdown_for_dropped_file(path, document_path.as_ref()))
+            .map(|path| {
+                let stored_path = store_dropped_file(path, document_path.as_ref());
+                markdown_for_dropped_file(&stored_path, document_path.as_ref())
+            })
             .collect::<Vec<_>>();
 
         if snippets.is_empty() {
@@ -467,7 +468,12 @@ impl RootView {
 fn is_markdown_path(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "md" | "markdown" | "mdown" | "mkd"))
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "md" | "markdown" | "mdown" | "mkd"
+            )
+        })
 }
 
 fn is_image_path(path: &Path) -> bool {
@@ -491,6 +497,61 @@ fn is_image_path(path: &Path) -> bool {
                     | "ico"
             )
         })
+}
+
+fn store_dropped_file(path: &Path, document_path: Option<&Utf8PathBuf>) -> PathBuf {
+    let Some(document_dir) = document_path.and_then(|path| path.parent()) else {
+        return path.to_path_buf();
+    };
+    let Some(file_name) = path.file_name().map(|name| name.to_string_lossy().into_owned()) else {
+        return path.to_path_buf();
+    };
+
+    let assets_dir = document_dir.as_std_path().join("assets");
+
+    // A file already inside this document's assets folder can be referenced directly.
+    if path.parent().is_some_and(|parent| parent == assets_dir.as_path()) {
+        return path.to_path_buf();
+    }
+
+    if fs::create_dir_all(&assets_dir).is_err() {
+        return path.to_path_buf();
+    }
+
+    let destination = unique_asset_path(&assets_dir, &file_name);
+    match fs::copy(path, &destination) {
+        Ok(_) => destination,
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+fn unique_asset_path(assets_dir: &Path, file_name: &str) -> PathBuf {
+    let original = assets_dir.join(file_name);
+    if !original.exists() {
+        return original;
+    }
+
+    let file_path = Path::new(file_name);
+    let stem = file_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("file");
+    let extension = file_path.extension().and_then(|ext| ext.to_str());
+
+    for index in 2u32.. {
+        let candidate_name = match extension {
+            Some(extension) if !extension.is_empty() => {
+                format!("{stem}-{index}.{extension}")
+            }
+            _ => format!("{stem}-{index}"),
+        };
+        let candidate = assets_dir.join(candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    unreachable!("asset suffix search is unbounded")
 }
 
 fn markdown_for_dropped_file(path: &Path, document_path: Option<&Utf8PathBuf>) -> String {
