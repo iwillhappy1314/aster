@@ -17,15 +17,17 @@ use crate::ui::theme::Theme;
 use camino::Utf8PathBuf;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, Bounds, Context, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ParentElement, Render, ScrollHandle, StatefulInteractiveElement, Styled,
-    Window, canvas, div, fill, point, px, size,
+    App, Bounds, Context, Entity, ExternalPaths, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, MouseMoveEvent, ParentElement, Render, ScrollHandle,
+    StatefulInteractiveElement, Styled, Window, canvas, div, fill, point, px, size,
 };
 use gpui_component::notification::NotificationList;
 use gpui_gfm::{
     MarkdownCache, MarkdownRenderOptions, MarkdownTheme, render_markdown_blocks_cached,
 };
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const INLINE_SYNC_PARSE_MAX_BYTES: usize = 64 * 1024;
@@ -315,6 +317,51 @@ impl RootView {
         self.open_path(&path, window, cx);
     }
 
+    fn handle_dropped_paths(
+        &mut self,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(markdown_path) = paths.paths().iter().find(|path| is_markdown_path(path)) {
+            if let Ok(path) = Utf8PathBuf::try_from(markdown_path.clone()) {
+                self.action_open_path(path, window, cx);
+            }
+            return;
+        }
+
+        let document_path = self.document.read(cx).path.clone();
+        let snippets = paths
+            .paths()
+            .iter()
+            .map(|path| {
+                let stored_path = store_dropped_file(path, document_path.as_ref());
+                markdown_for_dropped_file(&stored_path, document_path.as_ref())
+            })
+            .collect::<Vec<_>>();
+
+        if snippets.is_empty() {
+            return;
+        }
+
+        let insertion = snippets.join("\n");
+        let _ = self.document.update(cx, |doc, cx| {
+            doc.begin_edit();
+            doc.delete_selection();
+            let insert_at = doc.cursor;
+            doc.insert(insert_at, &insertion);
+            doc.cursor = insert_at.saturating_add(insertion.chars().count());
+            doc.commit_edit();
+            cx.notify();
+        });
+        let _ = self
+            .editor_view
+            .update(cx, |editor, cx| editor.reveal_cursor(cx));
+        // The preview is rendered by RootView rather than EditorView, so ensure a drop
+        // immediately repaints both modes and refreshes the cached document revision.
+        cx.notify();
+    }
+
     pub fn confirm_before_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let can_quit =
             self.confirm_can_discard_changes(window, cx, "Save changes before quitting?");
@@ -415,6 +462,200 @@ impl RootView {
         let _ = self.file_explorer_view.update(cx, |view, cx| {
             view.set_active_outline(active, cx);
         });
+    }
+}
+
+fn is_markdown_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "md" | "markdown" | "mdown" | "mkd"
+            )
+        })
+}
+
+fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png"
+                    | "jpg"
+                    | "jpeg"
+                    | "gif"
+                    | "webp"
+                    | "bmp"
+                    | "tif"
+                    | "tiff"
+                    | "heic"
+                    | "heif"
+                    | "svg"
+                    | "avif"
+                    | "ico"
+            )
+        })
+}
+
+fn store_dropped_file(path: &Path, document_path: Option<&Utf8PathBuf>) -> PathBuf {
+    let Some(document_dir) = document_path.and_then(|path| path.parent()) else {
+        return path.to_path_buf();
+    };
+    let Some(file_name) = path.file_name().map(|name| name.to_string_lossy().into_owned()) else {
+        return path.to_path_buf();
+    };
+
+    let assets_dir = document_dir.as_std_path().join("assets");
+
+    // A file already inside this document's assets folder can be referenced directly.
+    if path.parent().is_some_and(|parent| parent == assets_dir.as_path()) {
+        return path.to_path_buf();
+    }
+
+    if fs::create_dir_all(&assets_dir).is_err() {
+        return path.to_path_buf();
+    }
+
+    let destination = unique_asset_path(&assets_dir, &file_name);
+    match fs::copy(path, &destination) {
+        Ok(_) => destination,
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+fn unique_asset_path(assets_dir: &Path, file_name: &str) -> PathBuf {
+    let original = assets_dir.join(file_name);
+    if !original.exists() {
+        return original;
+    }
+
+    let file_path = Path::new(file_name);
+    let stem = file_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("file");
+    let extension = file_path.extension().and_then(|ext| ext.to_str());
+
+    for index in 2u32.. {
+        let candidate_name = match extension {
+            Some(extension) if !extension.is_empty() => {
+                format!("{stem}-{index}.{extension}")
+            }
+            _ => format!("{stem}-{index}"),
+        };
+        let candidate = assets_dir.join(candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    unreachable!("asset suffix search is unbounded")
+}
+
+fn markdown_for_dropped_file(path: &Path, document_path: Option<&Utf8PathBuf>) -> String {
+    let label = escape_markdown_label(
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file"),
+    );
+    let target = markdown_drop_target(path, document_path);
+
+    if is_image_path(path) {
+        format!("![{label}](<{target}>)")
+    } else {
+        format!("[{label}](<{target}>)")
+    }
+}
+
+fn markdown_drop_target(path: &Path, document_path: Option<&Utf8PathBuf>) -> String {
+    let rendered_path = document_path
+        .and_then(|document_path| document_path.parent())
+        .and_then(|base_dir| relative_path_from(base_dir.as_std_path(), path))
+        .unwrap_or_else(|| path.to_path_buf());
+
+    rendered_path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .replace('>', "%3E")
+}
+
+fn relative_path_from(base_dir: &Path, target: &Path) -> Option<PathBuf> {
+    if base_dir.is_absolute() != target.is_absolute() {
+        return None;
+    }
+
+    let base = base_dir.components().collect::<Vec<_>>();
+    let target = target.components().collect::<Vec<_>>();
+    let common = base
+        .iter()
+        .zip(target.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+
+    if common == 0 {
+        return None;
+    }
+
+    let mut relative = PathBuf::new();
+    for _ in common..base.len() {
+        relative.push("..");
+    }
+    for component in target.iter().skip(common) {
+        relative.push(component.as_os_str());
+    }
+
+    Some(relative)
+}
+
+fn escape_markdown_label(label: &str) -> String {
+    label
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+}
+
+fn preview_image_source(source: &str, document_dir: &Path) -> gpui::ImageSource {
+    if let Ok(url) = url::Url::parse(source) {
+        if url.scheme() == "file" {
+            if let Ok(path) = url.to_file_path() {
+                return path.into();
+            }
+        }
+        return source.to_string().into();
+    }
+
+    if source.starts_with("//") {
+        return source.to_string().into();
+    }
+
+    let source_path = Path::new(source);
+    let resolved = if source_path.is_absolute() {
+        source_path.to_path_buf()
+    } else {
+        document_dir.join(source_path)
+    };
+    resolved.into()
+}
+
+fn open_preview_link(target: &str, document_dir: &Path, cx: &mut App) {
+    if target.starts_with('#') || target.starts_with("//") || url::Url::parse(target).is_ok() {
+        cx.open_url(target);
+        return;
+    }
+
+    let target_path = Path::new(target);
+    let resolved = if target_path.is_absolute() {
+        target_path.to_path_buf()
+    } else {
+        document_dir.join(target_path)
+    };
+
+    if let Ok(file_url) = url::Url::from_file_path(resolved) {
+        cx.open_url(file_url.as_str());
+    } else {
+        cx.open_url(target);
     }
 }
 
@@ -659,6 +900,9 @@ impl Render for RootView {
             .bg(Theme::bg())
             .text_color(Theme::text())
             .size_full()
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.handle_dropped_paths(paths, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &NewFile, window, cx| {
                 this.action_new_file(window, cx);
             }))
@@ -784,10 +1028,29 @@ impl Render for RootView {
                             code_font_family: "Menlo".into(),
                             is_dark: Theme::is_dark(),
                         };
-                        let markdown_options = self
+                        let mut markdown_options = self
                             .preview_markdown_options
                             .clone()
                             .with_theme(markdown_theme);
+                        if let Some(document_dir) = doc_path
+                            .as_ref()
+                            .and_then(|path| path.parent())
+                            .map(|path| path.as_std_path().to_path_buf())
+                        {
+                            let image_base = document_dir.clone();
+                            markdown_options = markdown_options.with_image_loader(
+                                std::sync::Arc::new(move |source| {
+                                    preview_image_source(source, &image_base)
+                                }),
+                            );
+
+                            let link_base = document_dir;
+                            markdown_options = markdown_options.with_on_link(
+                                std::sync::Arc::new(move |target, _window, cx| {
+                                    open_preview_link(target, &link_base, cx);
+                                }),
+                            );
+                        }
                         let markdown_blocks = render_markdown_blocks_cached(
                             &doc_text,
                             &markdown_options,
