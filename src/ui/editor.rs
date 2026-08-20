@@ -8,11 +8,12 @@ use crate::ui::text_utils::ellipsize_chars;
 use crate::ui::theme::{MarkdownStyle, Theme};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontStyle,
-    FontWeight, HighlightStyle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render, ScrollHandle,
-    StatefulInteractiveElement, Styled, UnderlineStyle, Window, anchored, canvas,
-    combine_highlights, deferred, div, fill, point, px, size,
+    AnyElement, App, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, HighlightStyle,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    ParentElement, Pixels, Point, Render, ScrollHandle, StatefulInteractiveElement, Styled,
+    UTF16Selection, UnderlineStyle, Window, anchored, canvas, combine_highlights, deferred, div,
+    fill, point, px, size,
 };
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
@@ -200,6 +201,14 @@ pub struct EditorView {
     scroll_indicator_revision: u64,
     /// Cached text with revision to avoid repeated rope-to-string conversions
     cached_text: Option<(u64, String)>,
+    /// Character range currently owned by the platform IME composition.
+    marked_range: Option<Range<usize>>,
+    /// Keeps the full IME composition as one undo transaction.
+    ime_edit_active: bool,
+    /// Latest laid-out editor text used to position the platform IME candidate window.
+    input_layout: Option<EditorTextLayout>,
+    /// Latest source/display mapping paired with `input_layout`.
+    input_projection: Option<Arc<DisplayProjection>>,
     /// Find panel state.
     search_active: bool,
     search_query: String,
@@ -230,6 +239,10 @@ impl EditorView {
             scroll_indicator_visible: false,
             scroll_indicator_revision: 0,
             cached_text: None,
+            marked_range: None,
+            ime_edit_active: false,
+            input_layout: None,
+            input_projection: None,
             search_active: false,
             search_query: String::new(),
             search_current_match: 0,
@@ -512,6 +525,283 @@ impl EditorView {
     }
 }
 
+fn char_index_to_utf16(doc: &DocumentState, char_index: usize) -> usize {
+    doc.rope
+        .chars()
+        .take(char_index.min(doc.len_chars()))
+        .map(char::len_utf16)
+        .sum()
+}
+
+fn utf16_to_char_index(doc: &DocumentState, utf16_offset: usize) -> usize {
+    let mut utf16_count = 0usize;
+    let mut char_count = 0usize;
+
+    for ch in doc.rope.chars() {
+        if utf16_count >= utf16_offset {
+            break;
+        }
+
+        let next = utf16_count.saturating_add(ch.len_utf16());
+        if next > utf16_offset {
+            break;
+        }
+
+        utf16_count = next;
+        char_count += 1;
+    }
+
+    char_count
+}
+
+fn char_range_to_utf16(doc: &DocumentState, range: &Range<usize>) -> Range<usize> {
+    char_index_to_utf16(doc, range.start)..char_index_to_utf16(doc, range.end)
+}
+
+fn utf16_range_to_chars(doc: &DocumentState, range: &Range<usize>) -> Range<usize> {
+    let start = utf16_to_char_index(doc, range.start);
+    let end = utf16_to_char_index(doc, range.end).max(start);
+    start..end
+}
+
+fn utf16_offset_to_char_in_str(text: &str, utf16_offset: usize) -> usize {
+    let mut utf16_count = 0usize;
+    let mut char_count = 0usize;
+
+    for ch in text.chars() {
+        if utf16_count >= utf16_offset {
+            break;
+        }
+
+        let next = utf16_count.saturating_add(ch.len_utf16());
+        if next > utf16_offset {
+            break;
+        }
+
+        utf16_count = next;
+        char_count += 1;
+    }
+
+    char_count
+}
+
+impl EntityInputHandler for EditorView {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let doc = self.document.read(cx);
+        let range = utf16_range_to_chars(&doc, &range_utf16);
+        adjusted_range.replace(char_range_to_utf16(&doc, &range));
+        Some(doc.slice_chars(range))
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let doc = self.document.read(cx);
+        let range = doc
+            .selection_range()
+            .unwrap_or_else(|| doc.cursor..doc.cursor);
+        let reversed = doc
+            .selection_anchor
+            .is_some_and(|anchor| doc.selection.is_some() && doc.cursor < anchor);
+
+        Some(UTF16Selection {
+            range: char_range_to_utf16(&doc, &range),
+            reversed,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        let doc = self.document.read(cx);
+        self.marked_range
+            .as_ref()
+            .map(|range| char_range_to_utf16(&doc, range))
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.ime_edit_active {
+            let _ = self.document.update(cx, |doc, cx_doc| {
+                doc.commit_edit();
+                cx_doc.notify();
+            });
+        }
+        self.ime_edit_active = false;
+        self.marked_range = None;
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = {
+            let doc = self.document.read(cx);
+            range_utf16
+                .as_ref()
+                .map(|range| utf16_range_to_chars(&doc, range))
+                .or_else(|| self.marked_range.clone())
+                .or_else(|| doc.selection_range())
+                .unwrap_or_else(|| doc.cursor..doc.cursor)
+        };
+        let continuing_ime = self.ime_edit_active;
+
+        let _ = self.document.update(cx, |doc, cx_doc| {
+            if !continuing_ime {
+                doc.begin_edit();
+            }
+
+            let start = target.start.min(doc.len_chars());
+            let end = target.end.min(doc.len_chars()).max(start);
+            if start < end {
+                doc.delete_range(start..end);
+            }
+            if !text.is_empty() {
+                doc.insert(start, text);
+            }
+            doc.set_cursor(start.saturating_add(text.chars().count()));
+            doc.commit_edit();
+            cx_doc.notify();
+        });
+
+        self.ime_edit_active = false;
+        self.marked_range = None;
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range_utf16: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = {
+            let doc = self.document.read(cx);
+            range_utf16
+                .as_ref()
+                .map(|range| utf16_range_to_chars(&doc, range))
+                .or_else(|| self.marked_range.clone())
+                .or_else(|| doc.selection_range())
+                .unwrap_or_else(|| doc.cursor..doc.cursor)
+        };
+
+        let inserted_chars = new_text.chars().count();
+        let relative_selection = new_selected_range_utf16
+            .as_ref()
+            .map(|range| {
+                let start = utf16_offset_to_char_in_str(new_text, range.start);
+                let end = utf16_offset_to_char_in_str(new_text, range.end).max(start);
+                start..end
+            })
+            .unwrap_or(inserted_chars..inserted_chars);
+        let start_new_transaction = !self.ime_edit_active;
+        let mut new_marked_range = None;
+
+        let _ = self.document.update(cx, |doc, cx_doc| {
+            if start_new_transaction {
+                doc.begin_edit();
+            }
+
+            let start = target.start.min(doc.len_chars());
+            let end = target.end.min(doc.len_chars()).max(start);
+            if start < end {
+                doc.delete_range(start..end);
+            }
+            if !new_text.is_empty() {
+                doc.insert(start, new_text);
+                new_marked_range = Some(start..start.saturating_add(inserted_chars));
+            }
+
+            let selection_start = start
+                .saturating_add(relative_selection.start.min(inserted_chars))
+                .min(doc.len_chars());
+            let selection_end = start
+                .saturating_add(relative_selection.end.min(inserted_chars))
+                .min(doc.len_chars());
+            if selection_start == selection_end {
+                doc.set_cursor(selection_end);
+            } else {
+                doc.set_selection(selection_start, selection_end);
+            }
+            cx_doc.notify();
+        });
+
+        self.ime_edit_active = true;
+        self.marked_range = new_marked_range;
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        _element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let layout = self.input_layout.as_ref()?;
+        let projection = self.input_projection.as_ref()?;
+        let doc = self.document.read(cx);
+        let range = utf16_range_to_chars(&doc, &range_utf16);
+        let source_byte = doc.char_to_byte(range.end);
+        let display_byte = projection.source_to_display_byte(source_byte);
+        let position = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            layout.position_for_index(display_byte)
+        }))
+        .ok()
+        .flatten()?;
+        let line_height = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            layout.line_height_for_index(display_byte)
+        }))
+        .ok()?;
+        if line_height <= px(0.) {
+            return None;
+        }
+
+        Some(Bounds {
+            origin: position,
+            size: size(px(1.), line_height),
+        })
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let layout = self.input_layout.as_ref()?;
+        let projection = self.input_projection.as_ref()?;
+        let display_byte = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            layout.index_for_position(point)
+        }))
+        .ok()
+        .map(|result| match result {
+            Ok(index) => index,
+            Err(index) => index,
+        })?;
+        let source_byte = projection.display_to_source_byte(display_byte);
+        let doc = self.document.read(cx);
+        let char_index = doc.byte_to_char(source_byte);
+        Some(char_index_to_utf16(&doc, char_index))
+    }
+}
+
 fn source_byte_at_viewport_activation_line(
     scroll_handle: &ScrollHandle,
     text_layout: &EditorTextLayout,
@@ -773,6 +1063,7 @@ impl Render for EditorView {
             self.search_highlights(&text_owned, doc_revision);
         let search_highlights = projection.project_highlights(search_highlights);
         let selection_highlights = projection.project_highlights(self.selection_highlights(&doc));
+        drop(doc);
 
         let syntax_and_search = if search_highlights.is_empty() {
             syntax_highlights
@@ -795,6 +1086,8 @@ impl Render for EditorView {
         );
         let text_layout = editor_text.layout.clone();
         let editor_text_element = editor_text.element;
+        self.input_layout = Some(text_layout.clone());
+        self.input_projection = Some(projection.clone());
         let text_layout_for_sync = text_layout.clone();
         let text_layout_for_caret = text_layout.clone();
         let pending_reveal = self
@@ -808,6 +1101,9 @@ impl Render for EditorView {
         let has_multiple_lines = text_owned.lines().nth(1).is_some();
         let editor_scroll_handle = self.scroll_handle.clone();
         let show_scroll_indicator = self.scroll_indicator_visible;
+        let input_enabled = !self.search_active;
+        let input_focus_handle = focus_handle.clone();
+        let input_entity = cx.entity();
         let context_menu = self
             .context_menu_position
             .map(|position| build_editor_context_menu(position, has_selection, cx.entity()));
@@ -1190,32 +1486,7 @@ impl Render for EditorView {
                                         }
                                         cx_doc.notify();
                                     }
-                                    _ => {
-                                        if let Some(ch) = event
-                                            .keystroke
-                                            .key_char
-                                            .as_ref()
-                                            .and_then(|s| s.chars().next())
-                                        {
-                                            let insert = ch.to_string();
-                                            doc.begin_edit();
-                                            doc.delete_selection();
-                                            doc.insert(doc.cursor, &insert);
-                                            doc.cursor =
-                                                (doc.cursor).saturating_add(insert.chars().count());
-                                            doc.commit_edit();
-                                            cx_doc.notify();
-                                        } else if let Some(raw) = &event.keystroke.key_char {
-                                            if raw == "\n" {
-                                                doc.begin_edit();
-                                                doc.delete_selection();
-                                                doc.insert(doc.cursor, "\n");
-                                                doc.cursor += 1;
-                                                doc.commit_edit();
-                                                cx_doc.notify();
-                                            }
-                                        }
-                                    }
+                                    _ => {}
                                 }
                             });
                         })
@@ -1248,10 +1519,18 @@ impl Render for EditorView {
                                         callback(source_byte, cx);
                                     }
                                 },
-                                move |_bounds: Bounds<_>,
+                                move |bounds: Bounds<_>,
                                       (),
                                       window: &mut Window,
-                                      _cx: &mut App| {
+                                      cx: &mut App| {
+                                    if input_enabled {
+                                        window.handle_input(
+                                            &input_focus_handle,
+                                            ElementInputHandler::new(bounds, input_entity.clone()),
+                                            cx,
+                                        );
+                                    }
+
                                     if !draw_caret {
                                         return;
                                     }
@@ -1676,5 +1955,32 @@ mod tests {
             projection.display_to_source_byte(display_boundary),
             source_boundary
         );
+    }
+
+    #[test]
+    fn utf16_mapping_handles_cjk_and_surrogate_pairs() {
+        let mut doc = DocumentState::new_empty();
+        doc.set_text("A中😀B");
+
+        assert_eq!(char_index_to_utf16(&doc, 0), 0);
+        assert_eq!(char_index_to_utf16(&doc, 1), 1);
+        assert_eq!(char_index_to_utf16(&doc, 2), 2);
+        assert_eq!(char_index_to_utf16(&doc, 3), 4);
+        assert_eq!(char_index_to_utf16(&doc, 4), 5);
+
+        assert_eq!(utf16_to_char_index(&doc, 0), 0);
+        assert_eq!(utf16_to_char_index(&doc, 1), 1);
+        assert_eq!(utf16_to_char_index(&doc, 2), 2);
+        assert_eq!(utf16_to_char_index(&doc, 3), 2);
+        assert_eq!(utf16_to_char_index(&doc, 4), 3);
+        assert_eq!(utf16_to_char_index(&doc, 5), 4);
+    }
+
+    #[test]
+    fn marked_selection_utf16_offsets_are_relative_to_new_text() {
+        assert_eq!(utf16_offset_to_char_in_str("中😀文", 0), 0);
+        assert_eq!(utf16_offset_to_char_in_str("中😀文", 1), 1);
+        assert_eq!(utf16_offset_to_char_in_str("中😀文", 3), 2);
+        assert_eq!(utf16_offset_to_char_in_str("中😀文", 4), 3);
     }
 }
