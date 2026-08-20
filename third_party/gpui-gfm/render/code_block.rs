@@ -1,9 +1,14 @@
 //! Code block rendering.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
+
 use gpui::{
   AnyElement, App, Bounds, ClipboardItem, Element, ElementId, Font, GlobalElementId, Hitbox,
   HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, MouseButton, Pixels,
-  SharedString, StyledText, TextRun, Window, div, fill, point, prelude::*, px,
+  SharedString, StyledText, TextRun, Timer, Window, div, fill, point, prelude::*, px,
 };
 
 use crate::types::CodeBlock;
@@ -14,6 +19,11 @@ use super::selectable_text::SelectableText;
 const CODE_BLOCK_PADDING_X_PX: f32 = 12.0;
 const CODE_BLOCK_PADDING_TOP_PX: f32 = 8.0;
 const CODE_BLOCK_PADDING_BOTTOM_PX: f32 = 8.0;
+const COPY_FEEDBACK_DURATION_SECS: u64 = 2;
+
+static COPY_FEEDBACK: LazyLock<Mutex<HashMap<usize, usize>>> =
+  LazyLock::new(|| Mutex::new(HashMap::new()));
+static COPY_FEEDBACK_GENERATION: AtomicUsize = AtomicUsize::new(1);
 
 // Indentation dots
 const INDENT_DOT_SIZE_PX: f32 = 2.0;
@@ -37,9 +47,13 @@ pub fn render_code_block(
   // Language label
   let lang_label = code.lang.as_deref().unwrap_or("");
 
+  // Reuse the same identity already used by the code block's GPUI elements.
+  // Parsed Markdown is cached, so this remains stable across the refreshes
+  // used to show and clear the lightweight copy feedback.
+  let code_block_id = code as *const CodeBlock as usize;
+
   // Outer container with group for hover-reveal of copy button
-  let container_id: SharedString =
-    format!("md-code-container-{:x}", code as *const CodeBlock as usize).into();
+  let container_id: SharedString = format!("md-code-container-{code_block_id:x}").into();
 
   let mut container = div()
     .id(container_id)
@@ -53,9 +67,10 @@ pub fn render_code_block(
     .overflow_hidden();
 
   // Copy button — positioned inside the code area wrapper (below header)
-  let copy_btn_id: SharedString = format!("md-copy-{:x}", code as *const CodeBlock as usize).into();
+  let copy_btn_id: SharedString = format!("md-copy-{code_block_id:x}").into();
   let clipboard_value = display_value.clone();
   let hover_bg = theme.border;
+  let copied = is_code_block_copied(code_block_id);
 
   let copy_button = div()
     .id(copy_btn_id)
@@ -74,10 +89,24 @@ pub fn render_code_block(
     .opacity(0.0)
     .group_hover("code-block", |s| s.opacity(1.0))
     .hover(move |s| s.bg(hover_bg))
-    .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
       cx.write_to_clipboard(ClipboardItem::new_string(clipboard_value.clone()));
+
+      let generation = mark_code_block_copied(code_block_id);
+      window.refresh();
+
+      window
+        .spawn(cx, async move |cx| {
+          Timer::after(Duration::from_secs(COPY_FEEDBACK_DURATION_SECS)).await;
+          let _ = cx.update(|window, _cx| {
+            if clear_code_block_copied(code_block_id, generation) {
+              window.refresh();
+            }
+          });
+        })
+        .detach();
     })
-    .child("Copy");
+    .child(if copied { "Copied" } else { "Copy" });
 
   // Language header if present
   if !lang_label.is_empty() {
@@ -95,7 +124,7 @@ pub fn render_code_block(
 
   // Code content scrolls horizontally for long lines, but always participates
   // in the page's vertical scrolling rather than creating a nested Y scroller.
-  let code_id: SharedString = format!("md-code-{:x}", code as *const CodeBlock as usize).into();
+  let code_id: SharedString = format!("md-code-{code_block_id:x}").into();
   let code_font = Font {
     family: theme.code_font_family.clone(),
     features: Default::default(),
@@ -146,6 +175,28 @@ pub fn render_code_block(
   let code_wrapper = div().relative().child(code_area).child(copy_button);
 
   container.child(code_wrapper).into_any_element()
+}
+
+fn is_code_block_copied(code_block_id: usize) -> bool {
+  COPY_FEEDBACK.lock().unwrap().contains_key(&code_block_id)
+}
+
+fn mark_code_block_copied(code_block_id: usize) -> usize {
+  let generation = COPY_FEEDBACK_GENERATION.fetch_add(1, Ordering::Relaxed);
+  COPY_FEEDBACK
+    .lock()
+    .unwrap()
+    .insert(code_block_id, generation);
+  generation
+}
+
+fn clear_code_block_copied(code_block_id: usize, generation: usize) -> bool {
+  let mut copied = COPY_FEEDBACK.lock().unwrap();
+  if copied.get(&code_block_id).copied() != Some(generation) {
+    return false;
+  }
+  copied.remove(&code_block_id);
+  true
 }
 
 /// Prepare the display text for a code block.
@@ -429,6 +480,19 @@ mod tests {
     let display = code_block_display_value(&code);
     // Trailing newline stripped, tabs expanded
     assert_eq!(display, "fn main() {\n    println!(\"hello\");\n}");
+  }
+
+  #[test]
+  fn copy_feedback_ignores_stale_generation() {
+    let code_block_id = usize::MAX - 1;
+    let first = mark_code_block_copied(code_block_id);
+    let second = mark_code_block_copied(code_block_id);
+
+    assert!(is_code_block_copied(code_block_id));
+    assert!(!clear_code_block_copied(code_block_id, first));
+    assert!(is_code_block_copied(code_block_id));
+    assert!(clear_code_block_copied(code_block_id, second));
+    assert!(!is_code_block_copied(code_block_id));
   }
 
   // ------ indentation dot tests ------
