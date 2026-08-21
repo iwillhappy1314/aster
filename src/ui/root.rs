@@ -13,7 +13,7 @@ use crate::services::settings::{self, OutlinePosition, Settings};
 use crate::services::tasks::Debouncer;
 use crate::ui::editor::EditorView;
 use crate::ui::file_explorer::FileExplorerView;
-use crate::ui::theme::Theme;
+use crate::ui::theme::{Theme, ThemeName};
 
 use camino::Utf8PathBuf;
 use gpui::prelude::FluentBuilder as _;
@@ -26,8 +26,9 @@ use gpui::{
 };
 use gpui_component::notification::NotificationList;
 use gpui_gfm::{
-    InteractiveScrollbarAxis, InteractiveScrollbarState, MarkdownCache, MarkdownRenderOptions,
-    MarkdownTheme, render_interactive_scrollbar, render_markdown_blocks_cached,
+    CodeSyntaxTheme, InteractiveScrollbarAxis, InteractiveScrollbarState, MarkdownCache,
+    MarkdownRenderOptions, MarkdownTheme, render_interactive_scrollbar,
+    render_markdown_blocks_cached,
 };
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use std::fs;
@@ -1309,6 +1310,11 @@ impl Render for RootView {
                             accent: markdown_style.accent.into(),
                             code_font_family: "Menlo".into(),
                             is_dark: Theme::is_dark(),
+                            code_syntax_theme: match Theme::name() {
+                                ThemeName::AyuLight => CodeSyntaxTheme::AyuLight,
+                                ThemeName::AyuDark => CodeSyntaxTheme::AyuDark,
+                                ThemeName::AyuMirage => CodeSyntaxTheme::AyuMirage,
+                            },
                         };
                         let mut preview_find_color: gpui::Hsla = gpui::rgb(0xffd66b).into();
                         preview_find_color.a = 0.42;

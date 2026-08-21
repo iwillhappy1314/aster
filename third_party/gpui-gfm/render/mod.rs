@@ -431,6 +431,18 @@ pub fn apply_selection_to_runs(
   updated
 }
 
+/// Syntax palettes available to Markdown code blocks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CodeSyntaxTheme {
+  /// The light Ayu syntax palette.
+  #[default]
+  AyuLight,
+  /// The dark Ayu syntax palette.
+  AyuDark,
+  /// The Ayu Mirage syntax palette.
+  AyuMirage,
+}
+
 /// Theme colors for markdown rendering.
 ///
 /// Provide sensible defaults so rendering works out of the box without
@@ -448,6 +460,8 @@ pub struct MarkdownTheme {
   pub code_font_family: SharedString,
   /// Whether this is a dark theme (used for dark/light image URL selection).
   pub is_dark: bool,
+  /// Syntax palette applied to fenced code blocks.
+  pub code_syntax_theme: CodeSyntaxTheme,
 }
 
 impl Default for MarkdownTheme {
@@ -504,6 +518,7 @@ impl MarkdownTheme {
       },
       code_font_family: "Menlo".into(),
       is_dark: true,
+      code_syntax_theme: CodeSyntaxTheme::AyuDark,
     }
   }
 
@@ -554,6 +569,7 @@ impl MarkdownTheme {
       },
       code_font_family: "Menlo".into(),
       is_dark: false,
+      code_syntax_theme: CodeSyntaxTheme::AyuLight,
     }
   }
 }

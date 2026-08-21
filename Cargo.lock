@@ -267,7 +267,6 @@ dependencies = [
  "ropey 1.6.1",
  "serde",
  "serde_json",
- "syntect",
  "tempfile",
  "thiserror 2.0.17",
  "toml 0.9.10+spec-1.1.0",
@@ -2554,6 +2553,7 @@ version = "0.2.0"
 dependencies = [
  "comrak",
  "gpui",
+ "syntect",
  "tl",
 ]
 

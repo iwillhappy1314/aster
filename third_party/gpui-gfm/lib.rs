@@ -29,8 +29,9 @@ pub use html::{render_html, render_markdown_html, render_markdown_html_document}
 pub use parse::{parse_gfm, parse_markdown};
 #[cfg(feature = "gpui-render")]
 pub use render::{
-  DetailsState, ImageLoaderFn, InteractiveScrollbarAxis, InteractiveScrollbarState, ListItemView,
-  MarkdownRenderOptions, MarkdownTheme, RenderOverrides, RenderedMarkdownBlocks,
+  CodeSyntaxTheme, DetailsState, ImageLoaderFn, InteractiveScrollbarAxis,
+  InteractiveScrollbarState, ListItemView, MarkdownRenderOptions, MarkdownTheme,
+  RenderOverrides, RenderedMarkdownBlocks,
   render_interactive_scrollbar, render_markdown, render_markdown_blocks_cached,
   render_markdown_cached, render_parsed_markdown, render_parsed_markdown_blocks,
 };
