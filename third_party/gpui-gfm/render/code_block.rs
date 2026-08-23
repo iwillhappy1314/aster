@@ -81,59 +81,64 @@ pub fn render_code_block(
     .bg(theme.code_background)
     .overflow_hidden();
 
-  // Copy button — positioned inside the code area wrapper (below header)
+  // Build the copy button where it is needed: in the language header when one
+  // exists, or in the code area for language-less fenced blocks.
   let copy_btn_id: SharedString = format!("md-copy-{code_block_id:x}").into();
-  let clipboard_value = display_value.clone();
   let hover_bg = theme.border;
   let copied = is_code_block_copied(code_block_id);
 
-  let copy_button = div()
-    .id(copy_btn_id)
-    .absolute()
-    .top_2()
-    .right_2()
-    .px_2()
-    .py(px(2.0))
-    .rounded_md()
-    .text_xs()
-    .text_color(theme.muted_foreground)
-    .bg(theme.code_background)
-    .border_1()
-    .border_color(theme.border)
-    .cursor_pointer()
-    .opacity(0.0)
-    .group_hover("code-block", |s| s.opacity(1.0))
-    .hover(move |s| s.bg(hover_bg))
-    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-      cx.write_to_clipboard(ClipboardItem::new_string(clipboard_value.clone()));
+  let copy_button = || {
+    let clipboard_value = display_value.clone();
 
-      let generation = mark_code_block_copied(code_block_id);
-      window.refresh();
+    div()
+      .id(copy_btn_id.clone())
+      .px_2()
+      .py(px(2.0))
+      .rounded_md()
+      .text_xs()
+      .text_color(theme.muted_foreground)
+      .bg(theme.code_background)
+      .border_1()
+      .border_color(theme.border)
+      .cursor_pointer()
+      .opacity(0.0)
+      .group_hover("code-block", |s| s.opacity(1.0))
+      .hover(move |s| s.bg(hover_bg))
+      .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string(clipboard_value.clone()));
 
-      window
-        .spawn(cx, async move |cx| {
-          Timer::after(Duration::from_secs(COPY_FEEDBACK_DURATION_SECS)).await;
-          let _ = cx.update(|window, _cx| {
-            if clear_code_block_copied(code_block_id, generation) {
-              window.refresh();
-            }
-          });
-        })
-        .detach();
-    })
-    .child(if copied { "Copied" } else { "Copy" });
+        let generation = mark_code_block_copied(code_block_id);
+        window.refresh();
+
+        window
+          .spawn(cx, async move |cx| {
+            Timer::after(Duration::from_secs(COPY_FEEDBACK_DURATION_SECS)).await;
+            let _ = cx.update(|window, _cx| {
+              if clear_code_block_copied(code_block_id, generation) {
+                window.refresh();
+              }
+            });
+          })
+          .detach();
+      })
+      .child(if copied { "Copied" } else { "Copy" })
+  };
 
   // Language header if present
   if !lang_label.is_empty() {
     container = container.child(
       div()
+        .flex()
+        .items_center()
+        .justify_between()
         .px(px(CODE_BLOCK_PADDING_X_PX))
-        .py_1()
+        .py(px(6.0))
         .text_xs()
         .text_color(theme.muted_foreground)
         .border_b_1()
         .border_color(theme.border)
-        .child(lang_label.to_string()),
+        .child(lang_label.to_string())
+        .child(copy_button()),
     );
   }
 
@@ -207,9 +212,8 @@ pub fn render_code_block(
     );
   }
 
-  // Wrap code area + copy button in a relative container so the button
-  // is positioned relative to the code area (below the header).
-  let code_wrapper = div()
+  // Language-less blocks keep the previous overlaid copy-button placement.
+  let mut code_wrapper = div()
     .relative()
     .w_full()
     .min_w_0()
@@ -219,8 +223,17 @@ pub fn render_code_block(
       scroll_state.scrollbar,
       scroll_state.handle,
       theme.muted_foreground,
-    ))
-    .child(copy_button);
+    ));
+
+  if lang_label.is_empty() {
+    code_wrapper = code_wrapper.child(
+      div()
+        .absolute()
+        .top_2()
+        .right_2()
+        .child(copy_button()),
+    );
+  }
 
   container.child(code_wrapper).into_any_element()
 }
