@@ -45,6 +45,10 @@ const SIDEBAR_DIVIDER_WIDTH: f32 = 1.0;
 const TRAFFIC_LIGHT_SAFE_WIDTH: f32 = 88.0;
 /// Width reserved for each interactive control in the custom title bar.
 const TITLEBAR_CONTROL_WIDTH: f32 = NATIVE_TITLEBAR_HEIGHT;
+/// Maximum width available to a document title inside a full-width tab.
+const DOCUMENT_TAB_TITLE_MAX_WIDTH: f32 = 172.0;
+/// Font size used by document titles in the custom tab bar.
+const DOCUMENT_TAB_TITLE_FONT_SIZE: f32 = 14.0;
 
 #[cfg(target_os = "macos")]
 thread_local! {
@@ -213,6 +217,23 @@ fn document_title(path: Option<&Utf8PathBuf>, is_dirty: bool) -> String {
     let dirty = if is_dirty { " •" } else { "" };
 
     format!("{name}{dirty}")
+}
+
+/// Truncates a document title using the active UI font and appends an ellipsis when required.
+fn truncated_document_title(title: &str, window: &Window) -> String {
+    let text_style = window.text_style();
+    let mut runs = vec![text_style.to_run(title.len())];
+
+    window
+        .text_system()
+        .line_wrapper(text_style.font(), px(DOCUMENT_TAB_TITLE_FONT_SIZE))
+        .truncate_line(
+            title.to_string().into(),
+            px(DOCUMENT_TAB_TITLE_MAX_WIDTH),
+            "…",
+            &mut runs,
+        )
+        .to_string()
 }
 
 /// Owns the independent editor entities and display mode associated with one tab.
@@ -970,6 +991,7 @@ impl RootView {
         outline_position: OutlinePosition,
         has_left_sidebar: bool,
         has_right_sidebar: bool,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let left_inset = if outline_position == OutlinePosition::Left {
@@ -1008,6 +1030,7 @@ impl RootView {
 
         let tabs = tab_snapshots.into_iter().map(|(index, id, title)| {
             let is_active = index == self.active_tab_index;
+            let display_title = truncated_document_title(&title, window);
             let drag = DocumentTabDrag {
                 tab_id: id,
                 title: title.clone(),
@@ -1064,8 +1087,8 @@ impl RootView {
                     div()
                         .flex_1()
                         .min_w(px(0.))
-                        .overflow_hidden()
-                        .child(title),
+                        .truncate()
+                        .child(display_title),
                 )
                 .child(
                     div()
@@ -1078,6 +1101,10 @@ impl RootView {
                         .rounded(px(4.))
                         .text_sm()
                         .text_color(Theme::muted())
+                        .when(!is_active, |this| {
+                            this.invisible()
+                                .group_hover("document-tab", |style| style.visible())
+                        })
                         .hover(|style| style.bg(Theme::panel()))
                         .on_mouse_down(
                             MouseButton::Left,
@@ -1676,8 +1703,13 @@ impl Render for RootView {
         };
         let has_left_sidebar = self.outline_visible && outline_position == OutlinePosition::Left;
         let has_right_sidebar = self.outline_visible && outline_position == OutlinePosition::Right;
-        let tab_bar =
-            self.render_tab_bar(outline_position, has_left_sidebar, has_right_sidebar, cx);
+        let tab_bar = self.render_tab_bar(
+            outline_position,
+            has_left_sidebar,
+            has_right_sidebar,
+            window,
+            cx,
+        );
         let outline_toggle =
             self.render_titlebar_outline_toggle(outline_position, outline_toggle_color, cx);
         let mode_toggle = self.render_titlebar_mode_toggle(
