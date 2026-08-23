@@ -27,6 +27,7 @@ use super::interactive_scrollbar::{
 use super::selectable_text::SelectableText;
 
 const CODE_BLOCK_PADDING_X_PX: f32 = 12.0;
+const CODE_BLOCK_HEADER_INSET_PX: f32 = 6.0;
 const CODE_BLOCK_PADDING_TOP_PX: f32 = 8.0;
 const CODE_BLOCK_PADDING_BOTTOM_PX: f32 = 0.0;
 /// Approximate Menlo glyph width at the preview's small text size.
@@ -131,8 +132,9 @@ pub fn render_code_block(
         .flex()
         .items_center()
         .justify_between()
-        .px(px(CODE_BLOCK_PADDING_X_PX))
-        .py(px(6.0))
+        .pl(px(CODE_BLOCK_PADDING_X_PX))
+        .pr(px(CODE_BLOCK_HEADER_INSET_PX))
+        .py(px(CODE_BLOCK_HEADER_INSET_PX))
         .text_xs()
         .text_color(theme.muted_foreground)
         .border_b_1()
