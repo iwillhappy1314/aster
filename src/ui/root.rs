@@ -41,7 +41,9 @@ const NATIVE_TITLEBAR_HEIGHT: f32 = 38.0;
 /// Width of the draggable divider rendered beside the document Outline.
 const SIDEBAR_DIVIDER_WIDTH: f32 = 1.0;
 /// Width kept clear for macOS traffic-light controls when no left sidebar is visible.
-const TRAFFIC_LIGHT_SAFE_WIDTH: f32 = 76.0;
+const TRAFFIC_LIGHT_SAFE_WIDTH: f32 = 88.0;
+/// Width reserved for each interactive control in the custom title bar.
+const TITLEBAR_CONTROL_WIDTH: f32 = NATIVE_TITLEBAR_HEIGHT;
 
 /// Returns the active tab after closing one tab from a collection of `tab_count` tabs.
 fn tab_index_after_close(tab_count: usize, closed_index: usize) -> Option<usize> {
@@ -664,13 +666,136 @@ impl RootView {
         self.activate_tab(previous_tab_index(self.active_tab_index, self.tabs.len()), cx);
     }
 
+    /// Renders the Outline visibility control inside the custom title bar.
+    fn render_titlebar_outline_toggle(
+        &self,
+        outline_position: OutlinePosition,
+        outline_toggle_color: gpui::Rgba,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id("titlebar-outline-toggle")
+            .absolute()
+            .top_0()
+            .size(px(TITLEBAR_CONTROL_WIDTH))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|this| this.bg(Theme::panel()))
+            .when(outline_position == OutlinePosition::Left, |this| {
+                this.left(px(TRAFFIC_LIGHT_SAFE_WIDTH))
+            })
+            .when(outline_position == OutlinePosition::Right, |this| {
+                this.right_0()
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.toggle_outline(cx);
+                }),
+            )
+            .child(
+                div()
+                    .w(px(16.))
+                    .h(px(16.))
+                    .flex()
+                    .when(outline_position == OutlinePosition::Right, |this| {
+                        this.flex_row_reverse()
+                    })
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color(outline_toggle_color)
+                    .child(div().w(px(5.)).h_full().bg(outline_toggle_color))
+                    .child(div().flex_1()),
+            )
+            .into_any_element()
+    }
+
+    /// Renders the editor and preview mode control inside the custom title bar.
+    fn render_titlebar_mode_toggle(
+        &self,
+        outline_position: OutlinePosition,
+        has_right_sidebar: bool,
+        mode_toggle_color: gpui::Rgba,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let right_offset = if outline_position == OutlinePosition::Right {
+            if has_right_sidebar {
+                self.sidebar_width + SIDEBAR_DIVIDER_WIDTH
+            } else {
+                TITLEBAR_CONTROL_WIDTH
+            }
+        } else {
+            0.0
+        };
+
+        div()
+            .id("titlebar-preview-toggle")
+            .absolute()
+            .top_0()
+            .right(px(right_offset))
+            .size(px(TITLEBAR_CONTROL_WIDTH))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|this| this.bg(Theme::panel()))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.toggle_preview(cx);
+                }),
+            )
+            .child(
+                div()
+                    .w(px(16.))
+                    .h(px(16.))
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color(mode_toggle_color)
+                    .px(px(3.))
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .gap(px(2.))
+                    .child(div().w_full().h(px(1.)).bg(mode_toggle_color))
+                    .child(div().w_full().h(px(1.)).bg(mode_toggle_color))
+                    .child(div().w(px(6.)).h(px(1.)).bg(mode_toggle_color)),
+            )
+            .into_any_element()
+    }
+
     /// Renders the interactive document tabs and new-tab button in the custom title bar.
     fn render_tab_bar(
         &self,
+        outline_position: OutlinePosition,
         has_left_sidebar: bool,
         has_right_sidebar: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let left_inset = if outline_position == OutlinePosition::Left {
+            if has_left_sidebar {
+                (self.sidebar_width + SIDEBAR_DIVIDER_WIDTH)
+                    .max(TRAFFIC_LIGHT_SAFE_WIDTH + TITLEBAR_CONTROL_WIDTH)
+            } else {
+                TRAFFIC_LIGHT_SAFE_WIDTH + TITLEBAR_CONTROL_WIDTH
+            }
+        } else {
+            TRAFFIC_LIGHT_SAFE_WIDTH
+        };
+        let right_inset = TITLEBAR_CONTROL_WIDTH
+            + if outline_position == OutlinePosition::Right {
+                if has_right_sidebar {
+                    self.sidebar_width + SIDEBAR_DIVIDER_WIDTH
+                } else {
+                    TITLEBAR_CONTROL_WIDTH
+                }
+            } else {
+                0.0
+            };
         let tab_snapshots = self
             .tabs
             .iter()
@@ -752,13 +877,8 @@ impl RootView {
             .flex()
             .items_center()
             .overflow_x_scroll()
-            .when(has_left_sidebar, |this| {
-                this.ml(px(self.sidebar_width + SIDEBAR_DIVIDER_WIDTH))
-            })
-            .when(!has_left_sidebar, |this| this.pl(px(TRAFFIC_LIGHT_SAFE_WIDTH)))
-            .when(has_right_sidebar, |this| {
-                this.mr(px(self.sidebar_width + SIDEBAR_DIVIDER_WIDTH))
-            })
+            .ml(px(left_inset))
+            .mr(px(right_inset))
             .children(tabs)
             .child(
                 div()
@@ -1314,7 +1434,16 @@ impl Render for RootView {
         };
         let has_left_sidebar = self.outline_visible && outline_position == OutlinePosition::Left;
         let has_right_sidebar = self.outline_visible && outline_position == OutlinePosition::Right;
-        let tab_bar = self.render_tab_bar(has_left_sidebar, has_right_sidebar, cx);
+        let tab_bar =
+            self.render_tab_bar(outline_position, has_left_sidebar, has_right_sidebar, cx);
+        let outline_toggle =
+            self.render_titlebar_outline_toggle(outline_position, outline_toggle_color, cx);
+        let mode_toggle = self.render_titlebar_mode_toggle(
+            outline_position,
+            has_right_sidebar,
+            mode_toggle_color,
+            cx,
+        );
         let top_chrome = div()
             .id("window-chrome")
             .relative()
@@ -1360,88 +1489,9 @@ impl Render for RootView {
                         .border_color(Theme::border()),
                 )
             })
-            .child(tab_bar);
-
-        let floating_controls = div()
-            .id("floating-view-controls")
-            .absolute()
-            .right(px(16.))
-            .bottom(px(16.))
-            .p(px(4.))
-            .flex()
-            .flex_col()
-            .gap(px(4.))
-            .rounded(px(8.))
-            .border_1()
-            .border_color(Theme::border())
-            .bg(Theme::panel_alt())
-            .occlude()
-            .child(
-                div()
-                    .id("floating-outline-toggle")
-                    .size(px(28.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(5.))
-                    .cursor_pointer()
-                    .hover(|this| this.bg(Theme::bg()))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                            cx.stop_propagation();
-                            this.toggle_outline(cx);
-                        }),
-                    )
-                    .child(
-                        div()
-                            .w(px(16.))
-                            .h(px(16.))
-                            .flex()
-                            .when(outline_position == OutlinePosition::Right, |this| {
-                                this.flex_row_reverse()
-                            })
-                            .rounded(px(3.))
-                            .border_1()
-                            .border_color(outline_toggle_color)
-                            .child(div().w(px(5.)).h_full().bg(outline_toggle_color))
-                            .child(div().flex_1()),
-                    ),
-            )
-            .child(
-                div()
-                    .id("floating-preview-toggle")
-                    .size(px(28.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(5.))
-                    .cursor_pointer()
-                    .hover(|this| this.bg(Theme::bg()))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                            cx.stop_propagation();
-                            this.toggle_preview(cx);
-                        }),
-                    )
-                    .child(
-                        div()
-                            .w(px(16.))
-                            .h(px(16.))
-                            .rounded(px(3.))
-                            .border_1()
-                            .border_color(mode_toggle_color)
-                            .px(px(3.))
-                            .flex()
-                            .flex_col()
-                            .justify_center()
-                            .gap(px(2.))
-                            .child(div().w_full().h(px(1.)).bg(mode_toggle_color))
-                            .child(div().w_full().h(px(1.)).bg(mode_toggle_color))
-                            .child(div().w(px(6.)).h(px(1.)).bg(mode_toggle_color)),
-                    ),
-            );
+            .child(tab_bar)
+            .child(outline_toggle)
+            .child(mode_toggle);
 
         div()
             .relative()
@@ -1755,7 +1805,6 @@ impl Render for RootView {
                             .into_any_element()
                     }),
             )
-            .child(floating_controls)
             .child(self.notifications.clone())
     }
 }
