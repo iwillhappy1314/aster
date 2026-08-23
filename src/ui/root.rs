@@ -1,7 +1,7 @@
 use crate::commands::{
-    Copy, Find, FontSizeDecrease, FontSizeIncrease, FontSizeReset, NewFile, OpenFile,
-    OutlinePositionLeft, OutlinePositionRight, SaveFile, SaveFileAs, SelectAll, ToggleOutline,
-    TogglePreview,
+    Copy, Find, FontSizeDecrease, FontSizeIncrease, FontSizeReset, NewFile, NextTab, OpenFile,
+    OutlinePositionLeft, OutlinePositionRight, PreviousTab, SaveFile, SaveFileAs, SelectAll,
+    ToggleOutline, TogglePreview,
 };
 use crate::model::document::DocumentState;
 use crate::model::inline_markdown::InlineMarkdownState;
@@ -18,11 +18,10 @@ use crate::ui::theme::{Theme, ThemeName};
 use camino::Utf8PathBuf;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, ElementInputHandler, Entity, EntityInputHandler,
-    ExternalPaths, FocusHandle, FontWeight, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Render,
-    ScrollHandle, StatefulInteractiveElement, Styled, UTF16Selection, Window, canvas, div, px,
-    size,
+    AnyElement, App, AppContext, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
+    EntityInputHandler, ExternalPaths, FocusHandle, FontWeight, InteractiveElement, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Render,
+    ScrollHandle, StatefulInteractiveElement, Styled, UTF16Selection, Window, canvas, div, px, size,
 };
 use gpui_component::notification::NotificationList;
 use gpui_gfm::{
@@ -39,6 +38,33 @@ use std::time::Duration;
 const INLINE_SYNC_PARSE_MAX_BYTES: usize = 64 * 1024;
 /// Height reserved for macOS native titlebar controls.
 const NATIVE_TITLEBAR_HEIGHT: f32 = 38.0;
+/// Width of the draggable divider rendered beside the document Outline.
+const SIDEBAR_DIVIDER_WIDTH: f32 = 1.0;
+/// Width kept clear for macOS traffic-light controls when no left sidebar is visible.
+const TRAFFIC_LIGHT_SAFE_WIDTH: f32 = 76.0;
+
+/// Returns the active tab after closing one tab from a collection of `tab_count` tabs.
+fn tab_index_after_close(tab_count: usize, closed_index: usize) -> Option<usize> {
+    (tab_count > 1).then(|| closed_index.min(tab_count - 2))
+}
+
+/// Returns the next tab index, wrapping at the end of the collection.
+fn next_tab_index(active_index: usize, tab_count: usize) -> usize {
+    if tab_count == 0 {
+        0
+    } else {
+        (active_index + 1) % tab_count
+    }
+}
+
+/// Returns the previous tab index, wrapping at the start of the collection.
+fn previous_tab_index(active_index: usize, tab_count: usize) -> usize {
+    if tab_count == 0 {
+        0
+    } else {
+        (active_index + tab_count - 1) % tab_count
+    }
+}
 
 /// Returns the file name displayed in the custom title bar, including its unsaved marker.
 fn document_title(path: Option<&Utf8PathBuf>, is_dirty: bool) -> String {
@@ -50,7 +76,20 @@ fn document_title(path: Option<&Utf8PathBuf>, is_dirty: bool) -> String {
     format!("{name}{dirty}")
 }
 
+/// Owns the independent editor entities and display mode associated with one tab.
+struct DocumentTab {
+    id: usize,
+    document: Entity<DocumentState>,
+    inline_markdown: Entity<InlineMarkdownState>,
+    editor_view: Entity<EditorView>,
+    file_explorer_view: Entity<FileExplorerView>,
+    preview_visible: bool,
+}
+
 pub struct RootView {
+    tabs: Vec<DocumentTab>,
+    active_tab_index: usize,
+    next_tab_id: usize,
     document: Entity<DocumentState>,
     inline_markdown: Entity<InlineMarkdownState>,
     editor_view: Entity<crate::ui::editor::EditorView>,
@@ -106,7 +145,19 @@ impl RootView {
         notifications: Entity<NotificationList>,
         preview_visible: bool,
     ) -> Self {
+        let initial_tab = DocumentTab {
+            id: 0,
+            document: document.clone(),
+            inline_markdown: inline_markdown.clone(),
+            editor_view: editor_view.clone(),
+            file_explorer_view: file_explorer_view.clone(),
+            preview_visible,
+        };
+
         Self {
+            tabs: vec![initial_tab],
+            active_tab_index: 0,
+            next_tab_id: 1,
             document,
             inline_markdown,
             editor_view,
@@ -154,6 +205,113 @@ impl RootView {
         document: Entity<DocumentState>,
     ) -> crate::ui::file_explorer::FileExplorerView {
         FileExplorerView::new(document)
+    }
+
+    /// Creates the independent GPUI entities used by a new document tab.
+    fn create_document_tab(
+        &mut self,
+        path: Option<Utf8PathBuf>,
+        text: &str,
+        preview_visible: bool,
+        cx: &mut Context<Self>,
+    ) -> DocumentTab {
+        let document = cx.new(|_| DocumentState::new_empty());
+        if path.is_some() || !text.is_empty() {
+            let _ = document.update(cx, |document, cx| {
+                document.path = path;
+                document.set_text(text);
+                document.clear_undo_history();
+                document.save_snapshot();
+                cx.notify();
+            });
+        }
+        let inline_markdown = cx.new(|_| InlineMarkdownState::new());
+        let editor_view = cx.new(|_| EditorView::new(document.clone(), inline_markdown.clone()));
+        let file_explorer_view = cx.new(|_| FileExplorerView::new(document.clone()));
+        let id = self.next_tab_id;
+        self.next_tab_id = self.next_tab_id.saturating_add(1);
+
+        DocumentTab {
+            id,
+            document,
+            inline_markdown,
+            editor_view,
+            file_explorer_view,
+            preview_visible,
+        }
+    }
+
+    /// Activates a tab and points the window's editor, preview and outline at its entities.
+    fn activate_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        if index == self.active_tab_index {
+            return;
+        }
+
+        if self.active_tab_index < self.tabs.len() {
+            self.tabs[self.active_tab_index].preview_visible = self.preview_visible;
+        }
+
+        let tab = &self.tabs[index];
+        self.active_tab_index = index;
+        self.document = tab.document.clone();
+        self.inline_markdown = tab.inline_markdown.clone();
+        self.editor_view = tab.editor_view.clone();
+        self.file_explorer_view = tab.file_explorer_view.clone();
+        self.preview_visible = tab.preview_visible;
+        self.reset_active_tab_render_state();
+        cx.notify();
+    }
+
+    /// Clears render caches that must never be shared between document tabs.
+    fn reset_active_tab_render_state(&mut self) {
+        self.scheduled_inline_revision = 0;
+        self.cached_doc_text = None;
+        self.outline_reveal_installed = false;
+        self.preview_find_active = false;
+        self.preview_find_query.clear();
+        self.preview_find_cursor = 0;
+        self.preview_find_marked_range = None;
+        self.preview_scroll_handle = ScrollHandle::new();
+        self.preview_scrollbar_state = InteractiveScrollbarState::default();
+        self.preview_markdown_options = MarkdownRenderOptions::default();
+        self.preview_markdown_cache = MarkdownCache::default();
+        self.preview_heading_child_indices = Default::default();
+        self.focus_preview_on_render = self.preview_visible;
+    }
+
+    /// Adds and activates a blank source-editing tab.
+    fn add_blank_tab(&mut self, cx: &mut Context<Self>) {
+        let tab = self.create_document_tab(None, "", false, cx);
+        self.tabs.push(tab);
+        self.activate_tab(self.tabs.len() - 1, cx);
+    }
+
+    /// Opens a Markdown file in a new tab, or activates its existing tab.
+    fn open_path_in_tab(&mut self, path: &Utf8PathBuf, cx: &mut Context<Self>) {
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.document.read(cx).path.as_ref() == Some(path))
+        {
+            self.activate_tab(index, cx);
+            return;
+        }
+
+        let Ok(text) = read_to_string(path) else {
+            return;
+        };
+        let tab = self.create_document_tab(
+            Some(path.clone()),
+            &text,
+            settings::get_preview_visible(),
+            cx,
+        );
+        self.tabs.push(tab);
+        self.activate_tab(self.tabs.len() - 1, cx);
+        cx.add_recent_document(path.as_std_path());
     }
 
     fn save_document(&mut self, cx: &mut Context<Self>, force_save_as: bool) {
@@ -271,62 +429,18 @@ impl RootView {
         }
     }
 
-    pub fn open_path(
-        &mut self,
-        path: &camino::Utf8PathBuf,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.open_path_internal(path, cx);
-    }
-
     /// Internal open path that doesn't require window - for async context
     fn open_path_internal(&mut self, path: &camino::Utf8PathBuf, cx: &mut Context<Self>) {
-        match read_to_string(path) {
-            Ok(text) => {
-                self.restore_remembered_preview_mode();
-                let _ = self.document.update(cx, |d, cx| {
-                    d.path = Some(path.clone());
-                    d.set_text(&text);
-                    d.clear_undo_history();
-                    d.save_snapshot();
-                    cx.notify();
-                });
-                cx.add_recent_document(path.as_std_path());
-            }
-            Err(_err) => {
-                // Silently fail for async context - no window for notification
-            }
-        }
+        self.open_path_in_tab(path, cx);
     }
 
-    fn action_new_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.confirm_can_discard_changes(window, cx, "Save changes before creating a new file?")
-        {
-            return;
-        }
-
-        self.force_editor_mode_for_new_file(cx);
-
-        let _ = self.document.update(cx, |d, cx| {
-            d.path = None;
-            d.set_text("");
-            d.clear_undo_history();
-            d.save_snapshot();
-            cx.notify();
-        });
-        // No notification for new file - only save gets a notification
+    /// Creates a blank source-editing tab without disturbing open documents.
+    fn action_new_file(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.add_blank_tab(cx);
     }
 
-    fn action_open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.confirm_can_discard_changes(
-            window,
-            cx,
-            "Save changes before opening another file?",
-        ) {
-            return;
-        }
-
+    /// Opens the native Markdown picker and adds the selected file as a tab.
+    fn action_open_file(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let picker = pick_open_markdown_path_async();
         cx.spawn(async move |this, cx| {
             if let Some(utf8_path) = picker.await {
@@ -338,20 +452,14 @@ impl RootView {
         .detach();
     }
 
+    /// Opens an externally supplied Markdown path using the same tab de-duplication rules.
     pub fn action_open_path(
         &mut self,
         path: camino::Utf8PathBuf,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.confirm_can_discard_changes(
-            window,
-            cx,
-            "Save changes before opening another file?",
-        ) {
-            return;
-        }
-        self.open_path(&path, window, cx);
+        self.open_path_internal(&path, cx);
     }
 
     fn handle_dropped_paths(
@@ -399,13 +507,26 @@ impl RootView {
         cx.notify();
     }
 
+    /// Resolves every dirty tab before allowing its window or the application to close.
     pub fn confirm_before_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let can_quit =
-            self.confirm_can_discard_changes(window, cx, "Save changes before quitting?");
-        if can_quit {
-            self.persist_window_bounds(window);
+        let original_index = self.active_tab_index;
+        for index in 0..self.tabs.len() {
+            self.activate_tab(index, cx);
+            let title = document_title(
+                self.document.read(cx).path.as_ref(),
+                self.document.read(cx).dirty,
+            );
+            if !self.confirm_can_discard_changes(
+                window,
+                cx,
+                &format!("Save changes to {title} before quitting?"),
+            ) {
+                return false;
+            }
         }
-        can_quit
+        self.activate_tab(original_index.min(self.tabs.len().saturating_sub(1)), cx);
+        self.persist_window_bounds(window);
+        true
     }
 
     fn action_save(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -416,12 +537,39 @@ impl RootView {
         self.save_document(cx, true);
     }
 
-    pub fn action_close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.confirm_can_discard_changes(window, cx, "Save changes before closing?") {
+    /// Handles the Close Tab command for the active document.
+    pub fn action_close_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_tab(self.active_tab_index, window, cx);
+    }
+
+    /// Closes one tab after resolving its unsaved document, closing the window if it was last.
+    fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
             return;
         }
-        self.persist_window_bounds(window);
-        window.remove_window();
+
+        self.activate_tab(index, cx);
+        let title = document_title(
+            self.document.read(cx).path.as_ref(),
+            self.document.read(cx).dirty,
+        );
+        if !self.confirm_can_discard_changes(
+            window,
+            cx,
+            &format!("Save changes to {title} before closing?"),
+        ) {
+            return;
+        }
+
+        let Some(next_index) = tab_index_after_close(self.tabs.len(), index) else {
+            self.persist_window_bounds(window);
+            window.remove_window();
+            return;
+        };
+
+        self.tabs.remove(index);
+        self.active_tab_index = usize::MAX;
+        self.activate_tab(next_index, cx);
     }
 
     /// Persists the current window geometry before an application-initiated close.
@@ -443,21 +591,6 @@ impl RootView {
         settings::set_preview_visible(self.preview_visible);
         self.focus_preview_on_render = self.preview_visible;
         cx.notify();
-    }
-
-    /// Forces a newly created document into source editing without changing the saved preference.
-    fn force_editor_mode_for_new_file(&mut self, cx: &mut Context<Self>) {
-        self.preview_visible = false;
-        self.preview_find_active = false;
-        self.focus_preview_on_render = false;
-        cx.notify();
-    }
-
-    /// Restores the saved mode when an existing document is opened in this window.
-    fn restore_remembered_preview_mode(&mut self) {
-        self.preview_visible = settings::get_preview_visible();
-        self.preview_find_active = false;
-        self.focus_preview_on_render = self.preview_visible;
     }
 
     /// Opens the Find panel while keeping the rendered Markdown preview visible.
@@ -519,6 +652,136 @@ impl RootView {
         };
 
         cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    /// Activates the next tab in document order, wrapping at the end.
+    fn activate_next_tab(&mut self, cx: &mut Context<Self>) {
+        self.activate_tab(next_tab_index(self.active_tab_index, self.tabs.len()), cx);
+    }
+
+    /// Activates the previous tab in document order, wrapping at the start.
+    fn activate_previous_tab(&mut self, cx: &mut Context<Self>) {
+        self.activate_tab(previous_tab_index(self.active_tab_index, self.tabs.len()), cx);
+    }
+
+    /// Renders the interactive document tabs and new-tab button in the custom title bar.
+    fn render_tab_bar(
+        &self,
+        has_left_sidebar: bool,
+        has_right_sidebar: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let tab_snapshots = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let document = tab.document.read(cx);
+                (
+                    index,
+                    tab.id,
+                    document_title(document.path.as_ref(), document.dirty),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let tabs = tab_snapshots.into_iter().map(|(index, id, title)| {
+            let is_active = index == self.active_tab_index;
+            div()
+                .id(("document-tab", id))
+                .group("document-tab")
+                .h_full()
+                .min_w(px(132.))
+                .max_w(px(220.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .pl(px(12.))
+                .pr(px(8.))
+                .border_r_1()
+                .border_color(Theme::border())
+                .text_sm()
+                .text_color(if is_active { Theme::text() } else { Theme::muted() })
+                .when(is_active, |this| this.bg(Theme::bg()))
+                .when(!is_active, |this| {
+                    this.bg(Theme::panel_alt()).hover(|style| style.bg(Theme::panel()))
+                })
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                        this.activate_tab(index, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .id(("close-document-tab", id))
+                        .size(px(20.))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(4.))
+                        .text_sm()
+                        .text_color(Theme::muted())
+                        .hover(|style| style.bg(Theme::panel()))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.close_tab(index, window, cx);
+                            }),
+                        )
+                        .child("×"),
+                )
+        });
+
+        div()
+            .id("document-tab-bar")
+            .h_full()
+            .min_w(px(0.))
+            .flex()
+            .items_center()
+            .overflow_x_scroll()
+            .when(has_left_sidebar, |this| {
+                this.ml(px(self.sidebar_width + SIDEBAR_DIVIDER_WIDTH))
+            })
+            .when(!has_left_sidebar, |this| this.pl(px(TRAFFIC_LIGHT_SAFE_WIDTH)))
+            .when(has_right_sidebar, |this| {
+                this.mr(px(self.sidebar_width + SIDEBAR_DIVIDER_WIDTH))
+            })
+            .children(tabs)
+            .child(
+                div()
+                    .id("new-document-tab")
+                    .size(px(NATIVE_TITLEBAR_HEIGHT))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_xl()
+                    .text_color(Theme::muted())
+                    .cursor_pointer()
+                    .hover(|style| style.bg(Theme::panel()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.add_blank_tab(cx);
+                        }),
+                    )
+                    .child("+"),
+            )
+            .into_any_element()
     }
 
     fn sync_preview_outline_active(
@@ -1049,37 +1312,55 @@ impl Render for RootView {
         } else {
             Theme::border()
         };
+        let has_left_sidebar = self.outline_visible && outline_position == OutlinePosition::Left;
+        let has_right_sidebar = self.outline_visible && outline_position == OutlinePosition::Right;
+        let tab_bar = self.render_tab_bar(has_left_sidebar, has_right_sidebar, cx);
         let top_chrome = div()
             .id("window-chrome")
             .relative()
-            // Keep document content clear of the macOS window controls and provide a safe
-            // drag area that contains no application controls.
             .h(px(NATIVE_TITLEBAR_HEIGHT))
             .w_full()
-            .bg(Theme::bg())
+            .bg(Theme::panel_alt())
+            .border_b_1()
+            .border_color(Theme::border())
             .flex_shrink_0()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|_, event: &MouseDownEvent, window, _| {
-                if event.click_count == 1 {
-                    window.start_window_move();
-                }
-            }),
+                    if event.click_count == 1 {
+                        window.start_window_move();
+                    }
+                }),
             )
-            .child(
-                div()
-                    .id("window-title")
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_sm()
-                    .text_color(Theme::muted())
-                    .child(document_title),
-            );
+            .when(has_left_sidebar, |this| {
+                this.child(
+                    div()
+                        .id("left-sidebar-titlebar-background")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .h_full()
+                        .w(px(self.sidebar_width + SIDEBAR_DIVIDER_WIDTH))
+                        .bg(Theme::sidebar())
+                        .border_r_1()
+                        .border_color(Theme::border()),
+                )
+            })
+            .when(has_right_sidebar, |this| {
+                this.child(
+                    div()
+                        .id("right-sidebar-titlebar-background")
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .h_full()
+                        .w(px(self.sidebar_width + SIDEBAR_DIVIDER_WIDTH))
+                        .bg(Theme::sidebar())
+                        .border_l_1()
+                        .border_color(Theme::border()),
+                )
+            })
+            .child(tab_bar);
 
         let floating_controls = div()
             .id("floating-view-controls")
@@ -1177,6 +1458,12 @@ impl Render for RootView {
             }))
             .on_action(cx.listener(|this, _: &OpenFile, window, cx| {
                 this.action_open_file(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NextTab, _window, cx| {
+                this.activate_next_tab(cx);
+            }))
+            .on_action(cx.listener(|this, _: &PreviousTab, _window, cx| {
+                this.activate_previous_tab(cx);
             }))
             .on_action(cx.listener(|this, _: &SaveFile, window, cx| {
                 this.action_save(window, cx);
@@ -1282,7 +1569,7 @@ impl Render for RootView {
                         .child(
                             div()
                                 .id("sidebar-resize-handle")
-                                .w(px(1.))
+                                .w(px(SIDEBAR_DIVIDER_WIDTH))
                                 .h_full()
                                 .cursor_col_resize()
                                 .bg(resize_line_color)
@@ -1475,7 +1762,10 @@ impl Render for RootView {
 
 #[cfg(test)]
 mod tests {
-    use super::{document_title, preview_find_char_range_to_utf16, utf16_offset_to_char_offset};
+    use super::{
+        document_title, next_tab_index, previous_tab_index, tab_index_after_close,
+        preview_find_char_range_to_utf16, utf16_offset_to_char_offset,
+    };
     use camino::Utf8PathBuf;
 
     #[test]
@@ -1483,6 +1773,22 @@ mod tests {
         let path = Utf8PathBuf::from("/notes/project-plan.md");
 
         assert_eq!(document_title(Some(&path), true), "project-plan.md •");
+    }
+
+    #[test]
+    fn closing_a_tab_selects_the_next_or_previous_neighbor() {
+        assert_eq!(tab_index_after_close(3, 0), Some(0));
+        assert_eq!(tab_index_after_close(3, 1), Some(1));
+        assert_eq!(tab_index_after_close(3, 2), Some(1));
+        assert_eq!(tab_index_after_close(1, 0), None);
+    }
+
+    #[test]
+    fn tab_navigation_wraps_in_both_directions() {
+        assert_eq!(next_tab_index(0, 3), 1);
+        assert_eq!(next_tab_index(2, 3), 0);
+        assert_eq!(previous_tab_index(0, 3), 2);
+        assert_eq!(previous_tab_index(2, 3), 1);
     }
 
     #[test]

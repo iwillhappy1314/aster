@@ -1,11 +1,11 @@
 use crate::commands::{
-    About, CloseWindow, Copy, Cut, Find, FindNext, FindPrevious, FontSizeDecrease,
-    FontSizeIncrease, FontSizeReset, NewFile, OpenFile, OutlinePositionLeft, OutlinePositionRight,
-    Paste, Quit, Redo, SaveFile, SaveFileAs, SelectAll, ThemeAyuDark, ThemeAyuLight,
-    ThemeAyuMirage, ToggleOutline, TogglePreview, Undo,
+    About, CloseTab, Copy, Cut, Find, FindNext, FindPrevious, FontSizeDecrease,
+    FontSizeIncrease, FontSizeReset, NewFile, NextTab, OpenFile, OutlinePositionLeft,
+    OutlinePositionRight, Paste, PreviousTab, Quit, Redo, SaveFile, SaveFileAs, SelectAll,
+    ThemeAyuDark, ThemeAyuLight, ThemeAyuMirage, ToggleOutline, TogglePreview, Undo,
 };
 use crate::services::assets::AsterAssetSource;
-use crate::services::fs::{read_to_string, write_atomic};
+use crate::services::fs::read_to_string;
 use crate::services::settings;
 use crate::ui::root::RootView;
 use crate::ui::theme::ThemeName;
@@ -16,7 +16,7 @@ use gpui::{
 };
 use gpui_component::notification::NotificationList;
 use gpui_component::theme::{Theme as ComponentTheme, ThemeMode};
-use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
+use rfd::{MessageButtons, MessageDialog, MessageLevel};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -42,9 +42,11 @@ pub fn run() {
         cx.bind_keys([
             KeyBinding::new("cmd-n", NewFile, None),
             KeyBinding::new("cmd-o", OpenFile, None),
+            KeyBinding::new("ctrl-tab", NextTab, None),
+            KeyBinding::new("shift-ctrl-tab", PreviousTab, None),
             KeyBinding::new("cmd-s", SaveFile, None),
             KeyBinding::new("shift-cmd-s", SaveFileAs, None),
-            KeyBinding::new("cmd-w", CloseWindow, None),
+            KeyBinding::new("cmd-w", CloseTab, None),
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-z", Undo, None),
             KeyBinding::new("shift-cmd-z", Redo, None),
@@ -83,7 +85,7 @@ pub fn run() {
                     MenuItem::action("Save", SaveFile),
                     MenuItem::action("Save As…", SaveFileAs),
                     MenuItem::separator(),
-                    MenuItem::action("Close Window", CloseWindow),
+                    MenuItem::action("Close Tab", CloseTab),
                 ],
             },
             Menu {
@@ -115,6 +117,9 @@ pub fn run() {
                         ],
                     }),
                     MenuItem::action("Toggle Preview", TogglePreview),
+                    MenuItem::separator(),
+                    MenuItem::action("Next Tab", NextTab),
+                    MenuItem::action("Previous Tab", PreviousTab),
                     MenuItem::separator(),
                     MenuItem::submenu(Menu {
                         name: "Theme".into(),
@@ -155,7 +160,7 @@ pub fn run() {
 
             cx.quit();
         });
-        cx.on_action(|_: &CloseWindow, cx| {
+        cx.on_action(|_: &CloseTab, cx| {
             let target_window = cx.active_window().or_else(|| {
                 cx.window_stack()
                     .and_then(|windows| windows.first().copied())
@@ -165,7 +170,7 @@ pub fn run() {
                 cx.defer(move |cx| {
                     if let Some(handle) = window.downcast::<RootView>() {
                         let _ = handle.update(cx, |root, window, cx| {
-                            root.action_close_window(window, cx);
+                            root.action_close_tab(window, cx);
                         });
                     }
                 });
@@ -309,8 +314,7 @@ fn build_root_view(
         }
     }
 
-    install_should_close_prompt(window, cx, document.clone());
-    cx.new(|_| {
+    let root = cx.new(|_| {
         RootView::new(
             document,
             inline_markdown,
@@ -319,7 +323,9 @@ fn build_root_view(
             notifications,
             preview_visible,
         )
-    })
+    });
+    install_should_close_prompt(window, cx, root.clone());
+    root
 }
 
 /// Resolves the initial mode: blank documents always edit, existing documents use the preference.
@@ -330,82 +336,11 @@ fn initial_preview_visible(has_initial_path: bool, remembered_preview_visible: b
 fn install_should_close_prompt(
     window: &mut Window,
     cx: &mut App,
-    document: gpui::Entity<crate::model::document::DocumentState>,
+    root: gpui::Entity<RootView>,
 ) {
     window.on_window_should_close(cx, {
         move |window, cx| {
-            let is_dirty = document.read_with(cx, |d, _| d.dirty);
-            if !is_dirty {
-                settings::set_window_bounds(window.bounds());
-                return true;
-            }
-
-            let choice = MessageDialog::new()
-                .set_level(MessageLevel::Warning)
-                .set_title("Unsaved changes")
-                .set_description("Save changes before closing?")
-                .set_buttons(MessageButtons::YesNoCancelCustom(
-                    "Save".to_string(),
-                    "Don't Save".to_string(),
-                    "Cancel".to_string(),
-                ))
-                .show();
-
-            let mut save = || {
-                let current_path = document.read_with(cx, |d, _| d.path.clone());
-                // Only save if we have an existing path - avoid blocking file dialog
-                let Some(path) = current_path else {
-                    // No path - need to use Save As, which requires async dialog
-                    // Cancel the close and notify user to save first
-                    MessageDialog::new()
-                        .set_level(MessageLevel::Info)
-                        .set_title("Save required")
-                        .set_description(
-                            "Please use Save As (Cmd+Shift+S) to save this file first.",
-                        )
-                        .set_buttons(MessageButtons::Ok)
-                        .show();
-                    return false;
-                };
-
-                let contents = document.read_with(cx, |d, _| d.text());
-                match write_atomic(&path, &contents) {
-                    Ok(()) => {
-                        let _ = document.update(cx, |d, cx| {
-                            d.path = Some(path.clone());
-                            d.save_snapshot();
-                            cx.notify();
-                        });
-                        true
-                    }
-                    Err(err) => {
-                        MessageDialog::new()
-                            .set_level(MessageLevel::Error)
-                            .set_title("Save failed")
-                            .set_description(format!("Failed to save {}: {}", path, err))
-                            .set_buttons(MessageButtons::Ok)
-                            .show();
-                        false
-                    }
-                }
-            };
-
-            let should_close = match choice {
-                MessageDialogResult::Ok | MessageDialogResult::Yes => save(),
-                MessageDialogResult::No => true,
-                MessageDialogResult::Custom(label) => match label.as_str() {
-                    "Save" => save(),
-                    "Don't Save" => true,
-                    _ => false,
-                },
-                _ => false,
-            };
-
-            if should_close {
-                settings::set_window_bounds(window.bounds());
-            }
-
-            should_close
+            root.update(cx, |root, cx| root.confirm_before_quit(window, cx))
         }
     });
 }

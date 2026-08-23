@@ -46,6 +46,7 @@ Pre-built macOS applications are available for direct download:
 - Inline markdown rendering in the editor with background span parsing
 - Support for tables, footnotes, strikethrough, and task lists
 - Document outline in the sidebar (click any heading to jump in editor)
+- Multi-document tabs with independent editor, undo, and dirty state
 - Lightweight Markdown syntax highlighting in the editor
 - In-editor Find with match navigation (`Cmd+F`, `Cmd+G`, `Shift+Cmd+G`)
 - Image loading (local)
@@ -57,12 +58,14 @@ Pre-built macOS applications are available for direct download:
 
 ### File
 
-- `Cmd+N`: New file
-- `Cmd+O`: Open file
+- `Cmd+N`: New tab
+- `Cmd+O`: Open file in a tab
 - `Cmd+S`: Save
 - `Shift+Cmd+S`: Save As
-- `Cmd+W`: Close window
+- `Cmd+W`: Close current tab
 - `Cmd+Q`: Quit
+- `Ctrl+Tab`: Next tab
+- `Shift+Ctrl+Tab`: Previous tab
 
 ### Edit
 
