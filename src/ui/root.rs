@@ -1600,6 +1600,17 @@ impl Render for RootView {
                 .file_explorer_view
                 .update(cx, |view, _| view.set_on_reveal(callback));
 
+            let root = cx.weak_entity();
+            let open_file_callback: crate::ui::file_explorer::OpenFileCallback =
+                std::sync::Arc::new(move |path, cx: &mut App| {
+                    let _ = root.update(cx, |root, cx| {
+                        root.open_path_internal(&path, cx);
+                    });
+                });
+            let _ = self
+                .file_explorer_view
+                .update(cx, |view, _| view.set_on_open_file(open_file_callback));
+
             let file_explorer = self.file_explorer_view.clone();
             let viewport_callback: crate::ui::editor::OutlineViewportCallback =
                 std::sync::Arc::new(move |byte_start, cx: &mut App| {

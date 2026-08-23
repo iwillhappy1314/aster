@@ -1,14 +1,19 @@
 use crate::model::document::DocumentState;
+use crate::services::fs::is_markdown_path;
 use crate::ui::text_utils::ellipsize_chars;
 use crate::ui::theme::Theme;
+use camino::{Utf8Path, Utf8PathBuf};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     App, Context, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, Render, ScrollHandle, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
+use std::fs;
 use std::sync::Arc;
+use std::time::SystemTime;
 
+/// Describes one heading rendered in the document Outline.
 #[derive(Clone, Debug)]
 struct OutlineItem {
     ordinal: usize,
@@ -21,35 +26,56 @@ struct OutlineItem {
 /// byte offset in the document.
 pub type RevealCallback = Arc<dyn Fn(usize, usize, &mut App)>;
 
+/// Callback invoked when a Markdown file is selected from the FILES list.
+pub type OpenFileCallback = Arc<dyn Fn(Utf8PathBuf, &mut App)>;
+
+/// Caches the Markdown files found in one directory until its metadata changes.
+struct MarkdownFilesCache {
+    directory: Utf8PathBuf,
+    modified: Option<SystemTime>,
+    files: Vec<Utf8PathBuf>,
+}
+
+/// Renders the current document Outline and sibling Markdown files in the sidebar.
 pub struct FileExplorerView {
     document: Entity<DocumentState>,
     outline_scroll_handle: ScrollHandle,
+    files_scroll_handle: ScrollHandle,
     width: f32,
     cached_outline: Option<(u64, Vec<OutlineItem>)>,
+    cached_markdown_files: Option<MarkdownFilesCache>,
     /// Currently active heading in document order.
     active_outline_ordinal: Option<usize>,
     /// Called when an outline entry is clicked so the host can scroll the
     /// editor/preview to that section.
     on_reveal: Option<RevealCallback>,
+    /// Called when a Markdown file is clicked so the host can open its tab.
+    on_open_file: Option<OpenFileCallback>,
 }
 
 impl FileExplorerView {
+    /// Creates a sidebar bound to one document entity.
     pub fn new(document: Entity<DocumentState>) -> Self {
         Self {
             document,
             outline_scroll_handle: ScrollHandle::new(),
+            files_scroll_handle: ScrollHandle::new(),
             width: 200.0,
             cached_outline: None,
+            cached_markdown_files: None,
             active_outline_ordinal: None,
             on_reveal: None,
+            on_open_file: None,
         }
     }
 
+    /// Updates the rendered sidebar width after a divider drag.
     pub fn set_width(&mut self, width: f32, cx: &mut gpui::Context<Self>) {
         self.width = width;
         cx.notify();
     }
 
+    /// Selects an Outline entry and keeps it visible in the Outline scroll area.
     pub fn set_active_outline(&mut self, ordinal: Option<usize>, cx: &mut Context<Self>) {
         if self.active_outline_ordinal != ordinal {
             self.active_outline_ordinal = ordinal;
@@ -60,6 +86,7 @@ impl FileExplorerView {
         }
     }
 
+    /// Selects the last heading whose source byte offset precedes the viewport position.
     pub fn set_active_outline_for_byte(&mut self, byte: usize, cx: &mut Context<Self>) {
         let doc_revision = self.document.read(cx).revision;
         let outline_items = if let Some((cached_revision, items)) = &self.cached_outline {
@@ -85,6 +112,44 @@ impl FileExplorerView {
     pub fn set_on_reveal(&mut self, callback: RevealCallback) {
         self.on_reveal = Some(callback);
     }
+
+    /// Registers the callback invoked when a Markdown file is selected.
+    pub fn set_on_open_file(&mut self, callback: OpenFileCallback) {
+        self.on_open_file = Some(callback);
+    }
+
+    /// Returns the cached sibling Markdown files, refreshing after directory changes.
+    fn markdown_files(&mut self, cx: &App) -> Vec<Utf8PathBuf> {
+        let directory = self
+            .document
+            .read(cx)
+            .path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(Utf8Path::to_path_buf);
+        let Some(directory) = directory else {
+            self.cached_markdown_files = None;
+            return Vec::new();
+        };
+        let modified = fs::metadata(directory.as_std_path())
+            .and_then(|metadata| metadata.modified())
+            .ok();
+
+        if let Some(cache) = &self.cached_markdown_files
+            && cache.directory == directory
+            && cache.modified == modified
+        {
+            return cache.files.clone();
+        }
+
+        let files = list_markdown_files(&directory);
+        self.cached_markdown_files = Some(MarkdownFilesCache {
+            directory,
+            modified,
+            files: files.clone(),
+        });
+        files
+    }
 }
 
 impl Render for FileExplorerView {
@@ -107,6 +172,9 @@ impl Render for FileExplorerView {
         };
         let has_outline = !outline_items.is_empty();
         let document = self.document.clone();
+        let current_path = self.document.read(cx).path.clone();
+        let markdown_files = self.markdown_files(cx);
+        let show_files = should_show_files(&markdown_files);
 
         let outline_elements: Vec<_> = outline_items
             .into_iter()
@@ -178,6 +246,59 @@ impl Render for FileExplorerView {
             })
             .collect();
 
+        let file_elements: Vec<_> = markdown_files
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let file_name = path.file_name().unwrap_or("Untitled").to_string();
+                let is_active = current_path.as_ref() == Some(&path);
+                let on_open_file = self.on_open_file.clone();
+                div()
+                    .id(("markdown-file-entry", index))
+                    .flex()
+                    .items_center()
+                    .gap(px(7.))
+                    .px(px(10.))
+                    .py(px(4.))
+                    .cursor_pointer()
+                    .when(is_active, |this| this.bg(Theme::panel_alt()))
+                    .hover(|this| this.bg(Theme::panel_alt()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |_, _: &MouseDownEvent, _, cx| {
+                            if let Some(on_open_file) = on_open_file.clone() {
+                                on_open_file(path.clone(), cx);
+                            }
+                        }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(if is_active {
+                                Theme::control_accent()
+                            } else {
+                                Theme::muted()
+                            })
+                            .child("M↓"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_sm()
+                            .text_color(if is_active {
+                                Theme::control_accent()
+                            } else {
+                                Theme::text()
+                            })
+                            .child(ellipsize_chars(&file_name, 48)),
+                    )
+            })
+            .collect();
+
         div()
             .flex()
             .flex_col()
@@ -198,6 +319,7 @@ impl Render for FileExplorerView {
                 div()
                     .id("outline-scroll")
                     .flex_1()
+                    .min_h(px(80.))
                     .overflow_y_scroll()
                     .track_scroll(&self.outline_scroll_handle)
                     .when(has_outline, |this| this.children(outline_elements))
@@ -212,7 +334,61 @@ impl Render for FileExplorerView {
                         )
                     }),
             )
+            .when(show_files, |this| {
+                this.child(
+                    div()
+                        .h(px(1.))
+                        .mx(px(10.))
+                        .bg(Theme::border()),
+                )
+                .child(
+                    div()
+                        .px(px(10.))
+                        .pt(px(8.))
+                        .pb(px(5.))
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(Theme::muted())
+                        .child("FILES"),
+                )
+                .child(
+                    div()
+                        .id("files-scroll")
+                        .max_h(px(240.))
+                        .flex_shrink_0()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.files_scroll_handle)
+                        .children(file_elements),
+                )
+            })
     }
+}
+
+/// Returns supported Markdown files directly inside the supplied directory.
+fn list_markdown_files(directory: &Utf8Path) -> Vec<Utf8PathBuf> {
+    let Ok(entries) = fs::read_dir(directory.as_std_path()) else {
+        return Vec::new();
+    };
+    let mut files = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_file()))
+        .filter_map(|entry| Utf8PathBuf::from_path_buf(entry.path()).ok())
+        .filter(is_markdown_path)
+        .collect::<Vec<_>>();
+
+    files.sort_by(|left, right| {
+        left.file_name()
+            .unwrap_or_default()
+            .to_lowercase()
+            .cmp(&right.file_name().unwrap_or_default().to_lowercase())
+            .then_with(|| left.cmp(right))
+    });
+    files
+}
+
+/// Returns whether the FILES section has useful sibling documents to display.
+fn should_show_files(files: &[Utf8PathBuf]) -> bool {
+    files.len() > 1
 }
 
 fn parse_outline_items(text: &str) -> Vec<OutlineItem> {
@@ -283,6 +459,7 @@ fn heading_level_number(level: HeadingLevel) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn parses_multilevel_headings_in_document_order() {
@@ -315,6 +492,34 @@ mod tests {
         assert_eq!(active_outline_ordinal(&items, child - 1), Some(0));
         assert_eq!(active_outline_ordinal(&items, child), Some(1));
         assert_eq!(active_outline_ordinal(&items, leaf), Some(2));
+    }
+
+    #[test]
+    fn lists_supported_markdown_files_in_name_order() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("zeta.md"), "# Zeta").unwrap();
+        fs::write(directory.path().join("Alpha.MD"), "# Alpha").unwrap();
+        fs::write(directory.path().join("notes.markdown"), "# Notes").unwrap();
+        fs::write(directory.path().join("image.png"), "not markdown").unwrap();
+        fs::create_dir(directory.path().join("nested.md")).unwrap();
+        let directory = Utf8Path::from_path(directory.path()).unwrap();
+
+        let names = list_markdown_files(directory)
+            .into_iter()
+            .map(|path| path.file_name().unwrap().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["Alpha.MD", "notes.markdown", "zeta.md"]);
+    }
+
+    #[test]
+    fn files_section_requires_more_than_one_markdown_file() {
+        assert!(!should_show_files(&[]));
+        assert!(!should_show_files(&[Utf8PathBuf::from("only.md")]));
+        assert!(should_show_files(&[
+            Utf8PathBuf::from("first.md"),
+            Utf8PathBuf::from("second.md"),
+        ]));
     }
 
     #[test]
