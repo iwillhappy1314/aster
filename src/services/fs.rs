@@ -1,36 +1,20 @@
 use crate::error::{AppError, AppResult};
 use camino::Utf8PathBuf;
 use futures::channel::oneshot;
-use gpui::App;
-use rfd::AsyncFileDialog;
+use gpui::{App, PathPromptOptions};
 use std::fs;
-use std::future::Future;
 use std::io::Write;
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
 
-/// Opens a native file picker and returns a single selected markdown file.
-///
-/// The dialog is filtered to markdown extensions so users only see selectable
-/// markdown files while browsing.
-pub fn pick_open_markdown_path_async() -> impl Future<Output = Option<Utf8PathBuf>> + Send {
-    let home_dir = directories::UserDirs::new().map(|d| d.home_dir().to_path_buf());
-    let mut dialog = AsyncFileDialog::new()
-        .add_filter("Markdown", &["md", "markdown", "mdown"])
-        .set_title("Open Markdown File");
-
-    if let Some(dir) = home_dir {
-        dialog = dialog.set_directory(dir);
-    }
-
-    async move {
-        dialog
-            .pick_file()
-            .await
-            .map(|handle| handle.path().to_path_buf())
-            .and_then(|path| Utf8PathBuf::try_from(path).ok())
-            .filter(is_markdown_path)
-    }
+/// Opens a native picker that accepts either one file or one directory.
+pub fn pick_open_path_async(cx: &App) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
+    cx.prompt_for_paths(PathPromptOptions {
+        files: true,
+        directories: true,
+        multiple: false,
+        prompt: Some("Open".into()),
+    })
 }
 
 /// Returns true if the path has a supported markdown extension.

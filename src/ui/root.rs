@@ -6,13 +6,13 @@ use crate::commands::{
 use crate::model::document::DocumentState;
 use crate::model::inline_markdown::InlineMarkdownState;
 use crate::services::fs::{
-    pick_open_markdown_path_async, pick_save_path_async, read_to_string, write_atomic,
+    pick_open_path_async, pick_save_path_async, read_to_string, write_atomic,
 };
 use crate::services::inline_markdown::compute_inline_spans;
 use crate::services::settings::{self, OutlinePosition, Settings};
 use crate::services::tasks::Debouncer;
 use crate::ui::editor::EditorView;
-use crate::ui::file_explorer::FileExplorerView;
+use crate::ui::file_explorer::{FileExplorerView, list_markdown_files};
 use crate::ui::theme::{Theme, ThemeName};
 
 use camino::Utf8PathBuf;
@@ -163,6 +163,25 @@ enum BlankTitlebarMouseAction {
     Ignore,
 }
 
+/// Classifies a path supplied by a picker, Finder, or drag-and-drop operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenTargetKind {
+    Directory,
+    MarkdownFile,
+    Unsupported,
+}
+
+/// Returns the supported open behavior for a filesystem path.
+fn classify_open_target(path: &Utf8PathBuf) -> OpenTargetKind {
+    if path.is_dir() {
+        OpenTargetKind::Directory
+    } else if path.is_file() && is_markdown_path(path.as_std_path()) {
+        OpenTargetKind::MarkdownFile
+    } else {
+        OpenTargetKind::Unsupported
+    }
+}
+
 /// Maps the platform click sequence to native empty-titlebar behavior.
 fn blank_titlebar_mouse_action(click_count: usize) -> BlankTitlebarMouseAction {
     match click_count {
@@ -285,6 +304,8 @@ pub struct RootView {
     inline_markdown: Entity<InlineMarkdownState>,
     editor_view: Entity<crate::ui::editor::EditorView>,
     file_explorer_view: Entity<crate::ui::file_explorer::FileExplorerView>,
+    /// Explicit directory used by every tab's FILES section in this window.
+    workspace_directory: Option<Utf8PathBuf>,
     notifications: Entity<NotificationList>,
     inline_debounce: Debouncer<RootView>,
     /// Highest document revision for which an inline parse has been scheduled.
@@ -353,6 +374,7 @@ impl RootView {
             inline_markdown,
             editor_view,
             file_explorer_view,
+            workspace_directory: None,
             notifications,
             inline_debounce: Debouncer::new(Duration::from_millis(35)),
             scheduled_inline_revision: 0,
@@ -419,6 +441,11 @@ impl RootView {
         let inline_markdown = cx.new(|_| InlineMarkdownState::new());
         let editor_view = cx.new(|_| EditorView::new(document.clone(), inline_markdown.clone()));
         let file_explorer_view = cx.new(|_| FileExplorerView::new(document.clone()));
+        if let Some(directory) = self.workspace_directory.clone() {
+            let _ = file_explorer_view.update(cx, |view, cx| {
+                view.set_workspace_directory(Some(directory), cx);
+            });
+        }
         let id = self.next_tab_id;
         self.next_tab_id = self.next_tab_id.saturating_add(1);
 
@@ -620,9 +647,30 @@ impl RootView {
         }
     }
 
-    /// Internal open path that doesn't require window - for async context
+    /// Opens a directory as the window's FILES context and selects its first Markdown file.
+    fn open_directory(&mut self, directory: &Utf8PathBuf, cx: &mut Context<Self>) {
+        self.workspace_directory = Some(directory.clone());
+        for tab in &self.tabs {
+            let directory = directory.clone();
+            let _ = tab.file_explorer_view.update(cx, |view, cx| {
+                view.set_workspace_directory(Some(directory), cx);
+            });
+        }
+
+        if let Some(first_file) = list_markdown_files(directory).into_iter().next() {
+            self.open_path_in_tab(&first_file, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Opens a supported file or folder without requiring window access.
     fn open_path_internal(&mut self, path: &camino::Utf8PathBuf, cx: &mut Context<Self>) {
-        self.open_path_in_tab(path, cx);
+        match classify_open_target(path) {
+            OpenTargetKind::Directory => self.open_directory(path, cx),
+            OpenTargetKind::MarkdownFile => self.open_path_in_tab(path, cx),
+            OpenTargetKind::Unsupported => {}
+        }
     }
 
     /// Creates a blank source-editing tab without disturbing open documents.
@@ -630,11 +678,14 @@ impl RootView {
         self.add_blank_tab(cx);
     }
 
-    /// Opens the native Markdown picker and adds the selected file as a tab.
+    /// Opens the native file-or-folder picker and handles its selected target.
     fn action_open_file(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let picker = pick_open_markdown_path_async();
+        let picker = pick_open_path_async(cx);
         cx.spawn(async move |this, cx| {
-            if let Some(utf8_path) = picker.await {
+            if let Ok(Ok(Some(paths))) = picker.await
+                && let Some(path) = paths.into_iter().next()
+                && let Ok(utf8_path) = Utf8PathBuf::try_from(path)
+            {
                 let _ = this.update(&mut *cx, |this, cx| {
                     this.open_path_internal(&utf8_path, cx);
                 });
@@ -659,6 +710,13 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(directory) = paths.paths().iter().find(|path| path.is_dir()) {
+            if let Ok(path) = Utf8PathBuf::try_from(directory.clone()) {
+                self.action_open_path(path, window, cx);
+            }
+            return;
+        }
+
         if let Some(markdown_path) = paths.paths().iter().find(|path| is_markdown_path(path)) {
             if let Ok(path) = Utf8PathBuf::try_from(markdown_path.clone()) {
                 self.action_open_path(path, window, cx);
@@ -2088,8 +2146,9 @@ impl Render for RootView {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlankTitlebarMouseAction, blank_titlebar_mouse_action, document_title, move_vec_item,
-        next_tab_index, previous_tab_index, preview_find_char_range_to_utf16,
+        BlankTitlebarMouseAction, OpenTargetKind, blank_titlebar_mouse_action,
+        classify_open_target, document_title, move_vec_item, next_tab_index, previous_tab_index,
+        preview_find_char_range_to_utf16,
         tab_index_after_close, utf16_offset_to_char_offset,
     };
     use camino::Utf8PathBuf;
@@ -2099,6 +2158,28 @@ mod tests {
         let path = Utf8PathBuf::from("/notes/project-plan.md");
 
         assert_eq!(document_title(Some(&path), true), "project-plan.md •");
+    }
+
+    #[test]
+    fn classifies_folder_markdown_and_unsupported_open_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let markdown_path = directory.path().join("notes.md");
+        let text_path = directory.path().join("notes.txt");
+        std::fs::write(&markdown_path, "# Notes").unwrap();
+        std::fs::write(&text_path, "Notes").unwrap();
+
+        assert_eq!(
+            classify_open_target(&Utf8PathBuf::from_path_buf(directory.path().to_path_buf()).unwrap()),
+            OpenTargetKind::Directory
+        );
+        assert_eq!(
+            classify_open_target(&Utf8PathBuf::from_path_buf(markdown_path).unwrap()),
+            OpenTargetKind::MarkdownFile
+        );
+        assert_eq!(
+            classify_open_target(&Utf8PathBuf::from_path_buf(text_path).unwrap()),
+            OpenTargetKind::Unsupported
+        );
     }
 
     #[test]

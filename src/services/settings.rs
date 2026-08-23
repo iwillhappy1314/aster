@@ -15,6 +15,25 @@ pub enum OutlinePosition {
     Right,
 }
 
+/// Determines which sidebar section is rendered closest to the title bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SidebarSectionOrder {
+    #[default]
+    OutlineFirst,
+    FilesFirst,
+}
+
+impl SidebarSectionOrder {
+    /// Returns the opposite ordering for the sidebar swap control.
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::OutlineFirst => Self::FilesFirst,
+            Self::FilesFirst => Self::OutlineFirst,
+        }
+    }
+}
+
 /// Application settings with persistence
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -27,6 +46,9 @@ pub struct Settings {
     /// Side of the editor where the Outline is displayed.
     #[serde(default)]
     pub outline_position: OutlinePosition,
+    /// Order of the Outline and Files sections inside the sidebar.
+    #[serde(default)]
+    pub sidebar_section_order: SidebarSectionOrder,
     /// Whether the optional document Outline is visible.
     #[serde(default)]
     pub outline_visible: bool,
@@ -95,6 +117,7 @@ impl Default for Settings {
             font_size: default_font_size(),
             theme_name: default_theme_name(),
             outline_position: OutlinePosition::default(),
+            sidebar_section_order: SidebarSectionOrder::default(),
             outline_visible: false,
             preview_visible: default_preview_visible(),
             window_geometry: None,
@@ -197,6 +220,24 @@ pub fn set_outline_position(position: OutlinePosition) {
     }
 }
 
+/// Returns the persisted order of the Outline and Files sidebar sections.
+pub fn get_sidebar_section_order() -> SidebarSectionOrder {
+    settings()
+        .lock()
+        .map(|s| s.get().sidebar_section_order)
+        .unwrap_or_default()
+}
+
+/// Swaps and persists the order of the Outline and Files sidebar sections.
+pub fn toggle_sidebar_section_order() -> SidebarSectionOrder {
+    let mut next = SidebarSectionOrder::default();
+    if let Ok(mut manager) = settings().lock() {
+        next = manager.get().sidebar_section_order.toggled();
+        manager.update(|settings| settings.sidebar_section_order = next);
+    }
+    next
+}
+
 /// Returns whether the Outline should be visible when a window opens.
 pub fn get_outline_visible() -> bool {
     settings()
@@ -283,7 +324,7 @@ pub fn set_window_bounds(bounds: Bounds<Pixels>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{OutlinePosition, Settings, WindowGeometry};
+    use super::{OutlinePosition, Settings, SidebarSectionOrder, WindowGeometry};
     use gpui::{Bounds, point, px, size};
 
     #[test]
@@ -296,6 +337,22 @@ mod tests {
         let settings = Settings::default();
         assert!(!settings.outline_visible);
         assert!(settings.preview_visible);
+    }
+
+    #[test]
+    fn sidebar_sections_default_to_outline_first_and_toggle_both_ways() {
+        assert_eq!(
+            SidebarSectionOrder::default(),
+            SidebarSectionOrder::OutlineFirst
+        );
+        assert_eq!(
+            SidebarSectionOrder::OutlineFirst.toggled(),
+            SidebarSectionOrder::FilesFirst
+        );
+        assert_eq!(
+            SidebarSectionOrder::FilesFirst.toggled(),
+            SidebarSectionOrder::OutlineFirst
+        );
     }
 
     #[test]

@@ -80,7 +80,7 @@ pub fn run() {
                 name: "File".into(),
                 items: vec![
                     MenuItem::action("New", NewFile),
-                    MenuItem::action("Open…", OpenFile),
+                    MenuItem::action("Open File or Folder…", OpenFile),
                     MenuItem::separator(),
                     MenuItem::action("Save", SaveFile),
                     MenuItem::action("Save As…", SaveFileAs),
@@ -297,15 +297,16 @@ fn build_root_view(
     cx: &mut App,
     initial_path: Option<Utf8PathBuf>,
 ) -> gpui::Entity<RootView> {
+    let has_initial_file = initial_path.as_ref().is_some_and(|path| path.is_file());
     let preview_visible =
-        initial_preview_visible(initial_path.is_some(), settings::get_preview_visible());
+        initial_preview_visible(has_initial_file, settings::get_preview_visible());
     let document = cx.new(|_| RootView::new_document());
     let inline_markdown = cx.new(|_| RootView::new_inline_markdown());
     let notifications = cx.new(|cx| NotificationList::new(window, cx));
     let editor_view = cx.new(|_| RootView::build_editor(document.clone(), inline_markdown.clone()));
     let file_explorer_view = cx.new(|_| RootView::build_file_explorer(document.clone()));
 
-    if let Some(path) = initial_path.as_ref() {
+    if let Some(path) = initial_path.as_ref().filter(|path| path.is_file()) {
         if let Ok(text) = read_to_string(path) {
             let _ = document.update(cx, |d, cx| {
                 d.path = Some(path.clone());
@@ -327,6 +328,11 @@ fn build_root_view(
         )
     });
     install_should_close_prompt(window, cx, root.clone());
+    if let Some(directory) = initial_path.filter(|path| path.is_dir()) {
+        let _ = root.update(cx, |root, cx| {
+            root.action_open_path(directory, window, cx);
+        });
+    }
     root
 }
 

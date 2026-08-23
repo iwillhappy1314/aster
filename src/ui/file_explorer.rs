@@ -1,11 +1,12 @@
 use crate::model::document::DocumentState;
 use crate::services::fs::is_markdown_path;
+use crate::services::settings::{self, SidebarSectionOrder};
 use crate::ui::text_utils::ellipsize_chars;
 use crate::ui::theme::Theme;
 use camino::{Utf8Path, Utf8PathBuf};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, Context, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    AnyElement, App, Context, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, Render, ScrollHandle, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
@@ -44,6 +45,8 @@ pub struct FileExplorerView {
     width: f32,
     cached_outline: Option<(u64, Vec<OutlineItem>)>,
     cached_markdown_files: Option<MarkdownFilesCache>,
+    /// Explicit folder opened by the user, shared across document tabs in the window.
+    workspace_directory: Option<Utf8PathBuf>,
     /// Currently active heading in document order.
     active_outline_ordinal: Option<usize>,
     /// Called when an outline entry is clicked so the host can scroll the
@@ -63,6 +66,7 @@ impl FileExplorerView {
             width: 200.0,
             cached_outline: None,
             cached_markdown_files: None,
+            workspace_directory: None,
             active_outline_ordinal: None,
             on_reveal: None,
             on_open_file: None,
@@ -118,15 +122,29 @@ impl FileExplorerView {
         self.on_open_file = Some(callback);
     }
 
+    /// Sets the folder shown by FILES instead of deriving it from the active document.
+    pub fn set_workspace_directory(
+        &mut self,
+        directory: Option<Utf8PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace_directory != directory {
+            self.workspace_directory = directory;
+            self.cached_markdown_files = None;
+            cx.notify();
+        }
+    }
+
     /// Returns the cached sibling Markdown files, refreshing after directory changes.
     fn markdown_files(&mut self, cx: &App) -> Vec<Utf8PathBuf> {
-        let directory = self
-            .document
-            .read(cx)
-            .path
-            .as_ref()
-            .and_then(|path| path.parent())
-            .map(Utf8Path::to_path_buf);
+        let directory = self.workspace_directory.clone().or_else(|| {
+            self.document
+                .read(cx)
+                .path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .map(Utf8Path::to_path_buf)
+        });
         let Some(directory) = directory else {
             self.cached_markdown_files = None;
             return Vec::new();
@@ -149,6 +167,49 @@ impl FileExplorerView {
             files: files.clone(),
         });
         files
+    }
+
+    /// Builds a sidebar section label and its optional order-swap button.
+    fn render_section_header(
+        &mut self,
+        label: &'static str,
+        show_swap_button: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .px(px(10.))
+            .py(px(6.))
+            .text_xs()
+            .font_weight(gpui::FontWeight::BOLD)
+            .text_color(Theme::muted())
+            .child(label)
+            .when(show_swap_button, |this| {
+                this.child(
+                    div()
+                        .id("swap-sidebar-sections")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(20.))
+                        .h(px(20.))
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .font_weight(gpui::FontWeight::NORMAL)
+                        .hover(|this| this.bg(Theme::panel_alt()))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                settings::toggle_sidebar_section_order();
+                                cx.notify();
+                            }),
+                        )
+                        .child("⇅"),
+                )
+            })
+            .into_any_element()
     }
 }
 
@@ -174,7 +235,8 @@ impl Render for FileExplorerView {
         let document = self.document.clone();
         let current_path = self.document.read(cx).path.clone();
         let markdown_files = self.markdown_files(cx);
-        let show_files = should_show_files(&markdown_files);
+        let show_files = should_show_files(&markdown_files, self.workspace_directory.is_some());
+        let section_order = settings::get_sidebar_section_order();
 
         let outline_elements: Vec<_> = outline_items
             .into_iter()
@@ -299,22 +361,16 @@ impl Render for FileExplorerView {
             })
             .collect();
 
-        div()
+        let outline_section = div()
             .flex()
             .flex_col()
-            .h_full()
-            .w(px(self.width))
-            .bg(Theme::sidebar())
-            .flex_shrink_0()
-            .child(
-                div()
-                    .px(px(10.))
-                    .py(px(6.))
-                    .text_xs()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(Theme::muted())
-                    .child("OUTLINE"),
-            )
+            .flex_1()
+            .min_h(px(80.))
+            .child(self.render_section_header(
+                "OUTLINE",
+                show_files && section_order == SidebarSectionOrder::OutlineFirst,
+                cx,
+            ))
             .child(
                 div()
                     .id("outline-scroll")
@@ -334,23 +390,18 @@ impl Render for FileExplorerView {
                         )
                     }),
             )
-            .when(show_files, |this| {
-                this.child(
-                    div()
-                        .h(px(1.))
-                        .mx(px(10.))
-                        .bg(Theme::border()),
-                )
-                .child(
-                    div()
-                        .px(px(10.))
-                        .pt(px(8.))
-                        .pb(px(5.))
-                        .text_xs()
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(Theme::muted())
-                        .child("FILES"),
-                )
+            .into_any_element();
+
+        let files_section = show_files.then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .flex_shrink_0()
+                .child(self.render_section_header(
+                    "FILES",
+                    section_order == SidebarSectionOrder::FilesFirst,
+                    cx,
+                ))
                 .child(
                     div()
                         .id("files-scroll")
@@ -358,14 +409,50 @@ impl Render for FileExplorerView {
                         .flex_shrink_0()
                         .overflow_y_scroll()
                         .track_scroll(&self.files_scroll_handle)
+                        .when(file_elements.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .px(px(10.))
+                                    .py(px(8.))
+                                    .text_sm()
+                                    .text_color(Theme::muted())
+                                    .child("No Markdown files"),
+                            )
+                        })
                         .children(file_elements),
                 )
-            })
+                .into_any_element()
+        });
+
+        let divider = || {
+            div()
+                .h(px(1.))
+                .mx(px(10.))
+                .bg(Theme::border())
+                .into_any_element()
+        };
+
+        let sections = match (section_order, files_section) {
+            (SidebarSectionOrder::FilesFirst, Some(files)) => {
+                vec![files, divider(), outline_section]
+            }
+            (_, Some(files)) => vec![outline_section, divider(), files],
+            (_, None) => vec![outline_section],
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .h_full()
+            .w(px(self.width))
+            .bg(Theme::sidebar())
+            .flex_shrink_0()
+            .children(sections)
     }
 }
 
 /// Returns supported Markdown files directly inside the supplied directory.
-fn list_markdown_files(directory: &Utf8Path) -> Vec<Utf8PathBuf> {
+pub(crate) fn list_markdown_files(directory: &Utf8Path) -> Vec<Utf8PathBuf> {
     let Ok(entries) = fs::read_dir(directory.as_std_path()) else {
         return Vec::new();
     };
@@ -387,8 +474,8 @@ fn list_markdown_files(directory: &Utf8Path) -> Vec<Utf8PathBuf> {
 }
 
 /// Returns whether the FILES section has useful sibling documents to display.
-fn should_show_files(files: &[Utf8PathBuf]) -> bool {
-    files.len() > 1
+fn should_show_files(files: &[Utf8PathBuf], has_explicit_workspace: bool) -> bool {
+    has_explicit_workspace || files.len() > 1
 }
 
 fn parse_outline_items(text: &str) -> Vec<OutlineItem> {
@@ -513,13 +600,17 @@ mod tests {
     }
 
     #[test]
-    fn files_section_requires_more_than_one_markdown_file() {
-        assert!(!should_show_files(&[]));
-        assert!(!should_show_files(&[Utf8PathBuf::from("only.md")]));
-        assert!(should_show_files(&[
-            Utf8PathBuf::from("first.md"),
-            Utf8PathBuf::from("second.md"),
-        ]));
+    fn files_section_shows_multiple_siblings_or_an_explicit_workspace() {
+        assert!(!should_show_files(&[], false));
+        assert!(!should_show_files(&[Utf8PathBuf::from("only.md")], false));
+        assert!(should_show_files(&[], true));
+        assert!(should_show_files(
+            &[
+                Utf8PathBuf::from("first.md"),
+                Utf8PathBuf::from("second.md"),
+            ],
+            false
+        ));
     }
 
     #[test]
