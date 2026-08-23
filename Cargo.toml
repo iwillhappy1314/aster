@@ -31,7 +31,9 @@ url = "2.5.7"
 futures = "0.3.31"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSColor", "NSColorSpace"] }
+objc2 = "0.6.3"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSColor", "NSColorSpace", "NSEvent", "NSView", "NSWindow"] }
+raw-window-handle = "0.6.2"
 
 [package.metadata.bundle]
 identifier = "com.kumarujjawal.aster"

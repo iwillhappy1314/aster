@@ -266,6 +266,8 @@ fn open_window(cx: &mut App, initial_path: Option<Utf8PathBuf>) -> anyhow::Resul
             // A regular window opens at its final bounds without macOS's zoom animation.
             window_bounds: Some(WindowBounds::Windowed(window_bounds)),
             window_min_size: Some(size(px(640.), px(480.))),
+            // Interactive custom chrome handles its own native drag and double-click gestures.
+            is_movable: !cfg!(target_os = "macos"),
             titlebar: Some(TitlebarOptions {
                 title: None,
                 appears_transparent: true,

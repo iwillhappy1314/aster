@@ -18,10 +18,11 @@ use crate::ui::theme::{Theme, ThemeName};
 use camino::Utf8PathBuf;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, AppContext, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
-    EntityInputHandler, ExternalPaths, FocusHandle, FontWeight, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Render,
-    ScrollHandle, StatefulInteractiveElement, Styled, UTF16Selection, Window, canvas, div, px, size,
+    AnyElement, App, AppContext, Bounds, ClickEvent, ClipboardItem, Context, ElementInputHandler,
+    Entity, EntityInputHandler, ExternalPaths, FocusHandle, FontWeight, InteractiveElement, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Render, ScrollHandle, StatefulInteractiveElement, Styled, UTF16Selection, Window, canvas, div,
+    px, size,
 };
 use gpui_component::notification::NotificationList;
 use gpui_gfm::{
@@ -44,6 +45,73 @@ const SIDEBAR_DIVIDER_WIDTH: f32 = 1.0;
 const TRAFFIC_LIGHT_SAFE_WIDTH: f32 = 88.0;
 /// Width reserved for each interactive control in the custom title bar.
 const TITLEBAR_CONTROL_WIDTH: f32 = NATIVE_TITLEBAR_HEIGHT;
+
+#[cfg(target_os = "macos")]
+thread_local! {
+    /// Retains the original mouse-down event until pointer movement confirms a window drag.
+    static TITLEBAR_MOUSE_DOWN_EVENT: std::cell::RefCell<Option<objc2::rc::Retained<objc2_app_kit::NSEvent>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Remembers a possible native window drag without consuming a normal click or double-click.
+#[cfg(target_os = "macos")]
+fn prepare_titlebar_window_drag() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+
+    let Some(main_thread) = MainThreadMarker::new() else {
+        return;
+    };
+    let event = NSApplication::sharedApplication(main_thread).currentEvent();
+    TITLEBAR_MOUSE_DOWN_EVENT.with(|stored_event| {
+        *stored_event.borrow_mut() = event;
+    });
+}
+
+/// Starts native movement after pointer motion confirms the user's drag intent.
+#[cfg(target_os = "macos")]
+fn start_titlebar_window_drag(window: &Window) {
+    use objc2_app_kit::NSView;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Some(event) = TITLEBAR_MOUSE_DOWN_EVENT.with(|stored_event| stored_event.borrow_mut().take())
+    else {
+        return;
+    };
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return;
+    };
+    let ns_view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
+    let Some(ns_window) = ns_view.window() else {
+        return;
+    };
+    ns_window.performWindowDragWithEvent(&event);
+}
+
+/// Clears a pending titlebar drag when the pointer is released without moving.
+#[cfg(target_os = "macos")]
+fn clear_pending_titlebar_window_drag() {
+    TITLEBAR_MOUSE_DOWN_EVENT.with(|stored_event| {
+        stored_event.borrow_mut().take();
+    });
+}
+
+/// Prepares native titlebar dragging on platforms where GPUI exposes it directly.
+#[cfg(not(target_os = "macos"))]
+fn prepare_titlebar_window_drag() {}
+
+/// Starts platform-managed movement after pointer motion confirms drag intent.
+#[cfg(not(target_os = "macos"))]
+fn start_titlebar_window_drag(window: &Window) {
+    window.start_window_move();
+}
+
+/// Clears platform-specific pending drag state when none is required.
+#[cfg(not(target_os = "macos"))]
+fn clear_pending_titlebar_window_drag() {}
 
 /// Returns the active tab after closing one tab from a collection of `tab_count` tabs.
 fn tab_index_after_close(tab_count: usize, closed_index: usize) -> Option<usize> {
@@ -68,6 +136,75 @@ fn previous_tab_index(active_index: usize, tab_count: usize) -> usize {
     }
 }
 
+/// Moves one vector item to a target index and returns its resulting index.
+fn move_vec_item<T>(items: &mut Vec<T>, from_index: usize, target_index: usize) -> Option<usize> {
+    if from_index >= items.len() {
+        return None;
+    }
+    if from_index == target_index {
+        return Some(from_index);
+    }
+
+    let item = items.remove(from_index);
+    let resulting_index = target_index.min(items.len());
+    items.insert(resulting_index, item);
+    Some(resulting_index)
+}
+
+/// Describes the gesture assigned to a mouse-down inside the empty titlebar region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlankTitlebarMouseAction {
+    PrepareWindowDrag,
+    PerformSystemDoubleClick,
+    Ignore,
+}
+
+/// Maps the platform click sequence to native empty-titlebar behavior.
+fn blank_titlebar_mouse_action(click_count: usize) -> BlankTitlebarMouseAction {
+    match click_count {
+        1 => BlankTitlebarMouseAction::PrepareWindowDrag,
+        2 => BlankTitlebarMouseAction::PerformSystemDoubleClick,
+        _ => BlankTitlebarMouseAction::Ignore,
+    }
+}
+
+/// Builds an interactive titlebar surface that preserves native drag and double-click behavior.
+fn titlebar_window_drag_surface(id: &'static str) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .on_mouse_down(
+            MouseButton::Left,
+            |event: &MouseDownEvent, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+                match blank_titlebar_mouse_action(event.click_count) {
+                    BlankTitlebarMouseAction::PrepareWindowDrag => {
+                        prepare_titlebar_window_drag();
+                    }
+                    BlankTitlebarMouseAction::PerformSystemDoubleClick => {
+                        clear_pending_titlebar_window_drag();
+                        window.titlebar_double_click();
+                    }
+                    BlankTitlebarMouseAction::Ignore => {}
+                }
+            },
+        )
+        .on_mouse_move(|event: &MouseMoveEvent, window, cx| {
+            if event.pressed_button == Some(MouseButton::Left) {
+                cx.stop_propagation();
+                start_titlebar_window_drag(window);
+            }
+        })
+        .on_mouse_up(
+            MouseButton::Left,
+            |_: &MouseUpEvent, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+                clear_pending_titlebar_window_drag();
+            },
+        )
+}
+
 /// Returns the file name displayed in the custom title bar, including its unsaved marker.
 fn document_title(path: Option<&Utf8PathBuf>, is_dirty: bool) -> String {
     let name = path
@@ -86,6 +223,37 @@ struct DocumentTab {
     editor_view: Entity<EditorView>,
     file_explorer_view: Entity<FileExplorerView>,
     preview_visible: bool,
+}
+
+/// Identifies the document tab currently participating in a GPUI drag operation.
+#[derive(Clone)]
+struct DocumentTabDrag {
+    tab_id: usize,
+    title: String,
+}
+
+/// Draws a compact label beside the pointer while a document tab is being dragged.
+struct DocumentTabDragPreview {
+    title: String,
+}
+
+impl Render for DocumentTabDragPreview {
+    /// Renders the dragged tab title without any document content or actions.
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .max_w(px(220.))
+            .px(px(12.))
+            .py(px(7.))
+            .overflow_hidden()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(Theme::border())
+            .bg(Theme::panel_alt())
+            .text_sm()
+            .text_color(Theme::text())
+            .opacity(0.88)
+            .child(self.title.clone())
+    }
 }
 
 pub struct RootView {
@@ -666,6 +834,32 @@ impl RootView {
         self.activate_tab(previous_tab_index(self.active_tab_index, self.tabs.len()), cx);
     }
 
+    /// Moves a document tab to a drop target while preserving the active document entity.
+    fn move_tab_to_index(
+        &mut self,
+        dragged_tab_id: usize,
+        target_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(from_index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.id == dragged_tab_id)
+        else {
+            return;
+        };
+        let active_tab_id = self.tabs.get(self.active_tab_index).map(|tab| tab.id);
+        if move_vec_item(&mut self.tabs, from_index, target_index).is_none() {
+            return;
+        }
+        if let Some(active_tab_id) = active_tab_id
+            && let Some(active_index) = self.tabs.iter().position(|tab| tab.id == active_tab_id)
+        {
+            self.active_tab_index = active_index;
+        }
+        cx.notify();
+    }
+
     /// Renders the Outline visibility control inside the custom title bar.
     fn render_titlebar_outline_toggle(
         &self,
@@ -691,7 +885,8 @@ impl RootView {
             })
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    window.prevent_default();
                     cx.stop_propagation();
                     this.toggle_outline(cx);
                 }),
@@ -744,7 +939,8 @@ impl RootView {
             .hover(|this| this.bg(Theme::panel()))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    window.prevent_default();
                     cx.stop_propagation();
                     this.toggle_preview(cx);
                 }),
@@ -812,6 +1008,10 @@ impl RootView {
 
         let tabs = tab_snapshots.into_iter().map(|(index, id, title)| {
             let is_active = index == self.active_tab_index;
+            let drag = DocumentTabDrag {
+                tab_id: id,
+                title: title.clone(),
+            };
             div()
                 .id(("document-tab", id))
                 .group("document-tab")
@@ -833,13 +1033,33 @@ impl RootView {
                     this.bg(Theme::panel_alt()).hover(|style| style.bg(Theme::panel()))
                 })
                 .cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                        this.activate_tab(index, cx);
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    this.activate_tab(index, cx);
+                }))
+                .on_drag(drag, |drag, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| DocumentTabDragPreview {
+                        title: drag.title.clone(),
+                    })
+                })
+                .drag_over::<DocumentTabDrag>(move |style, drag, _, _| {
+                    if drag.tab_id == id {
+                        style
+                    } else {
+                        style
+                            .border_l_2()
+                            .border_color(Theme::control_accent())
+                    }
+                })
+                .on_drop(cx.listener(
+                    move |this, drag: &DocumentTabDrag, window, cx| {
+                        window.prevent_default();
                         cx.stop_propagation();
-                    }),
-                )
+                        this.move_tab_to_index(drag.tab_id, index, cx);
+                    },
+                ))
                 .child(
                     div()
                         .flex_1()
@@ -861,9 +1081,12 @@ impl RootView {
                         .hover(|style| style.bg(Theme::panel()))
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                window.prevent_default();
                                 cx.stop_propagation();
-                                this.close_tab(index, window, cx);
+                                if event.click_count == 1 {
+                                    this.close_tab(index, window, cx);
+                                }
                             }),
                         )
                         .child("×"),
@@ -894,12 +1117,31 @@ impl RootView {
                     .hover(|style| style.bg(Theme::panel()))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            window.prevent_default();
                             cx.stop_propagation();
-                            this.add_blank_tab(cx);
+                            if event.click_count == 1 {
+                                this.add_blank_tab(cx);
+                            }
                         }),
                     )
                     .child("+"),
+            )
+            .child(
+                titlebar_window_drag_surface("titlebar-window-drag-region")
+                    .h_full()
+                    .min_w(px(24.))
+                    .flex_1()
+                    .drag_over::<DocumentTabDrag>(|style, _, _, _| {
+                        style.bg(Theme::panel())
+                    })
+                    .on_drop(cx.listener(
+                        |this, drag: &DocumentTabDrag, window, cx| {
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            this.move_tab_to_index(drag.tab_id, usize::MAX, cx);
+                        },
+                    )),
             )
             .into_any_element()
     }
@@ -1453,18 +1695,9 @@ impl Render for RootView {
             .border_b_1()
             .border_color(Theme::border())
             .flex_shrink_0()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_, event: &MouseDownEvent, window, _| {
-                    if event.click_count == 1 {
-                        window.start_window_move();
-                    }
-                }),
-            )
             .when(has_left_sidebar, |this| {
                 this.child(
-                    div()
-                        .id("left-sidebar-titlebar-background")
+                    titlebar_window_drag_surface("left-sidebar-titlebar-background")
                         .absolute()
                         .top_0()
                         .left_0()
@@ -1812,8 +2045,9 @@ impl Render for RootView {
 #[cfg(test)]
 mod tests {
     use super::{
-        document_title, next_tab_index, previous_tab_index, tab_index_after_close,
-        preview_find_char_range_to_utf16, utf16_offset_to_char_offset,
+        BlankTitlebarMouseAction, blank_titlebar_mouse_action, document_title, move_vec_item,
+        next_tab_index, previous_tab_index, preview_find_char_range_to_utf16,
+        tab_index_after_close, utf16_offset_to_char_offset,
     };
     use camino::Utf8PathBuf;
 
@@ -1838,6 +2072,32 @@ mod tests {
         assert_eq!(next_tab_index(2, 3), 0);
         assert_eq!(previous_tab_index(0, 3), 2);
         assert_eq!(previous_tab_index(2, 3), 1);
+    }
+
+    #[test]
+    fn moving_a_tab_preserves_expected_document_order() {
+        let mut tabs = vec![0, 1, 2, 3];
+
+        assert_eq!(move_vec_item(&mut tabs, 0, 2), Some(2));
+        assert_eq!(tabs, vec![1, 2, 0, 3]);
+        assert_eq!(move_vec_item(&mut tabs, 3, 0), Some(0));
+        assert_eq!(tabs, vec![3, 1, 2, 0]);
+    }
+
+    #[test]
+    fn blank_titlebar_distinguishes_drag_and_system_double_click() {
+        assert_eq!(
+            blank_titlebar_mouse_action(1),
+            BlankTitlebarMouseAction::PrepareWindowDrag
+        );
+        assert_eq!(
+            blank_titlebar_mouse_action(2),
+            BlankTitlebarMouseAction::PerformSystemDoubleClick
+        );
+        assert_eq!(
+            blank_titlebar_mouse_action(3),
+            BlankTitlebarMouseAction::Ignore
+        );
     }
 
     #[test]
