@@ -51,7 +51,8 @@ pub fn pick_save_path_async(
 }
 
 pub fn read_to_string(path: &Utf8PathBuf) -> AppResult<String> {
-    Ok(fs::read_to_string(path)?)
+    fs::read_to_string(path)
+        .map_err(|error| AppError::file_operation("read", path.as_std_path(), error))
 }
 
 /// Atomically replaces a file after fully syncing its contents and preserving existing permissions.

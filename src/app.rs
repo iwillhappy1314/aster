@@ -5,7 +5,6 @@ use crate::commands::{
     ThemeAyuMirage, ToggleLineNumbers, ToggleLiveMarkdown, ToggleOutline, TogglePreview, Undo,
 };
 use crate::services::assets::AsterAssetSource;
-use crate::services::fs::read_to_string;
 use crate::services::settings;
 use crate::ui::root::RootView;
 use crate::ui::theme::{Theme as AsterTheme, ThemeName};
@@ -327,17 +326,7 @@ fn build_root_view(
     let notifications = cx.new(|cx| NotificationList::new(window, cx));
     let editor_view = cx.new(|_| RootView::build_editor(document.clone(), inline_markdown.clone()));
     let file_explorer_view = cx.new(|_| RootView::build_file_explorer(document.clone()));
-
-    if let Some(path) = initial_path.as_ref().filter(|path| path.is_file()) {
-        if let Ok(text) = read_to_string(path) {
-            let _ = document.update(cx, |d, cx| {
-                d.path = Some(path.clone());
-                d.set_text(&text);
-                d.save_snapshot();
-                cx.notify();
-            });
-        }
-    }
+    let initial_file = initial_path.as_ref().filter(|path| path.is_file()).cloned();
 
     let root_view = cx.new(|_| {
         RootView::new(
@@ -350,6 +339,9 @@ fn build_root_view(
         )
     });
     install_should_close_prompt(window, cx, root_view.clone());
+    if let Some(path) = initial_file {
+        root_view.update(cx, |root, cx| root.load_initial_path(path, cx));
+    }
     if let Some(directory) = initial_path.filter(|path| path.is_dir()) {
         let _ = root_view.update(cx, |root, cx| {
             root.action_open_path(directory, window, cx);

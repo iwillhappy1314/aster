@@ -6,9 +6,10 @@ use crate::commands::{
 use crate::model::document::DocumentState;
 use crate::model::inline_markdown::InlineMarkdownState;
 use crate::services::document_persistence::{
-    DocumentSaveOutcome, DocumentSaveSnapshot, apply_document_save, write_document_snapshot,
+    DocumentSaveOutcome, DocumentSaveSnapshot, DocumentWriteReceipt, LoadedDocumentSnapshot,
+    apply_document_save, read_document_snapshot, write_document_snapshot,
 };
-use crate::services::fs::{pick_open_path_async, pick_save_path_async, read_to_string};
+use crate::services::fs::{pick_open_path_async, pick_save_path_async};
 use crate::services::inline_markdown::compute_inline_spans;
 use crate::services::settings::{self, OutlinePosition, Settings};
 use crate::services::tasks::Debouncer;
@@ -185,6 +186,30 @@ enum CloseContinuation {
     QuitApp,
 }
 
+/// Owns one immutable save request while it is active or waiting behind another write.
+#[derive(Clone)]
+struct PendingDocumentSave {
+    document: Entity<DocumentState>,
+    snapshot: DocumentSaveSnapshot,
+    path: Utf8PathBuf,
+    continuation: Option<CloseContinuation>,
+}
+
+/// Starts an idle operation immediately or coalesces waiting work to its newest request.
+fn queue_latest_operation<T>(
+    in_flight: &mut bool,
+    pending: &mut Option<T>,
+    request: T,
+) -> Option<T> {
+    if *in_flight {
+        *pending = Some(request);
+        None
+    } else {
+        *in_flight = true;
+        Some(request)
+    }
+}
+
 /// Returns whether a completed save is safe to follow with a destructive close action.
 fn save_outcome_allows_close(outcome: &DocumentSaveOutcome) -> bool {
     matches!(
@@ -287,6 +312,14 @@ struct DocumentTab {
     editor_view: Entity<EditorView>,
     file_explorer_view: Entity<FileExplorerView>,
     preview_visible: bool,
+    /// Path being read for this placeholder tab, cleared when loading finishes or is abandoned.
+    loading_path: Option<Utf8PathBuf>,
+    /// Whether a background write currently owns this tab's persistence queue.
+    save_in_flight: bool,
+    /// Target currently being written, used by Save while a Save As request is still pending.
+    active_save_path: Option<Utf8PathBuf>,
+    /// Newest save request waiting behind the active write.
+    pending_save: Option<PendingDocumentSave>,
 }
 
 /// Identifies the document tab currently participating in a GPUI drag operation.
@@ -388,6 +421,10 @@ impl RootView {
             editor_view: editor_view.clone(),
             file_explorer_view: file_explorer_view.clone(),
             preview_visible,
+            loading_path: None,
+            save_in_flight: false,
+            active_save_path: None,
+            pending_save: None,
         };
 
         Self {
@@ -480,6 +517,10 @@ impl RootView {
             editor_view,
             file_explorer_view,
             preview_visible,
+            loading_path: None,
+            save_in_flight: false,
+            active_save_path: None,
+            pending_save: None,
         }
     }
 
@@ -536,24 +577,109 @@ impl RootView {
         if let Some(index) = self
             .tabs
             .iter()
-            .position(|tab| tab.document.read(cx).path.as_ref() == Some(path))
+            .position(|tab| {
+                tab.document.read(cx).path.as_ref() == Some(path)
+                    || tab.loading_path.as_ref() == Some(path)
+            })
         {
             self.activate_tab(index, cx);
             return;
         }
 
-        let Ok(text) = read_to_string(path) else {
-            return;
-        };
-        let tab = self.create_document_tab(
-            Some(path.clone()),
-            &text,
-            settings::get_preview_visible(),
-            cx,
-        );
+        let mut tab = self.create_document_tab(None, "", settings::get_preview_visible(), cx);
+        tab.loading_path = Some(path.clone());
+        let tab_id = tab.id;
+        let document = tab.document.clone();
+        let expected_revision = document.read(cx).revision;
         self.tabs.push(tab);
         self.activate_tab(self.tabs.len() - 1, cx);
-        cx.add_recent_document(path.as_std_path());
+        self.spawn_document_load(tab_id, document, expected_revision, path.clone(), cx);
+    }
+
+    /// Loads a startup path into the existing initial tab without blocking window creation.
+    pub fn load_initial_path(&mut self, path: Utf8PathBuf, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.first_mut() else {
+            return;
+        };
+        if tab.document.read(cx).revision != 0 || tab.loading_path.is_some() {
+            return;
+        }
+
+        tab.loading_path = Some(path.clone());
+        let tab_id = tab.id;
+        let document = tab.document.clone();
+        let expected_revision = document.read(cx).revision;
+        cx.notify();
+        self.spawn_document_load(tab_id, document, expected_revision, path, cx);
+    }
+
+    /// Reads and parses a document on the background executor before applying pure loaded data.
+    fn spawn_document_load(
+        &mut self,
+        tab_id: usize,
+        document: Entity<DocumentState>,
+        expected_revision: u64,
+        path: Utf8PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let path_for_read = path.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { read_document_snapshot(&path_for_read) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.complete_document_load(
+                    tab_id,
+                    &document,
+                    expected_revision,
+                    path,
+                    result,
+                    cx,
+                );
+            });
+        })
+        .detach();
+    }
+
+    /// Applies a loaded Rope only when its placeholder tab and expected revision still exist.
+    fn complete_document_load(
+        &mut self,
+        tab_id: usize,
+        document: &Entity<DocumentState>,
+        expected_revision: u64,
+        path: Utf8PathBuf,
+        result: crate::error::AppResult<LoadedDocumentSnapshot>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.tabs.iter().position(|tab| {
+            tab.id == tab_id
+                && tab.document.entity_id() == document.entity_id()
+                && tab.loading_path.as_ref() == Some(&path)
+        }) else {
+            return;
+        };
+        self.tabs[index].loading_path = None;
+
+        match result {
+            Ok(loaded) if document.read(cx).revision == expected_revision => {
+                document.update(cx, |document, cx| {
+                    document.load_rope(path.clone(), loaded.rope, loaded.content_hash);
+                    cx.notify();
+                });
+                cx.add_recent_document(path.as_std_path());
+            }
+            Ok(_) => {}
+            Err(error) => {
+                MessageDialog::new()
+                    .set_level(MessageLevel::Error)
+                    .set_title("Open failed")
+                    .set_description(format!("Could not open '{}'.\n\n{error}", path))
+                    .set_buttons(MessageButtons::Ok)
+                    .show();
+            }
+        }
+        cx.notify();
     }
 
     /// Saves the active document, capturing its entity and revision before any picker opens.
@@ -561,9 +687,28 @@ impl RootView {
         let document = self.document.clone();
         let snapshot = DocumentSaveSnapshot::capture(document.read(cx));
 
-        if !force_save_as && let Some(path) = snapshot.original_path.clone() {
-            let outcome = self.save_snapshot_to_path(&document, &snapshot, path, cx);
-            self.present_save_failure(&outcome);
+        let queued_path = self
+            .tabs
+            .iter()
+            .find(|tab| tab.document.entity_id() == document.entity_id())
+            .and_then(|tab| {
+                tab.pending_save
+                    .as_ref()
+                    .map(|pending| pending.path.clone())
+                    .or_else(|| tab.active_save_path.clone())
+            });
+        if !force_save_as
+            && let Some(path) = queued_path.or_else(|| snapshot.original_path.clone())
+        {
+            self.enqueue_document_save(
+                PendingDocumentSave {
+                    document,
+                    snapshot,
+                    path,
+                    continuation: None,
+                },
+                cx,
+            );
             return;
         }
 
@@ -578,29 +723,140 @@ impl RootView {
         path
     }
 
-    /// Writes one immutable snapshot and applies its result only to the captured document.
-    fn save_snapshot_to_path(
+    /// Starts one save or replaces the waiting request with the newest immutable snapshot.
+    fn enqueue_document_save(
         &mut self,
-        document: &Entity<DocumentState>,
-        snapshot: &DocumentSaveSnapshot,
-        path: Utf8PathBuf,
+        mut request: PendingDocumentSave,
         cx: &mut Context<Self>,
-    ) -> DocumentSaveOutcome {
-        let path = Self::normalize_save_path(path);
-        if let Err(error) = write_document_snapshot(&path, snapshot) {
-            return DocumentSaveOutcome::Failed {
-                path: Some(path),
-                message: error.to_string(),
+    ) {
+        request.path = Self::normalize_save_path(request.path);
+        let Some(index) = self.tabs.iter().position(|tab| {
+            tab.document.entity_id() == request.document.entity_id()
+        }) else {
+            return;
+        };
+
+        if request.continuation.is_none() {
+            request.continuation = self.tabs[index]
+                .pending_save
+                .as_ref()
+                .and_then(|pending| pending.continuation);
+        }
+        let tab = &mut self.tabs[index];
+        let request_to_start = queue_latest_operation(
+            &mut tab.save_in_flight,
+            &mut tab.pending_save,
+            request,
+        );
+        if let Some(request) = request_to_start.as_ref() {
+            tab.active_save_path = Some(request.path.clone());
+        }
+        cx.notify();
+        if let Some(request) = request_to_start {
+            self.spawn_document_save(request, cx);
+        }
+    }
+
+    /// Writes one snapshot on the background executor and serially advances its document queue.
+    fn spawn_document_save(
+        &mut self,
+        request: PendingDocumentSave,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let path = request.path.clone();
+            let snapshot = request.snapshot.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { write_document_snapshot(&path, &snapshot) })
+                .await;
+            let continuation = this
+                .update(cx, |this, cx| {
+                    this.complete_document_save(request, result, cx)
+                })
+                .ok()
+                .flatten();
+
+            let Some(continuation) = continuation else {
+                return;
             };
+            match continuation {
+                CloseContinuation::Tab { tab_id, window } => {
+                    let this = this.clone();
+                    let _ = cx.update_window(window, move |_, window, cx| {
+                        let _ = this.update(cx, |this, cx| {
+                            this.close_tab_without_confirmation(tab_id, window, cx);
+                        });
+                    });
+                }
+                CloseContinuation::Window { window } => {
+                    let this = this.clone();
+                    let _ = cx.update_window(window, move |_, window, cx| {
+                        let can_close = this
+                            .update(cx, |this, cx| this.confirm_before_window_close(window, cx))
+                            .unwrap_or(false);
+                        if can_close {
+                            window.remove_window();
+                        }
+                    });
+                }
+                CloseContinuation::QuitApp => {
+                    let _ = cx.update(|cx| cx.dispatch_action(&Quit));
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Applies a background write, starts the newest queued save, and returns a safe close intent.
+    fn complete_document_save(
+        &mut self,
+        request: PendingDocumentSave,
+        result: crate::error::AppResult<DocumentWriteReceipt>,
+        cx: &mut Context<Self>,
+    ) -> Option<CloseContinuation> {
+        let index = self.tabs.iter().position(|tab| {
+            tab.document.entity_id() == request.document.entity_id()
+        })?;
+
+        let outcome = match result {
+            Ok(receipt) => {
+                let document_unchanged = request.document.update(cx, |document, cx| {
+                    let unchanged = apply_document_save(
+                        document,
+                        request.path.clone(),
+                        &request.snapshot,
+                        receipt,
+                    );
+                    cx.notify();
+                    unchanged
+                });
+                cx.add_recent_document(request.path.as_std_path());
+                DocumentSaveOutcome::Saved { document_unchanged }
+            }
+            Err(error) => DocumentSaveOutcome::Failed {
+                path: Some(request.path.clone()),
+                message: error.to_string(),
+            },
+        };
+        self.present_save_failure(&outcome);
+
+        if let Some(mut pending) = self.tabs[index].pending_save.take() {
+            if pending.continuation.is_none() {
+                pending.continuation = request.continuation;
+            }
+            self.tabs[index].active_save_path = Some(pending.path.clone());
+            self.spawn_document_save(pending, cx);
+            cx.notify();
+            return None;
         }
 
-        let document_unchanged = document.update(cx, |document, cx| {
-            let unchanged = apply_document_save(document, path.clone(), snapshot);
-            cx.notify();
-            unchanged
-        });
-        cx.add_recent_document(path.as_std_path());
-        DocumentSaveOutcome::Saved { document_unchanged }
+        self.tabs[index].save_in_flight = false;
+        self.tabs[index].active_save_path = None;
+        cx.notify();
+        save_outcome_allows_close(&outcome)
+            .then_some(request.continuation)
+            .flatten()
     }
 
     /// Shows a visible error for a failed save while leaving the document dirty.
@@ -631,64 +887,50 @@ impl RootView {
         let receiver = pick_save_path_async(cx, snapshot.original_path.as_ref());
 
         cx.spawn(async move |this, cx| {
-            let outcome = match receiver.await {
+            match receiver.await {
                 Ok(Ok(Some(path))) => match Utf8PathBuf::try_from(path) {
-                    Ok(path) => this
-                        .update(cx, |this, cx| {
-                            this.save_snapshot_to_path(&document, &snapshot, path, cx)
-                        })
-                        .unwrap_or_else(|error| DocumentSaveOutcome::Failed {
-                            path: None,
-                            message: error.to_string(),
-                        }),
-                    Err(path) => DocumentSaveOutcome::Failed {
-                        path: None,
-                        message: format!(
-                            "The selected path is not valid UTF-8: {}",
-                            path.as_path().display()
-                        ),
-                    },
-                },
-                Ok(Ok(None)) => DocumentSaveOutcome::Cancelled,
-                Ok(Err(error)) => DocumentSaveOutcome::Failed {
-                    path: None,
-                    message: error.to_string(),
-                },
-                Err(error) => DocumentSaveOutcome::Failed {
-                    path: None,
-                    message: error.to_string(),
-                },
-            };
-
-            let _ = this.update(cx, |this, _| this.present_save_failure(&outcome));
-            if !save_outcome_allows_close(&outcome) {
-                return;
-            }
-
-            match continuation {
-                Some(CloseContinuation::Tab { tab_id, window }) => {
-                    let this = this.clone();
-                    let _ = cx.update_window(window, move |_, window, cx| {
+                    Ok(path) => {
                         let _ = this.update(cx, |this, cx| {
-                            this.close_tab_without_confirmation(tab_id, window, cx);
+                            this.enqueue_document_save(
+                                PendingDocumentSave {
+                                    document,
+                                    snapshot,
+                                    path,
+                                    continuation,
+                                },
+                                cx,
+                            );
                         });
-                    });
+                    }
+                    Err(path) => {
+                        let outcome = DocumentSaveOutcome::Failed {
+                            path: None,
+                            message: format!(
+                                "The selected path is not valid UTF-8: {}",
+                                path.as_path().display()
+                            ),
+                        };
+                        let _ = this.update(cx, |this, _| this.present_save_failure(&outcome));
+                    }
+                },
+                Ok(Ok(None)) => {
+                    let outcome = DocumentSaveOutcome::Cancelled;
+                    let _ = this.update(cx, |this, _| this.present_save_failure(&outcome));
                 }
-                Some(CloseContinuation::Window { window }) => {
-                    let this = this.clone();
-                    let _ = cx.update_window(window, move |_, window, cx| {
-                        let can_close = this
-                            .update(cx, |this, cx| this.confirm_before_window_close(window, cx))
-                            .unwrap_or(false);
-                        if can_close {
-                            window.remove_window();
-                        }
-                    });
+                Ok(Err(error)) => {
+                    let outcome = DocumentSaveOutcome::Failed {
+                        path: None,
+                        message: error.to_string(),
+                    };
+                    let _ = this.update(cx, |this, _| this.present_save_failure(&outcome));
                 }
-                Some(CloseContinuation::QuitApp) => {
-                    let _ = cx.update(|cx| cx.dispatch_action(&Quit));
+                Err(error) => {
+                    let outcome = DocumentSaveOutcome::Failed {
+                        path: None,
+                        message: error.to_string(),
+                    };
+                    let _ = this.update(cx, |this, _| this.present_save_failure(&outcome));
                 }
-                None => {}
             }
         })
         .detach();
@@ -720,10 +962,27 @@ impl RootView {
 
         let save = |this: &mut Self, cx: &mut Context<Self>| -> bool {
             let snapshot = DocumentSaveSnapshot::capture(document.read(cx));
-            if let Some(path) = snapshot.original_path.clone() {
-                let outcome = this.save_snapshot_to_path(&document, &snapshot, path, cx);
-                this.present_save_failure(&outcome);
-                save_outcome_allows_close(&outcome)
+            let queued_path = this
+                .tabs
+                .iter()
+                .find(|tab| tab.document.entity_id() == document.entity_id())
+                .and_then(|tab| {
+                    tab.pending_save
+                        .as_ref()
+                        .map(|pending| pending.path.clone())
+                        .or_else(|| tab.active_save_path.clone())
+                });
+            if let Some(path) = queued_path.or_else(|| snapshot.original_path.clone()) {
+                this.enqueue_document_save(
+                    PendingDocumentSave {
+                        document,
+                        snapshot,
+                        path,
+                        continuation: Some(continuation),
+                    },
+                    cx,
+                );
+                false
             } else {
                 this.start_save_as(document, snapshot, Some(continuation), cx);
                 false
@@ -1330,10 +1589,17 @@ impl RootView {
             .enumerate()
             .map(|(index, tab)| {
                 let document = tab.document.read(cx);
+                let mut title = tab.loading_path.as_ref().map_or_else(
+                    || document_title(document.path.as_ref(), document.dirty),
+                    |path| format!("{} — Opening…", path.file_name().unwrap_or("document.md")),
+                );
+                if tab.save_in_flight {
+                    title.push_str(" — Saving…");
+                }
                 (
                     index,
                     tab.id,
-                    document_title(document.path.as_ref(), document.dirty),
+                    title,
                 )
             })
             .collect::<Vec<_>>();
@@ -2438,13 +2704,36 @@ impl Render for RootView {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlankTitlebarMouseAction, OpenTargetKind, blank_titlebar_mouse_action,
+        BlankTitlebarMouseAction, OpenTargetKind, RootView, blank_titlebar_mouse_action,
         classify_open_target, document_title, move_vec_item, next_tab_index, previous_tab_index,
-        normalize_markdown_anchor, preview_find_char_range_to_utf16,
+        normalize_markdown_anchor, preview_find_char_range_to_utf16, queue_latest_operation,
         save_outcome_allows_close, tab_index_after_close, utf16_offset_to_char_offset,
     };
+    use crate::model::document::DocumentState;
+    use crate::model::inline_markdown::InlineMarkdownState;
     use crate::services::document_persistence::DocumentSaveOutcome;
+    use crate::ui::editor::EditorView;
+    use crate::ui::file_explorer::FileExplorerView;
     use camino::Utf8PathBuf;
+    use gpui::{AppContext, Context, TestAppContext, Window};
+    use gpui_component::notification::NotificationList;
+
+    /// Builds a real root view for deterministic foreground/background persistence tests.
+    fn build_test_root(window: &mut Window, cx: &mut Context<RootView>) -> RootView {
+        let document = cx.new(|_| DocumentState::new_empty());
+        let inline_markdown = cx.new(|_| InlineMarkdownState::new());
+        let editor_view = cx.new(|_| EditorView::new(document.clone(), inline_markdown.clone()));
+        let file_explorer_view = cx.new(|_| FileExplorerView::new(document.clone()));
+        let notifications = cx.new(|cx| NotificationList::new(window, cx));
+        RootView::new(
+            document,
+            inline_markdown,
+            editor_view,
+            file_explorer_view,
+            notifications,
+            false,
+        )
+    }
 
     #[test]
     fn document_title_uses_file_name_and_unsaved_marker() {
@@ -2496,6 +2785,86 @@ mod tests {
             path: None,
             message: "permission denied".to_string(),
         }));
+    }
+
+    #[test]
+    fn save_queue_runs_one_request_and_coalesces_waiting_work_to_the_latest() {
+        let mut in_flight = false;
+        let mut pending = None;
+
+        assert_eq!(
+            queue_latest_operation(&mut in_flight, &mut pending, 1),
+            Some(1)
+        );
+        assert_eq!(
+            queue_latest_operation(&mut in_flight, &mut pending, 2),
+            None
+        );
+        assert_eq!(
+            queue_latest_operation(&mut in_flight, &mut pending, 3),
+            None
+        );
+        assert_eq!((in_flight, pending), (true, Some(3)));
+    }
+
+    #[gpui::test]
+    fn queued_background_saves_leave_the_newest_snapshot_on_disk(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let directory = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(directory.path().join("queued-save.md")).unwrap();
+        let (root, cx) = cx.add_window_view(build_test_root);
+
+        root.update(cx, |root, cx| {
+            let document = root.document.clone();
+            document.update(cx, |document, _| {
+                document.path = Some(path.clone());
+                document.insert(0, "older");
+            });
+            root.save_document(cx, false);
+            document.update(cx, |document, _| {
+                document.insert(document.len_chars(), " newer");
+            });
+            root.save_document(cx, false);
+
+            assert!(root.tabs[0].save_in_flight);
+            assert!(root.tabs[0].pending_save.is_some());
+        });
+        cx.run_until_parked();
+
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "older newer");
+        root.update(cx, |root, cx| {
+            assert!(!root.tabs[0].save_in_flight);
+            assert!(root.tabs[0].pending_save.is_none());
+            assert!(!root.document.read(cx).dirty);
+        });
+    }
+
+    #[gpui::test]
+    fn closing_a_loading_tab_discards_its_background_result(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let directory = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(directory.path().join("large.md")).unwrap();
+        std::fs::write(&path, "0123456789abcdef\n".repeat(640 * 1024)).unwrap();
+        let (root, cx) = cx.add_window_view(build_test_root);
+
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                root.open_path_in_tab(&path, cx);
+                let loading_tab_id = root.tabs[root.active_tab_index].id;
+                root.add_blank_tab(cx);
+                root.close_tab_without_confirmation(loading_tab_id, window, cx);
+                assert_eq!(root.tabs.len(), 2);
+            });
+        });
+        cx.run_until_parked();
+
+        root.update(cx, |root, cx| {
+            assert_eq!(root.tabs.len(), 2);
+            assert!(root.tabs.iter().all(|tab| {
+                tab.loading_path.as_ref() != Some(&path)
+                    && tab.document.read(cx).path.as_ref() != Some(&path)
+            }));
+        });
     }
 
     #[test]

@@ -235,17 +235,37 @@ impl DocumentState {
 
     /// Returns a stable process-local hash of the current document content.
     pub fn content_hash(&self) -> u64 {
+        Self::rope_content_hash(&self.rope)
+    }
+
+    /// Returns the same stable hash for an immutable Rope captured outside the document entity.
+    pub fn rope_content_hash(rope: &Rope) -> u64 {
         let mut h = DefaultHasher::new();
-        self.rope.hash(&mut h);
+        rope.hash(&mut h);
         h.finish()
     }
 
     /// Records a completed disk snapshot and clears dirty only when the document still matches it.
     pub fn record_saved_snapshot(&mut self, revision: u64, content_hash: u64) -> bool {
         self.last_saved_hash = content_hash;
-        let unchanged = self.revision == revision && self.content_hash() == content_hash;
+        // Every content mutation increments revision, so an equal revision still represents
+        // the exact Rope whose hash was computed by the background save task.
+        let unchanged = self.revision == revision;
         self.dirty = !unchanged;
         unchanged
+    }
+
+    /// Replaces a loading placeholder with a Rope parsed off the UI thread.
+    pub fn load_rope(&mut self, path: Utf8PathBuf, rope: Rope, content_hash: u64) {
+        self.path = Some(path);
+        self.rope = rope;
+        self.cursor = self.rope.len_chars();
+        self.clear_selection();
+        self.clear_undo_history();
+        self.bump_revision();
+        self.last_edit = None;
+        self.last_saved_hash = content_hash;
+        self.dirty = false;
     }
 
     fn bump_revision(&mut self) {
