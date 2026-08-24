@@ -1,6 +1,7 @@
 //! Code block rendering.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -39,6 +40,48 @@ static COPY_FEEDBACK: LazyLock<Mutex<HashMap<usize, usize>>> =
 static COPY_FEEDBACK_GENERATION: AtomicUsize = AtomicUsize::new(1);
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(load_theme_set);
+
+/// One source-relative syntax color produced for editable fenced code.
+#[derive(Clone, Debug)]
+pub struct CodeSyntaxHighlight {
+  pub range: Range<usize>,
+  pub color: Hsla,
+}
+
+/// Highlights fenced-code text with the same Syntect themes used by Preview.
+pub fn code_syntax_highlights(
+  language: &str,
+  text: &str,
+  syntax_theme: CodeSyntaxTheme,
+) -> Vec<CodeSyntaxHighlight> {
+  let Some(syntax) = code_block_syntax(language) else {
+    return Vec::new();
+  };
+  let mut highlighter = HighlightLines::new(syntax, code_block_theme(syntax_theme));
+  let mut highlights = Vec::new();
+  let mut offset = 0usize;
+
+  for line in LinesWithEndings::from(text) {
+    let Ok(regions) = highlighter.highlight_line(line, &SYNTAX_SET) else {
+      return Vec::new();
+    };
+    for (style, region) in regions {
+      let end = offset + region.len();
+      if offset < end {
+        let rgb_value = ((style.foreground.r as u32) << 16)
+          | ((style.foreground.g as u32) << 8)
+          | style.foreground.b as u32;
+        highlights.push(CodeSyntaxHighlight {
+          range: offset..end,
+          color: rgb(rgb_value).into(),
+        });
+      }
+      offset = end;
+    }
+  }
+
+  (offset == text.len()).then_some(highlights).unwrap_or_default()
+}
 
 // Indentation dots
 const INDENT_DOT_SIZE_PX: f32 = 2.0;
@@ -756,6 +799,19 @@ mod tests {
     );
     assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), text.len());
     assert!(runs.windows(2).any(|pair| pair[0].color != pair[1].color));
+  }
+
+  #[test]
+  fn editable_rust_highlights_cover_utf8_safe_ranges() {
+    let text = "fn main() { println!(\"你好\"); }";
+    let highlights = code_syntax_highlights("rust", text, CodeSyntaxTheme::AyuLight);
+
+    assert!(!highlights.is_empty());
+    assert_eq!(highlights.last().unwrap().range.end, text.len());
+    assert!(highlights.iter().all(|highlight| {
+      text.is_char_boundary(highlight.range.start)
+        && text.is_char_boundary(highlight.range.end)
+    }));
   }
 
   #[test]

@@ -2,6 +2,7 @@
 
 pub mod blocks;
 pub mod code_block;
+pub use code_block::{CodeSyntaxHighlight, code_syntax_highlights};
 pub mod code_preview;
 pub mod image;
 pub mod inline;

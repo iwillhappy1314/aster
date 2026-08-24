@@ -1,4 +1,5 @@
 use crate::model::document::EditDelta;
+use crate::services::complex_markdown::{ComplexMarkdownComponent, complex_markdown_components};
 use crate::services::syntax::SyntaxSpan;
 use crate::services::syntax::markdown_spans;
 use std::time::Instant;
@@ -6,10 +7,11 @@ use std::time::Instant;
 #[derive(Clone, Debug)]
 pub struct InlineParseResult {
     pub spans: Vec<SyntaxSpan>,
+    pub components: Vec<ComplexMarkdownComponent>,
     pub parse_millis: f32,
 }
 
-/// Computes markdown syntax spans for inline editor presentation.
+/// Computes Markdown syntax spans and complex components for editor presentation.
 ///
 /// This runs on a background thread and returns immutable span snapshots keyed
 /// by document revision in the caller.
@@ -26,9 +28,11 @@ pub fn compute_inline_spans(source: &str, _last_edit: Option<&EditDelta>) -> Inl
         )
     });
     let spans = markdown_spans(source);
+    let components = complex_markdown_components(source);
     let parse_millis = started.elapsed().as_secs_f32() * 1000.0;
     InlineParseResult {
         spans,
+        components,
         parse_millis,
     }
 }

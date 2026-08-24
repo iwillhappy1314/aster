@@ -18,12 +18,34 @@ pub enum SyntaxKind {
     EmphasisMarker,
     EmphasisText,
     StrongText,
+    StrikethroughMarker,
+    StrikethroughText,
+    HorizontalRule,
 }
 
 #[derive(Clone, Debug)]
 pub struct SyntaxSpan {
     pub range: Range<usize>,
     pub kind: SyntaxKind,
+}
+
+/// Describes the source and language of one fenced Markdown code block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FencedCodeBlock {
+    pub language: Option<String>,
+    pub content_range: Range<usize>,
+}
+
+/// Classifies one source line for block-level editor presentation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MarkdownLineKind {
+    Paragraph,
+    Quote,
+    List { indent: usize },
+    Task { indent: usize },
+    CodeFence,
+    CodeBody,
+    HorizontalRule,
 }
 
 /// Scans Markdown source and returns byte-range spans for syntax highlighting.
@@ -73,26 +95,33 @@ pub fn markdown_spans(source: &str) -> Vec<SyntaxSpan> {
                 }
             }
 
-            if content.starts_with('>') {
+            if horizontal_rule_len(content).is_some() {
                 spans.push(SyntaxSpan {
-                    range: content_start..(content_start + 1),
-                    kind: SyntaxKind::QuoteMarker,
+                    range: content_start..(content_start + content.len()),
+                    kind: SyntaxKind::HorizontalRule,
                 });
-            }
+            } else {
+                if content.starts_with('>') {
+                    spans.push(SyntaxSpan {
+                        range: content_start..(content_start + 1),
+                        kind: SyntaxKind::QuoteMarker,
+                    });
+                }
 
-            if let Some(marker_len) = task_marker_len(content) {
-                spans.push(SyntaxSpan {
-                    range: content_start..(content_start + marker_len),
-                    kind: SyntaxKind::TaskMarker,
-                });
-            } else if let Some(marker_len) = list_marker_len(content) {
-                spans.push(SyntaxSpan {
-                    range: content_start..(content_start + marker_len),
-                    kind: SyntaxKind::ListMarker,
-                });
-            }
+                if let Some(marker_len) = task_marker_len(content) {
+                    spans.push(SyntaxSpan {
+                        range: content_start..(content_start + marker_len),
+                        kind: SyntaxKind::TaskMarker,
+                    });
+                } else if let Some(marker_len) = list_marker_len(content) {
+                    spans.push(SyntaxSpan {
+                        range: content_start..(content_start + marker_len),
+                        kind: SyntaxKind::ListMarker,
+                    });
+                }
 
-            scan_inline(line, offset, &mut spans);
+                scan_inline(line, offset, &mut spans);
+            }
         }
 
         offset += raw_line.len();
@@ -132,6 +161,89 @@ pub fn markdown_heading_levels(source: &str) -> Vec<Option<u8>> {
             }
         })
         .collect()
+}
+
+/// Returns the block presentation kind for every source line.
+pub fn markdown_line_kinds(source: &str) -> Vec<MarkdownLineKind> {
+    let mut active_fence: Option<(u8, usize)> = None;
+
+    source
+        .split('\n')
+        .map(|raw_line| {
+            let line = raw_line.trim_end_matches('\r');
+            let leading = leading_whitespace_bytes(line);
+            let content = &line[leading..];
+
+            if let Some((fence_marker, fence_len)) = fence_prefix(content) {
+                if let Some((active_marker, active_len)) = active_fence
+                    && fence_marker == active_marker
+                    && fence_len >= active_len
+                {
+                    active_fence = None;
+                } else if active_fence.is_none() {
+                    active_fence = Some((fence_marker, fence_len));
+                }
+                MarkdownLineKind::CodeFence
+            } else if active_fence.is_some() {
+                MarkdownLineKind::CodeBody
+            } else if horizontal_rule_len(content).is_some() {
+                MarkdownLineKind::HorizontalRule
+            } else if task_marker_len(content).is_some() {
+                MarkdownLineKind::Task { indent: leading }
+            } else if list_marker_len(content).is_some() {
+                MarkdownLineKind::List { indent: leading }
+            } else if content.starts_with('>') {
+                MarkdownLineKind::Quote
+            } else {
+                MarkdownLineKind::Paragraph
+            }
+        })
+        .collect()
+}
+
+/// Returns fenced code content ranges together with their optional language identifiers.
+pub fn fenced_code_blocks(source: &str) -> Vec<FencedCodeBlock> {
+    let mut blocks = Vec::new();
+    let mut active: Option<(u8, usize, Option<String>, usize)> = None;
+    let mut offset = 0usize;
+
+    for raw_line in source.split_inclusive('\n') {
+        let line = raw_line.trim_end_matches('\n').trim_end_matches('\r');
+        let leading = leading_whitespace_bytes(line);
+        let content = &line[leading..];
+
+        if let Some((marker, marker_len)) = fence_prefix(content) {
+            if let Some((active_marker, active_len, language, content_start)) = active.take() {
+                if marker == active_marker && marker_len >= active_len {
+                    blocks.push(FencedCodeBlock {
+                        language,
+                        content_range: content_start..offset,
+                    });
+                } else {
+                    active = Some((active_marker, active_len, language, content_start));
+                }
+            } else {
+                let language = content[marker_len..].trim();
+                active = Some((
+                    marker,
+                    marker_len,
+                    (!language.is_empty()).then(|| language.to_string()),
+                    offset + raw_line.len(),
+                ));
+            }
+        }
+
+        offset += raw_line.len();
+    }
+
+    if let Some((_, _, language, content_start)) = active {
+        blocks.push(FencedCodeBlock {
+            language,
+            content_range: content_start..source.len(),
+        });
+    }
+
+    blocks
 }
 
 /// Returns the ATX heading level (1–6) for a single Markdown source line.
@@ -233,6 +345,19 @@ fn list_marker_len(content: &str) -> Option<usize> {
     None
 }
 
+/// Returns the byte length when a line is a Markdown horizontal rule.
+fn horizontal_rule_len(content: &str) -> Option<usize> {
+    let compact = content
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    let marker = *compact.first()?;
+    if !matches!(marker, b'-' | b'*' | b'_') {
+        return None;
+    }
+    (compact.len() >= 3 && compact.iter().all(|byte| *byte == marker)).then_some(content.len())
+}
+
 fn scan_inline(line: &str, line_start: usize, spans: &mut Vec<SyntaxSpan>) {
     let bytes = line.as_bytes();
     let mut i = 0usize;
@@ -330,6 +455,26 @@ fn scan_inline(line: &str, line_start: usize, spans: &mut Vec<SyntaxSpan>) {
                     continue;
                 }
             }
+            b'~' if i + 1 < bytes.len() && bytes[i + 1] == b'~' => {
+                if let Some(close) = find_emphasis_close(bytes, i + 2, b'~', 2) {
+                    spans.push(SyntaxSpan {
+                        range: (line_start + i)..(line_start + i + 2),
+                        kind: SyntaxKind::StrikethroughMarker,
+                    });
+                    if close > i + 2 {
+                        spans.push(SyntaxSpan {
+                            range: (line_start + i + 2)..(line_start + close),
+                            kind: SyntaxKind::StrikethroughText,
+                        });
+                    }
+                    spans.push(SyntaxSpan {
+                        range: (line_start + close)..(line_start + close + 2),
+                        kind: SyntaxKind::StrikethroughMarker,
+                    });
+                    i = close + 2;
+                    continue;
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -388,8 +533,7 @@ dn’t require a patchwork of vendors.
 
     #[test]
     fn scanner_detects_core_markdown_tokens() {
-        let source =
-            "# Heading\n- [x] Done\n[Link](https://example.com)\n`code`\n*italic* **bold**\n";
+        let source = "# Heading\n- [x] Done\n[Link](https://example.com)\n`code`\n*italic* **bold** ~~gone~~\n---\n";
         let spans = markdown_spans(source);
 
         assert!(spans.iter().any(|s| s.kind == SyntaxKind::HeadingMarker));
@@ -406,6 +550,41 @@ dn’t require a patchwork of vendors.
         assert!(spans.iter().any(|s| s.kind == SyntaxKind::InlineCode));
         assert!(spans.iter().any(|s| s.kind == SyntaxKind::EmphasisText));
         assert!(spans.iter().any(|s| s.kind == SyntaxKind::StrongText));
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.kind == SyntaxKind::StrikethroughText)
+        );
+        assert!(spans.iter().any(|s| s.kind == SyntaxKind::HorizontalRule));
+    }
+
+    #[test]
+    fn line_kinds_distinguish_structured_blocks_and_fenced_content() {
+        let source = "> quote\n- item\n  - [ ] task\n---\n```md\n# code\n```\nplain";
+
+        assert_eq!(
+            markdown_line_kinds(source),
+            vec![
+                MarkdownLineKind::Quote,
+                MarkdownLineKind::List { indent: 0 },
+                MarkdownLineKind::Task { indent: 2 },
+                MarkdownLineKind::HorizontalRule,
+                MarkdownLineKind::CodeFence,
+                MarkdownLineKind::CodeBody,
+                MarkdownLineKind::CodeFence,
+                MarkdownLineKind::Paragraph,
+            ]
+        );
+    }
+
+    #[test]
+    fn fenced_code_blocks_preserve_language_and_content_ranges() {
+        let source = "before\n```rust\nfn main() {}\n```\nafter";
+        let blocks = fenced_code_blocks(source);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].language.as_deref(), Some("rust"));
+        assert_eq!(&source[blocks[0].content_range.clone()], "fn main() {}\n");
     }
 
     #[test]

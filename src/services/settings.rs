@@ -55,6 +55,9 @@ pub struct Settings {
     /// Whether the document starts in rendered preview mode.
     #[serde(default = "default_preview_visible")]
     pub preview_visible: bool,
+    /// Whether editable Markdown uses the live presentation instead of raw source styling.
+    #[serde(default = "default_live_markdown_enabled")]
+    pub live_markdown_enabled: bool,
     /// Last valid normal-window geometry, restored on the next launch.
     #[serde(default)]
     pub window_geometry: Option<WindowGeometry>,
@@ -65,6 +68,11 @@ fn default_theme_name() -> ThemeName {
 }
 
 fn default_preview_visible() -> bool {
+    true
+}
+
+/// Returns the default editable Markdown presentation preference.
+fn default_live_markdown_enabled() -> bool {
     true
 }
 
@@ -120,6 +128,7 @@ impl Default for Settings {
             sidebar_section_order: SidebarSectionOrder::default(),
             outline_visible: false,
             preview_visible: default_preview_visible(),
+            live_markdown_enabled: default_live_markdown_enabled(),
             window_geometry: None,
         }
     }
@@ -268,6 +277,21 @@ pub fn set_preview_visible(visible: bool) {
     }
 }
 
+/// Returns whether editors should render the live Markdown presentation.
+pub fn get_live_markdown_enabled() -> bool {
+    settings()
+        .lock()
+        .map(|s| s.get().live_markdown_enabled)
+        .unwrap_or_else(|_| default_live_markdown_enabled())
+}
+
+/// Persists whether editors should render the live Markdown presentation.
+pub fn set_live_markdown_enabled(enabled: bool) {
+    if let Ok(mut manager) = settings().lock() {
+        manager.update(|settings| settings.live_markdown_enabled = enabled);
+    }
+}
+
 /// Convenience function to get current font size
 pub fn get_font_size() -> f32 {
     settings()
@@ -337,6 +361,7 @@ mod tests {
         let settings = Settings::default();
         assert!(!settings.outline_visible);
         assert!(settings.preview_visible);
+        assert!(settings.live_markdown_enabled);
     }
 
     #[test]

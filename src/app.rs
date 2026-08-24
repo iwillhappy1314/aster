@@ -1,19 +1,20 @@
 use crate::commands::{
-    About, CloseTab, Copy, Cut, Find, FindNext, FindPrevious, FontSizeDecrease,
-    FontSizeIncrease, FontSizeReset, NewFile, NextTab, OpenFile, OutlinePositionLeft,
-    OutlinePositionRight, Paste, PreviousTab, Quit, Redo, SaveFile, SaveFileAs, SelectAll,
-    ThemeAyuDark, ThemeAyuLight, ThemeAyuMirage, ToggleOutline, TogglePreview, Undo,
+    About, CloseTab, Copy, Cut, Find, FindNext, FindPrevious, FontSizeDecrease, FontSizeIncrease,
+    FontSizeReset, NewFile, NextTab, OpenFile, OutlinePositionLeft, OutlinePositionRight, Paste,
+    PreviousTab, Quit, Redo, SaveFile, SaveFileAs, SelectAll, ThemeAyuDark, ThemeAyuLight,
+    ThemeAyuMirage, ToggleLiveMarkdown, ToggleOutline, TogglePreview, Undo,
 };
 use crate::services::assets::AsterAssetSource;
 use crate::services::fs::read_to_string;
 use crate::services::settings;
 use crate::ui::root::RootView;
-use crate::ui::theme::ThemeName;
+use crate::ui::theme::{Theme as AsterTheme, ThemeName};
 use camino::Utf8PathBuf;
 use gpui::{
     App, AppContext, Application, Bounds, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType,
     TitlebarOptions, Window, WindowBounds, WindowOptions, point, px, size,
 };
+use gpui_component::Root as ComponentRoot;
 use gpui_component::notification::NotificationList;
 use gpui_component::theme::{Theme as ComponentTheme, ThemeMode};
 use rfd::{MessageButtons, MessageDialog, MessageLevel};
@@ -36,6 +37,7 @@ pub fn run() {
 
     app.run(move |cx: &mut App| {
         gpui_component::init(cx);
+        sync_component_text_color(cx);
 
         cx.activate(true);
 
@@ -62,6 +64,7 @@ pub fn run() {
             KeyBinding::new("cmd--", FontSizeDecrease, None),
             KeyBinding::new("cmd-0", FontSizeReset, None),
             KeyBinding::new("shift-cmd-o", ToggleOutline, None),
+            KeyBinding::new("shift-cmd-m", ToggleLiveMarkdown, None),
             KeyBinding::new("shift-cmd-p", TogglePreview, None),
         ]);
 
@@ -109,6 +112,7 @@ pub fn run() {
                 name: "View".into(),
                 items: vec![
                     MenuItem::action("Show or Hide Outline", ToggleOutline),
+                    MenuItem::action("Toggle Live Markdown", ToggleLiveMarkdown),
                     MenuItem::submenu(Menu {
                         name: "Outline Position".into(),
                         items: vec![
@@ -197,13 +201,14 @@ pub fn run() {
                 .show();
         });
 
-        let _ = open_window(cx, None);
+        let mut startup_paths = std::env::args()
+            .skip(1)
+            .filter_map(|arg| parse_open_target(&arg));
+        let initial_path = startup_paths.next();
+        let _ = open_window(cx, initial_path);
 
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        for arg in args {
-            if let Some(path) = parse_open_target(&arg) {
-                open_path_in_active_window_or_new(cx, path);
-            }
+        for path in startup_paths {
+            open_path_in_active_window_or_new(cx, path);
         }
 
         let queue = pending_urls.clone();
@@ -243,11 +248,21 @@ pub fn run() {
 /// repaints every open window with the new palette.
 fn apply_theme(name: ThemeName, cx: &mut App) {
     let is_dark = crate::ui::theme::set_theme(name);
-    let mode = if is_dark { ThemeMode::Dark } else { ThemeMode::Light };
+    let mode = if is_dark {
+        ThemeMode::Dark
+    } else {
+        ThemeMode::Light
+    };
     ComponentTheme::change(mode, None, cx);
+    sync_component_text_color(cx);
     for window in cx.windows() {
         let _ = window.update(cx, |_, window, _| window.refresh());
     }
+}
+
+/// Keeps native component text aligned with Aster's current editor foreground.
+fn sync_component_text_color(cx: &mut App) {
+    ComponentTheme::global_mut(cx).foreground = AsterTheme::text().into();
 }
 
 /// Persists the Outline side and repaints all open windows immediately.
@@ -296,7 +311,7 @@ fn build_root_view(
     window: &mut Window,
     cx: &mut App,
     initial_path: Option<Utf8PathBuf>,
-) -> gpui::Entity<RootView> {
+) -> gpui::Entity<ComponentRoot> {
     let has_initial_file = initial_path.as_ref().is_some_and(|path| path.is_file());
     let preview_visible =
         initial_preview_visible(has_initial_file, settings::get_preview_visible());
@@ -317,7 +332,7 @@ fn build_root_view(
         }
     }
 
-    let root = cx.new(|_| {
+    let root_view = cx.new(|_| {
         RootView::new(
             document,
             inline_markdown,
@@ -327,13 +342,13 @@ fn build_root_view(
             preview_visible,
         )
     });
-    install_should_close_prompt(window, cx, root.clone());
+    install_should_close_prompt(window, cx, root_view.clone());
     if let Some(directory) = initial_path.filter(|path| path.is_dir()) {
-        let _ = root.update(cx, |root, cx| {
+        let _ = root_view.update(cx, |root, cx| {
             root.action_open_path(directory, window, cx);
         });
     }
-    root
+    cx.new(|cx| ComponentRoot::new(root_view, window, cx))
 }
 
 /// Resolves the initial mode: blank documents always edit, existing documents use the preference.

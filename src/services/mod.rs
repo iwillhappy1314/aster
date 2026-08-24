@@ -1,4 +1,5 @@
 pub mod assets;
+pub mod complex_markdown;
 pub mod fs;
 pub mod inline_markdown;
 pub mod settings;

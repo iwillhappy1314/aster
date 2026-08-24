@@ -29,6 +29,7 @@ actions!(
         ThemeAyuLight,
         ThemeAyuMirage,
         ToggleOutline,
+        ToggleLiveMarkdown,
         TogglePreview,
         Undo,
     ]

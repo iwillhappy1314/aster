@@ -2,21 +2,31 @@ use crate::commands::{Copy, Cut, Find, FindNext, FindPrevious, Paste, Redo, Sele
 use crate::model::document::DocumentState;
 use crate::model::inline_markdown::InlineMarkdownState;
 use crate::services::settings;
-use crate::services::syntax::{SyntaxKind, SyntaxSpan};
-use crate::ui::editor_text_layout::{EditorTextLayout, render_editor_text};
+use crate::services::complex_markdown::{
+    ComplexMarkdownKind, MarkdownTableCell, complex_markdown_components,
+    serialize_table_cell_value,
+};
+use crate::services::syntax::{SyntaxKind, SyntaxSpan, fenced_code_blocks};
+use crate::ui::editor_projection::{DisplayProjection, ProjectionAtom, active_line_range};
+use crate::ui::editor_text_layout::{
+    ActiveTableCellEditor, ComplexComponentClickHandler, EditorTextLayout,
+    TableCellClickHandler, render_editor_text,
+};
 use crate::ui::text_utils::ellipsize_chars;
 use crate::ui::theme::{MarkdownStyle, Theme};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, FontWeight, HighlightStyle,
+    AnyElement, App, AppContext, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, HighlightStyle,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement, Pixels, Point, Render, ScrollHandle, StatefulInteractiveElement, Styled,
-    UTF16Selection, Window, anchored, canvas, combine_highlights, deferred, div,
-    fill, point, px, size,
+    ParentElement, Pixels, Point, Render, ScrollHandle, StatefulInteractiveElement, Subscription,
+    StrikethroughStyle, Styled, UTF16Selection, Window, anchored, canvas, combine_highlights,
+    deferred, div, fill, point, px, size,
 };
+use gpui_component::input::{InputEvent, InputState};
 use gpui_gfm::{
-    InteractiveScrollbarAxis, InteractiveScrollbarState, render_interactive_scrollbar,
+    CodeSyntaxTheme, InteractiveScrollbarAxis, InteractiveScrollbarState, code_syntax_highlights,
+    render_interactive_scrollbar,
 };
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
@@ -27,6 +37,7 @@ const CARET_WIDTH: f32 = 2.0;
 const HEAVY_DOCUMENT_BYTES: usize = 64 * 1024;
 
 pub type OutlineViewportCallback = Arc<dyn Fn(usize, &mut App)>;
+pub type ComplexLinkCallback = Arc<dyn Fn(String, &mut App)>;
 
 struct SearchCache {
     revision: u64,
@@ -34,103 +45,81 @@ struct SearchCache {
     matches: Vec<Range<usize>>,
 }
 
-#[derive(Clone, Debug)]
-struct ProjectionSegment {
-    source: Range<usize>,
-    display_start: usize,
-    hidden: bool,
+/// Owns one native wrapping cell input and the open document edit it controls.
+struct TableCellEdit {
+    source_range: Range<usize>,
+    input: Entity<InputState>,
+    layout_text: String,
+    scroll_offset: Point<Pixels>,
+    scroll_restore_task: Option<gpui::Task<()>>,
+    _subscription: Subscription,
 }
 
-#[derive(Clone, Debug)]
-struct DisplayProjection {
-    display_text: String,
-    source_len: usize,
-    segments: Vec<ProjectionSegment>,
+/// Describes the editable prefix of one structured Markdown line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MarkdownLinePrefix {
+    prefix_chars: usize,
+    continuation: String,
+    content_is_empty: bool,
 }
 
-impl DisplayProjection {
-    /// Creates the editor's identity source projection.
-    ///
-    /// Edit mode intentionally displays every Markdown byte, so cursor, selection,
-    /// search, and IME offsets all use the original document source directly.
-    fn from_source(source: &str) -> Self {
-        let source_len = source.len();
-        Self {
-            display_text: source.to_string(),
-            source_len,
-            segments: vec![ProjectionSegment {
-                source: 0..source_len,
-                display_start: 0,
-                hidden: false,
-            }],
-        }
+/// Parses list, task, ordered-list, or quote prefixes from one source line.
+fn markdown_line_prefix(line: &str) -> Option<MarkdownLinePrefix> {
+    let line = line.trim_end_matches(['\n', '\r']);
+    let indent_bytes = line.bytes().take_while(|byte| *byte == b' ').count();
+    let indent = &line[..indent_bytes];
+    let content = &line[indent_bytes..];
+
+    if content.starts_with("> ") {
+        return Some(MarkdownLinePrefix {
+            prefix_chars: indent.chars().count() + 2,
+            continuation: format!("{indent}> "),
+            content_is_empty: content[2..].trim().is_empty(),
+        });
     }
 
-    fn source_to_display_byte(&self, source_byte: usize) -> usize {
-        let source_byte = source_byte.min(self.source_len);
-        let segment_index = self
-            .segments
-            .partition_point(|segment| segment.source.end < source_byte);
-        let Some(segment) = self.segments.get(segment_index) else {
-            return self.display_text.len();
-        };
-
-        if source_byte < segment.source.start || segment.hidden {
-            return segment.display_start;
-        }
-
-        segment.display_start + (source_byte - segment.source.start)
+    if content.len() >= 6
+        && matches!(content.as_bytes()[0], b'-' | b'*' | b'+')
+        && content.as_bytes()[1] == b' '
+        && content.as_bytes()[2] == b'['
+        && matches!(content.as_bytes()[3], b' ' | b'x' | b'X')
+        && content.as_bytes()[4] == b']'
+        && content.as_bytes()[5] == b' '
+    {
+        let marker = content.as_bytes()[0] as char;
+        return Some(MarkdownLinePrefix {
+            prefix_chars: indent.chars().count() + 6,
+            continuation: format!("{indent}{marker} [ ] "),
+            content_is_empty: content[6..].trim().is_empty(),
+        });
     }
 
-    fn display_to_source_byte(&self, display_byte: usize) -> usize {
-        let display_byte = display_byte.min(self.display_text.len());
-        let mut mapped = self.source_len;
-
-        for segment in &self.segments {
-            if display_byte < segment.display_start {
-                return segment.source.start;
-            }
-
-            if segment.hidden {
-                // Hidden Markdown syntax occupies no display width. When the caret lands exactly
-                // on that boundary, bias it to the right so typing after a rendered link happens
-                // after `](...)` rather than inside the hidden Markdown syntax.
-                if display_byte == segment.display_start {
-                    mapped = segment.source.end;
-                }
-                continue;
-            }
-
-            let display_end = segment.display_start + segment.source.len();
-            if display_byte < display_end {
-                return segment.source.start + (display_byte - segment.display_start);
-            }
-            if display_byte == display_end {
-                mapped = segment.source.end;
-                continue;
-            }
-        }
-
-        mapped.min(self.source_len)
+    if content.len() >= 2
+        && matches!(content.as_bytes()[0], b'-' | b'*' | b'+')
+        && content.as_bytes()[1] == b' '
+    {
+        let marker = content.as_bytes()[0] as char;
+        return Some(MarkdownLinePrefix {
+            prefix_chars: indent.chars().count() + 2,
+            continuation: format!("{indent}{marker} "),
+            content_is_empty: content[2..].trim().is_empty(),
+        });
     }
 
-    fn project_highlights(
-        &self,
-        highlights: Vec<(Range<usize>, HighlightStyle)>,
-    ) -> Vec<(Range<usize>, HighlightStyle)> {
-        highlights
-            .into_iter()
-            .filter_map(|(range, style)| {
-                let start = self.source_to_display_byte(range.start);
-                let end = self.source_to_display_byte(range.end);
-                if start < end {
-                    Some((start..end, style))
-                } else {
-                    None
-                }
-            })
-            .collect()
+    let digits = content.bytes().take_while(u8::is_ascii_digit).count();
+    if digits > 0
+        && content.as_bytes().get(digits) == Some(&b'.')
+        && content.as_bytes().get(digits + 1) == Some(&b' ')
+    {
+        let number = content[..digits].parse::<usize>().ok()?;
+        return Some(MarkdownLinePrefix {
+            prefix_chars: indent.chars().count() + digits + 2,
+            continuation: format!("{indent}{}. ", number.saturating_add(1)),
+            content_is_empty: content[digits + 2..].trim().is_empty(),
+        });
     }
+
+    None
 }
 
 pub struct EditorView {
@@ -145,7 +134,9 @@ pub struct EditorView {
     /// Cached text with revision to avoid repeated rope-to-string conversions.
     cached_text: Option<(u64, Arc<str>)>,
     /// Cached source/display projection for the current document + inline parse revisions.
-    cached_projection: Option<(u64, u64, Arc<DisplayProjection>)>,
+    cached_projection: Option<(u64, u64, Range<usize>, bool, Arc<DisplayProjection>)>,
+    /// Whether Markdown syntax is rendered as an editable live presentation.
+    live_markdown: bool,
     /// Character range currently owned by the platform IME composition.
     marked_range: Option<Range<usize>>,
     /// Keeps the full IME composition as one undo transaction.
@@ -165,8 +156,14 @@ pub struct EditorView {
     pending_outline_reveal_byte: Option<usize>,
     /// Reports the source byte crossing the editor viewport activation line.
     on_outline_viewport_change: Option<OutlineViewportCallback>,
+    /// Opens wiki-link and footnote targets without coupling the editor to tab management.
+    on_complex_link: Option<ComplexLinkCallback>,
     /// Window-space position of the editor's lightweight right-click menu.
     context_menu_position: Option<Point<Pixels>>,
+    /// Source range of the complex component selected before entering source editing.
+    selected_component: Option<Range<usize>>,
+    /// Native inline editor for the currently active Markdown table cell.
+    table_cell_edit: Option<TableCellEdit>,
 }
 
 impl EditorView {
@@ -184,6 +181,7 @@ impl EditorView {
             scrollbar_state: InteractiveScrollbarState::default(),
             cached_text: None,
             cached_projection: None,
+            live_markdown: settings::get_live_markdown_enabled(),
             marked_range: None,
             ime_edit_active: false,
             input_layout: None,
@@ -195,7 +193,10 @@ impl EditorView {
             pending_scroll_to_byte: None,
             pending_outline_reveal_byte: None,
             on_outline_viewport_change: None,
+            on_complex_link: None,
             context_menu_position: None,
+            selected_component: None,
+            table_cell_edit: None,
         }
     }
 
@@ -249,6 +250,175 @@ impl EditorView {
         self.on_outline_viewport_change = Some(callback);
     }
 
+    /// Installs the host callback used by command-click navigation components.
+    pub fn set_on_complex_link(&mut self, callback: ComplexLinkCallback) {
+        self.on_complex_link = Some(callback);
+    }
+
+    /// Returns whether this editor is using the live Markdown presentation.
+    pub fn live_markdown_enabled(&self) -> bool {
+        self.live_markdown
+    }
+
+    /// Updates the editable Markdown presentation without changing document bytes.
+    pub fn set_live_markdown_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.live_markdown != enabled {
+            self.finish_table_cell_edit(cx);
+            self.live_markdown = enabled;
+            self.cached_projection = None;
+            cx.notify();
+        }
+    }
+
+    /// Begins a single undo transaction for direct editing of one table cell.
+    fn begin_table_cell_edit(
+        &mut self,
+        cell: MarkdownTableCell,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(active) = &self.table_cell_edit
+            && active.source_range == cell.source_range
+        {
+            active.input.update(cx, |input, cx| input.focus(window, cx));
+            return;
+        }
+
+        self.finish_table_cell_edit(cx);
+        let layout_text = cell.text.clone();
+        let scroll_offset = self.scroll_handle.offset();
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line()
+                .soft_wrap(true)
+                .default_value(cell.text)
+        });
+        let subscription = cx.subscribe(&input, |editor, input, event, cx| match event {
+            InputEvent::Change => {
+                let value = input.read(cx).value().to_string();
+                editor.update_table_cell_value(&value, cx);
+            }
+            InputEvent::PressEnter { .. } | InputEvent::Blur => {
+                editor.finish_table_cell_edit(cx);
+            }
+            InputEvent::Focus => {}
+        });
+        let _ = self.document.update(cx, |doc, _| doc.begin_edit());
+        self.selected_component = None;
+        self.table_cell_edit = Some(TableCellEdit {
+            source_range: cell.source_range,
+            input: input.clone(),
+            layout_text,
+            scroll_offset,
+            scroll_restore_task: None,
+            _subscription: subscription,
+        });
+        input.update(cx, |input, cx| input.focus(window, cx));
+        self.cached_projection = None;
+        cx.notify();
+    }
+
+    /// Replaces only the active table cell's content bytes while preserving table syntax.
+    fn update_table_cell_value(&mut self, value: &str, cx: &mut Context<Self>) {
+        let Some(active) = &self.table_cell_edit else {
+            return;
+        };
+        let serialized = serialize_table_cell_value(value);
+        let source_range = active.source_range.clone();
+        let source_start = source_range.start;
+        let scroll_offset = active.scroll_offset;
+        let _ = self.document.update(cx, |doc, doc_cx| {
+            let start = doc.byte_to_char(source_range.start);
+            let end = doc.byte_to_char(source_range.end);
+            if start < end {
+                doc.delete_range(start..end);
+            }
+            if !serialized.is_empty() {
+                doc.insert(start, &serialized);
+            }
+            doc.set_cursor(start + serialized.chars().count());
+            doc_cx.notify();
+        });
+        if let Some(active) = &mut self.table_cell_edit {
+            active.source_range.end = active.source_range.start + serialized.len();
+        }
+        self.scroll_handle.set_offset(scroll_offset);
+        let entity = cx.entity();
+        let restore_task = cx.spawn(async move |_editor, cx| {
+            for delay in [Duration::from_millis(16), Duration::from_millis(80)] {
+                cx.background_executor().timer(delay).await;
+                let _ = entity.update(cx, |editor, cx| {
+                    if editor
+                        .table_cell_edit
+                        .as_ref()
+                        .is_some_and(|active| active.source_range.start == source_start)
+                    {
+                        editor.scroll_handle.set_offset(scroll_offset);
+                        cx.notify();
+                    }
+                });
+            }
+        });
+        if let Some(active) = &mut self.table_cell_edit {
+            active.scroll_restore_task = Some(restore_task);
+        }
+        self.cached_projection = None;
+        cx.notify();
+    }
+
+    /// Commits the active cell edit as one document undo operation.
+    fn finish_table_cell_edit(&mut self, cx: &mut Context<Self>) {
+        if self.table_cell_edit.take().is_none() {
+            return;
+        }
+        let _ = self.document.update(cx, |doc, doc_cx| {
+            doc.commit_edit();
+            doc_cx.notify();
+        });
+        self.cached_projection = None;
+        cx.notify();
+    }
+
+    /// Selects a complex component first and reveals its complete source on the next click.
+    fn activate_complex_component(
+        &mut self,
+        source_range: Range<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_component.as_ref() == Some(&source_range) {
+            let _ = self.document.update(cx, |doc, cx| {
+                let start = doc.byte_to_char(source_range.start);
+                let end = doc.byte_to_char(source_range.end);
+                doc.set_selection(start, end);
+                cx.notify();
+            });
+            self.selected_component = None;
+            self.cached_projection = None;
+        } else {
+            self.selected_component = Some(source_range);
+        }
+        cx.notify();
+    }
+
+    /// Deletes the selected component as one undoable source transaction.
+    fn delete_selected_component(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(source_range) = self.selected_component.take() else {
+            return false;
+        };
+        let _ = self.document.update(cx, |doc, cx| {
+            let start = doc.byte_to_char(source_range.start);
+            let end = doc.byte_to_char(source_range.end);
+            doc.begin_edit();
+            doc.delete_range(start..end);
+            doc.set_cursor(start);
+            doc.commit_edit();
+            cx.notify();
+        });
+        self.cached_projection = None;
+        cx.notify();
+        true
+    }
+
     fn selection_highlights(&self, doc: &DocumentState) -> Vec<(Range<usize>, HighlightStyle)> {
         doc.selection_bytes().map_or_else(Vec::new, |range| {
             vec![(
@@ -269,6 +439,39 @@ impl EditorView {
         spans
             .iter()
             .map(|span| (span.range.clone(), syntax_style(span.kind, markdown_style)))
+            .collect()
+    }
+
+    /// Builds source-relative syntax colors for fenced code in Live Markdown.
+    fn fenced_code_highlights(&self, source: &str) -> Vec<(Range<usize>, HighlightStyle)> {
+        let syntax_theme = match Theme::name() {
+            crate::ui::theme::ThemeName::AyuLight => CodeSyntaxTheme::AyuLight,
+            crate::ui::theme::ThemeName::AyuDark => CodeSyntaxTheme::AyuDark,
+            crate::ui::theme::ThemeName::AyuMirage => CodeSyntaxTheme::AyuMirage,
+        };
+
+        fenced_code_blocks(source)
+            .into_iter()
+            .filter_map(|block| {
+                block
+                    .language
+                    .map(|language| (block.content_range, language))
+            })
+            .flat_map(|(content_range, language)| {
+                let content = &source[content_range.clone()];
+                code_syntax_highlights(&language, content, syntax_theme)
+                    .into_iter()
+                    .map(move |highlight| {
+                        (
+                            (content_range.start + highlight.range.start)
+                                ..(content_range.start + highlight.range.end),
+                            HighlightStyle {
+                                color: Some(highlight.color.into()),
+                                ..Default::default()
+                            },
+                        )
+                    })
+            })
             .collect()
     }
 
@@ -978,12 +1181,29 @@ impl Render for EditorView {
 
         let doc = self.document.read(cx);
         let cursor_source_byte = doc.char_to_byte(doc.cursor);
+        let active_source_range = active_line_range(
+            text_owned.as_ref(),
+            doc.selection_bytes()
+                .unwrap_or(cursor_source_byte..cursor_source_byte),
+        );
+        let projection_active_range = if self.table_cell_edit.is_some() {
+            text_owned.len()..text_owned.len()
+        } else {
+            active_source_range
+        };
         let show_caret = doc.selection.is_none();
         let has_selection = doc.selection_range().is_some();
-        let draw_caret = show_caret && is_focused && self.caret_visible;
-        let (inline_spans, inline_revision) = {
+        let draw_caret = show_caret
+            && is_focused
+            && self.table_cell_edit.is_none()
+            && self.caret_visible;
+        let (inline_spans, complex_components, inline_revision) = {
             let inline = self.inline_markdown.read(cx);
-            (inline.spans.clone(), inline.source_revision)
+            (
+                inline.spans.clone(),
+                inline.components.clone(),
+                inline.source_revision,
+            )
         };
         // Large documents are parsed asynchronously, so their spans can temporarily
         // describe the previous document revision. Never apply stale byte ranges to
@@ -994,28 +1214,61 @@ impl Render for EditorView {
         } else {
             &[]
         };
-        let projection = if let Some((cached_doc_revision, cached_inline_revision, cached)) =
-            &self.cached_projection
+        let current_cell_components = (self.table_cell_edit.is_some()
+            && !inline_spans_are_current)
+            .then(|| complex_markdown_components(text_owned.as_ref()));
+        let render_components = current_cell_components
+            .as_ref()
+            .unwrap_or(complex_components.as_ref());
+        let projection_data_is_current = inline_spans_are_current || current_cell_components.is_some();
+        let projection = if let Some((
+            cached_doc_revision,
+            cached_inline_revision,
+            cached_active_range,
+            cached_live_markdown,
+            cached,
+        )) = &self.cached_projection
             && *cached_doc_revision == doc_revision
             && *cached_inline_revision == inline_revision
+            && *cached_active_range == projection_active_range
+            && *cached_live_markdown == self.live_markdown
         {
             cached.clone()
         } else {
-            let projection = Arc::new(DisplayProjection::from_source(text_owned.as_ref()));
-            self.cached_projection = Some((doc_revision, inline_revision, projection.clone()));
+            let projection = Arc::new(if self.live_markdown && projection_data_is_current {
+                DisplayProjection::from_markdown_with_components(
+                    text_owned.as_ref(),
+                    render_spans,
+                    render_components,
+                    projection_active_range.clone(),
+                )
+            } else {
+                DisplayProjection::from_source(text_owned.as_ref())
+            });
+            self.cached_projection = Some((
+                doc_revision,
+                inline_revision,
+                projection_active_range,
+                self.live_markdown,
+                projection.clone(),
+            ));
             projection
         };
         let cursor_display_byte = projection.source_to_display_byte(cursor_source_byte);
         let syntax_highlights = if inline_spans_are_current {
-            projection.project_highlights(self.inline_syntax_highlights(render_spans, markdown_style))
+            let mut source_highlights = self.inline_syntax_highlights(render_spans, markdown_style);
+            if self.live_markdown {
+                source_highlights.extend(self.fenced_code_highlights(text_owned.as_ref()));
+            }
+            project_editor_highlights(projection.as_ref(), source_highlights)
         } else {
             Vec::new()
         };
         let (search_highlights, search_match_count) =
             self.search_highlights(text_owned.as_ref(), doc_revision);
-        let search_highlights = projection.project_highlights(search_highlights);
-        let selection_highlights = projection.project_highlights(self.selection_highlights(&doc));
-        drop(doc);
+        let search_highlights = project_editor_highlights(projection.as_ref(), search_highlights);
+        let selection_highlights =
+            project_editor_highlights(projection.as_ref(), self.selection_highlights(&doc));
 
         let syntax_and_search = if search_highlights.is_empty() {
             syntax_highlights
@@ -1030,11 +1283,43 @@ impl Render for EditorView {
         };
 
         let safe_highlights = sanitize_highlights(&projection.display_text, all_highlights);
+        let document_directory = doc
+            .path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(|path| path.as_std_path().to_path_buf());
+        let component_editor = cx.entity();
+        let on_component_click: ComplexComponentClickHandler = Arc::new(
+            move |source_range, _window, cx| {
+                let _ = component_editor.update(cx, |editor, cx| {
+                    editor.activate_complex_component(source_range, cx);
+                });
+            },
+        );
+        let table_cell_editor = cx.entity();
+        let on_table_cell_click: TableCellClickHandler = Arc::new(
+            move |cell, window, cx| {
+                let _ = table_cell_editor.update(cx, |editor, cx| {
+                    editor.begin_table_cell_edit(cell, window, cx);
+                });
+            },
+        );
+        let active_table_cell = self.table_cell_edit.as_ref().map(|edit| ActiveTableCellEditor {
+            source_range: edit.source_range.clone(),
+            input: edit.input.clone(),
+            layout_text: edit.layout_text.clone(),
+        });
         let editor_text = render_editor_text(
             &projection.display_text,
             text_owned.as_ref(),
+            projection.as_ref(),
             &safe_highlights,
             settings::get_font_size(),
+            document_directory.as_deref(),
+            self.selected_component.as_ref(),
+            on_component_click,
+            active_table_cell.as_ref(),
+            on_table_cell_click,
         );
         let editor_left_padding = editor_text.left_padding;
         let text_layout = editor_text.layout.clone();
@@ -1056,6 +1341,7 @@ impl Render for EditorView {
         let input_enabled = !self.search_active;
         let input_focus_handle = focus_handle.clone();
         let input_entity = cx.entity();
+        let selected_component_for_actions = self.selected_component.clone();
         let context_menu = self
             .context_menu_position
             .map(|position| build_editor_context_menu(position, has_selection, cx.entity()));
@@ -1104,7 +1390,17 @@ impl Render for EditorView {
                     })
                     .on_action({
                         let doc_handle = self.document.clone();
+                        let selected_component = selected_component_for_actions.clone();
                         move |_: &Copy, _window: &mut Window, cx_app: &mut App| {
+                            if let Some(source_range) = selected_component.clone() {
+                                let text = doc_handle.read_with(cx_app, |doc, _| {
+                                    let start = doc.byte_to_char(source_range.start);
+                                    let end = doc.byte_to_char(source_range.end);
+                                    doc.slice_chars(start..end)
+                                });
+                                cx_app.write_to_clipboard(ClipboardItem::new_string(text));
+                                return;
+                            }
                             if let Some(selection) =
                                 doc_handle.read_with(cx_app, |d, _| d.selection_range())
                             {
@@ -1116,7 +1412,26 @@ impl Render for EditorView {
                     })
                     .on_action({
                         let doc_handle = self.document.clone();
+                        let selected_component = selected_component_for_actions.clone();
                         move |_: &Cut, _window: &mut Window, cx_app: &mut App| {
+                            if let Some(source_range) = selected_component.clone() {
+                                let text = doc_handle.read_with(cx_app, |doc, _| {
+                                    let start = doc.byte_to_char(source_range.start);
+                                    let end = doc.byte_to_char(source_range.end);
+                                    doc.slice_chars(start..end)
+                                });
+                                cx_app.write_to_clipboard(ClipboardItem::new_string(text));
+                                let _ = doc_handle.update(cx_app, |doc, cx| {
+                                    let start = doc.byte_to_char(source_range.start);
+                                    let end = doc.byte_to_char(source_range.end);
+                                    doc.begin_edit();
+                                    doc.delete_range(start..end);
+                                    doc.set_cursor(start);
+                                    doc.commit_edit();
+                                    cx.notify();
+                                });
+                                return;
+                            }
                             let selection = doc_handle
                                 .read_with(cx_app, |d, _| d.selection_range())
                                 .unwrap_or_else(|| 0..0);
@@ -1207,19 +1522,69 @@ impl Render for EditorView {
                     .on_mouse_down(MouseButton::Left, {
                         let focus_handle = focus_handle.clone();
                         let doc_handle = self.document.clone();
+                        let editor_handle = cx.entity();
+                        let complex_link_callback = self.on_complex_link.clone();
                         let layout_for_event = text_layout.clone();
                         let projection_for_event = projection.clone();
                         move |event: &MouseDownEvent, window: &mut Window, cx_app: &mut App| {
                             focus_handle.focus(window);
-                            let _ = doc_handle.update(cx_app, |doc, cx| {
-                                let byte_idx = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                    layout_for_event.index_for_position(event.position)
-                                }))
-                                .ok()
-                                .map(|res| match res {
-                                    Ok(ix) => ix,
-                                    Err(ix) => ix,
+                            let byte_idx = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                layout_for_event.index_for_position(event.position)
+                            }))
+                            .ok()
+                            .map(|result| match result {
+                                Ok(index) => index,
+                                Err(index) => index,
+                            });
+                            if let Some((source_range, ProjectionAtom::Complex(kind))) = byte_idx
+                                .and_then(|byte| projection_for_event.atom_at_display_byte(byte))
+                            {
+                                // Native table cells own their mouse handling so a click can
+                                // begin inline editing without revealing the whole table source.
+                                if matches!(kind, ComplexMarkdownKind::Table { .. }) {
+                                    return;
+                                }
+                                if event.modifiers.platform
+                                    && let Some(callback) = complex_link_callback.as_ref()
+                                {
+                                    match kind {
+                                        ComplexMarkdownKind::WikiLink { target, .. } => {
+                                            callback(target, cx_app);
+                                            return;
+                                        }
+                                        ComplexMarkdownKind::Footnote { label, .. } => {
+                                            callback(format!("^{}", label), cx_app);
+                                            return;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                let _ = editor_handle.update(cx_app, |editor, cx| {
+                                    editor.activate_complex_component(source_range, cx);
                                 });
+                                return;
+                            }
+                            let _ = editor_handle.update(cx_app, |editor, cx| {
+                                if editor.selected_component.take().is_some() {
+                                    cx.notify();
+                                }
+                            });
+                            let _ = doc_handle.update(cx_app, |doc, cx| {
+                                if let Some((source_range, ProjectionAtom::Task { checked })) =
+                                    byte_idx.and_then(|byte| {
+                                        projection_for_event.atom_at_display_byte(byte)
+                                    })
+                                {
+                                    let marker_byte = source_range.start.saturating_add(3);
+                                    let marker_char = doc.byte_to_char(marker_byte);
+                                    doc.begin_edit();
+                                    doc.delete_range(marker_char..marker_char.saturating_add(1));
+                                    doc.insert(marker_char, if checked { " " } else { "x" });
+                                    doc.set_cursor(doc.byte_to_char(source_range.end));
+                                    doc.commit_edit();
+                                    cx.notify();
+                                    return;
+                                }
                                 let source_byte = byte_idx
                                     .map(|b| projection_for_event.display_to_source_byte(b));
                                 if let Some(byte_idx) = source_byte.map(|b| doc.byte_to_char(b)) {
@@ -1292,6 +1657,17 @@ impl Render for EditorView {
                                 return;
                             }
 
+                            if key == "escape" && this.selected_component.take().is_some() {
+                                cx.notify();
+                                return;
+                            }
+
+                            if matches!(key.as_str(), "backspace" | "delete")
+                                && this.delete_selected_component(cx)
+                            {
+                                return;
+                            }
+
                             if is_cmd {
                                 return;
                             }
@@ -1325,6 +1701,19 @@ impl Render for EditorView {
                                             cx_doc.notify();
                                             return;
                                         }
+                                        let cursor = doc.cursor.min(len);
+                                        let line_index = doc.rope.char_to_line(cursor);
+                                        let line_start = doc.rope.line_to_char(line_index);
+                                        let line = doc.rope.line(line_index).to_string();
+                                        if let Some(prefix) = markdown_line_prefix(&line)
+                                            && cursor == line_start + prefix.prefix_chars
+                                        {
+                                            doc.delete_range(line_start..cursor);
+                                            doc.cursor = line_start;
+                                            doc.commit_edit();
+                                            cx_doc.notify();
+                                            return;
+                                        }
                                         if doc.cursor > 0 && len > 0 {
                                             let start = doc.cursor.saturating_sub(1);
                                             doc.delete_range(start..doc.cursor);
@@ -1349,9 +1738,58 @@ impl Render for EditorView {
                                     }
                                     "enter" | "return" => {
                                         doc.begin_edit();
-                                        doc.delete_selection();
+                                        if doc.delete_selection().is_none() {
+                                            let cursor = doc.cursor.min(len);
+                                            let line_index = doc.rope.char_to_line(cursor);
+                                            let line_start = doc.rope.line_to_char(line_index);
+                                            let line = doc.rope.line(line_index).to_string();
+                                            if let Some(prefix) = markdown_line_prefix(&line)
+                                                && cursor >= line_start + prefix.prefix_chars
+                                            {
+                                                if prefix.content_is_empty {
+                                                    doc.delete_range(
+                                                        line_start
+                                                            ..line_start + prefix.prefix_chars,
+                                                    );
+                                                    doc.cursor = line_start;
+                                                } else {
+                                                    let insertion =
+                                                        format!("\n{}", prefix.continuation);
+                                                    doc.insert(cursor, &insertion);
+                                                    doc.cursor += insertion.chars().count();
+                                                }
+                                                doc.commit_edit();
+                                                cx_doc.notify();
+                                                return;
+                                            }
+                                        }
                                         doc.insert(doc.cursor, "\n");
                                         doc.cursor += 1;
+                                        doc.commit_edit();
+                                        cx_doc.notify();
+                                    }
+                                    "tab" => {
+                                        doc.begin_edit();
+                                        let cursor = doc.cursor.min(len);
+                                        let line_index = doc.rope.char_to_line(cursor);
+                                        let line_start = doc.rope.line_to_char(line_index);
+                                        if shift {
+                                            let line = doc.rope.line(line_index).to_string();
+                                            let removable = line
+                                                .bytes()
+                                                .take(2)
+                                                .take_while(|byte| *byte == b' ')
+                                                .count();
+                                            if removable > 0 {
+                                                doc.delete_range(
+                                                    line_start..line_start + removable,
+                                                );
+                                                doc.cursor = cursor.saturating_sub(removable);
+                                            }
+                                        } else {
+                                            doc.insert(line_start, "  ");
+                                            doc.cursor = cursor.saturating_add(2);
+                                        }
                                         doc.commit_edit();
                                         cx_doc.notify();
                                     }
@@ -1441,7 +1879,7 @@ impl Render for EditorView {
                         })
                     })
                     .child(
-                        div().relative().w_full().child(editor_text_element).child(
+                        div().relative().w_full().child(
                             canvas(
                                 move |_, window: &mut Window, cx: &mut App| {
                                     let had_pending_reveal = pending_reveal.is_some();
@@ -1527,7 +1965,8 @@ impl Render for EditorView {
                             .top_0()
                             .left_0()
                             .size_full(),
-                        ),
+                        )
+                        .child(editor_text_element),
                     )
                     .when(self.search_active, |this| {
                         this.child(
@@ -1582,7 +2021,18 @@ impl Render for EditorView {
     }
 }
 
-/// Returns source-code syntax colors without applying Markdown rich-text rendering.
+/// Converts source-based highlights into ranges visible in the current projection.
+fn project_editor_highlights(
+    projection: &DisplayProjection,
+    highlights: Vec<(Range<usize>, HighlightStyle)>,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    highlights
+        .into_iter()
+        .filter_map(|(range, style)| projection.project_range(&range).map(|range| (range, style)))
+        .collect()
+}
+
+/// Returns syntax colors and inline typography for the editable Markdown presentation.
 fn syntax_style(kind: SyntaxKind, markdown_style: MarkdownStyle) -> HighlightStyle {
     match kind {
         SyntaxKind::HeadingMarker => HighlightStyle {
@@ -1605,8 +2055,13 @@ fn syntax_style(kind: SyntaxKind, markdown_style: MarkdownStyle) -> HighlightSty
             color: Some(markdown_style.muted_foreground.into()),
             ..Default::default()
         },
-        SyntaxKind::InlineCodeMarker | SyntaxKind::InlineCode => HighlightStyle {
+        SyntaxKind::InlineCodeMarker => HighlightStyle {
             color: Some(markdown_style.foreground.into()),
+            ..Default::default()
+        },
+        SyntaxKind::InlineCode => HighlightStyle {
+            color: Some(markdown_style.foreground.into()),
+            background_color: Some(markdown_style.code_background.into()),
             ..Default::default()
         },
         SyntaxKind::LinkTextDelimiter | SyntaxKind::LinkUrlDelimiter => HighlightStyle {
@@ -1625,7 +2080,29 @@ fn syntax_style(kind: SyntaxKind, markdown_style: MarkdownStyle) -> HighlightSty
             color: Some(markdown_style.muted_foreground.into()),
             ..Default::default()
         },
-        SyntaxKind::EmphasisText | SyntaxKind::StrongText => HighlightStyle::default(),
+        SyntaxKind::EmphasisText => HighlightStyle {
+            font_style: Some(FontStyle::Italic),
+            ..Default::default()
+        },
+        SyntaxKind::StrongText => HighlightStyle {
+            font_weight: Some(FontWeight::BOLD),
+            ..Default::default()
+        },
+        SyntaxKind::StrikethroughMarker => HighlightStyle {
+            color: Some(markdown_style.muted_foreground.into()),
+            ..Default::default()
+        },
+        SyntaxKind::StrikethroughText => HighlightStyle {
+            strikethrough: Some(StrikethroughStyle {
+                thickness: px(1.),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        SyntaxKind::HorizontalRule => HighlightStyle {
+            color: Some(markdown_style.muted_foreground.into()),
+            ..Default::default()
+        },
     }
 }
 
@@ -1829,5 +2306,33 @@ mod tests {
         assert_eq!(utf16_offset_to_char_in_str("中😀文", 1), 1);
         assert_eq!(utf16_offset_to_char_in_str("中😀文", 3), 2);
         assert_eq!(utf16_offset_to_char_in_str("中😀文", 4), 3);
+    }
+
+    #[test]
+    fn structured_line_prefixes_produce_expected_continuations() {
+        assert_eq!(markdown_line_prefix("- item\n").unwrap().continuation, "- ");
+        assert_eq!(
+            markdown_line_prefix("  - [x] done").unwrap().continuation,
+            "  - [ ] "
+        );
+        assert_eq!(
+            markdown_line_prefix("9. item").unwrap().continuation,
+            "10. "
+        );
+        assert_eq!(markdown_line_prefix("> quote").unwrap().continuation, "> ");
+        assert!(markdown_line_prefix("- ").unwrap().content_is_empty);
+    }
+
+    #[test]
+    fn editable_code_highlights_preserve_utf8_boundaries() {
+        let text = "fn main() { println!(\"你好\"); }";
+        let highlights = code_syntax_highlights("rust", text, CodeSyntaxTheme::AyuLight);
+
+        assert!(!highlights.is_empty());
+        assert_eq!(highlights.last().unwrap().range.end, text.len());
+        assert!(highlights.iter().all(|highlight| {
+            text.is_char_boundary(highlight.range.start)
+                && text.is_char_boundary(highlight.range.end)
+        }));
     }
 }

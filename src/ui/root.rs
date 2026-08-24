@@ -1,7 +1,7 @@
 use crate::commands::{
     Copy, Find, FontSizeDecrease, FontSizeIncrease, FontSizeReset, NewFile, NextTab, OpenFile,
     OutlinePositionLeft, OutlinePositionRight, PreviousTab, SaveFile, SaveFileAs, SelectAll,
-    ToggleOutline, TogglePreview,
+    ToggleLiveMarkdown, ToggleOutline, TogglePreview,
 };
 use crate::model::document::DocumentState;
 use crate::model::inline_markdown::InlineMarkdownState;
@@ -673,6 +673,80 @@ impl RootView {
         }
     }
 
+    /// Opens a wiki-link target or reveals a footnote/heading in the active Markdown document.
+    fn open_complex_markdown_target(&mut self, target: &str, cx: &mut Context<Self>) {
+        if let Some(label) = target.strip_prefix('^') {
+            self.reveal_markdown_anchor(&format!("^{label}"), cx);
+            return;
+        }
+        if url::Url::parse(target).is_ok() || target.starts_with("//") {
+            cx.open_url(target);
+            return;
+        }
+
+        let (file_target, anchor) = target
+            .split_once('#')
+            .map_or((target, None), |(file, anchor)| (file, Some(anchor)));
+        if !file_target.trim().is_empty() {
+            let current_directory = self
+                .document
+                .read(cx)
+                .path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .map(ToOwned::to_owned)
+                .or_else(|| self.workspace_directory.clone());
+            if let Some(directory) = current_directory {
+                let mut path = directory.join(file_target.trim());
+                if path.extension().is_none() {
+                    path.set_extension("md");
+                }
+                if path.is_file() {
+                    self.open_path_in_tab(&path, cx);
+                } else {
+                    return;
+                }
+            }
+        }
+        if let Some(anchor) = anchor.filter(|anchor| !anchor.is_empty()) {
+            self.reveal_markdown_anchor(anchor, cx);
+        }
+    }
+
+    /// Reveals an ATX heading or footnote definition without changing document source.
+    fn reveal_markdown_anchor(&mut self, anchor: &str, cx: &mut Context<Self>) {
+        let source = self.document.read(cx).text();
+        let normalized_anchor = normalize_markdown_anchor(anchor.trim_start_matches('#'));
+        let mut offset = 0usize;
+        let target_byte = source.split_inclusive('\n').find_map(|raw_line| {
+            let line = raw_line.trim_end_matches(['\n', '\r']).trim_start();
+            let heading = line
+                .strip_prefix('#')
+                .map(|rest| rest.trim_start_matches('#').trim());
+            let footnote = line
+                .strip_prefix("[^")
+                .and_then(|rest| rest.split_once("]:").map(|(label, _)| format!("^{label}")));
+            let matches = heading
+                .is_some_and(|title| normalize_markdown_anchor(title) == normalized_anchor)
+                || footnote
+                    .as_deref()
+                    .is_some_and(|label| normalize_markdown_anchor(label) == normalized_anchor);
+            let current = offset;
+            offset += raw_line.len();
+            matches.then_some(current)
+        });
+        let Some(target_byte) = target_byte else {
+            return;
+        };
+        let _ = self.document.update(cx, |doc, cx| {
+            doc.set_cursor(doc.byte_to_char(target_byte));
+            cx.notify();
+        });
+        let _ = self.editor_view.update(cx, |editor, cx| {
+            editor.reveal_outline(target_byte, cx);
+        });
+    }
+
     /// Creates a blank source-editing tab without disturbing open documents.
     fn action_new_file(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.add_blank_tab(cx);
@@ -839,6 +913,16 @@ impl RootView {
         self.preview_visible = !self.preview_visible;
         settings::set_preview_visible(self.preview_visible);
         self.focus_preview_on_render = self.preview_visible;
+        cx.notify();
+    }
+
+    /// Switches the active editor between Source and Live Markdown presentation.
+    fn toggle_live_markdown(&mut self, cx: &mut Context<Self>) {
+        let enabled = !self.editor_view.read(cx).live_markdown_enabled();
+        settings::set_live_markdown_enabled(enabled);
+        let _ = self.editor_view.update(cx, |editor, cx| {
+            editor.set_live_markdown_enabled(enabled, cx);
+        });
         cx.notify();
     }
 
@@ -1040,6 +1124,50 @@ impl RootView {
                     .child(div().w_full().h(px(1.)).bg(mode_toggle_color))
                     .child(div().w(px(6.)).h(px(1.)).bg(mode_toggle_color)),
             )
+            .into_any_element()
+    }
+
+    /// Renders the Source and Live Markdown presentation toggle beside Preview.
+    fn render_titlebar_live_markdown_toggle(
+        &self,
+        outline_position: OutlinePosition,
+        has_right_sidebar: bool,
+        live_markdown_color: gpui::Rgba,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let preview_offset = if outline_position == OutlinePosition::Right {
+            if has_right_sidebar {
+                self.sidebar_width + SIDEBAR_DIVIDER_WIDTH
+            } else {
+                TITLEBAR_CONTROL_WIDTH
+            }
+        } else {
+            0.0
+        };
+
+        div()
+            .id("titlebar-live-markdown-toggle")
+            .absolute()
+            .top_0()
+            .right(px(preview_offset + TITLEBAR_CONTROL_WIDTH))
+            .size(px(TITLEBAR_CONTROL_WIDTH))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .text_xs()
+            .font_weight(FontWeight::BOLD)
+            .text_color(live_markdown_color)
+            .hover(|this| this.bg(Theme::panel()))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    this.toggle_live_markdown(cx);
+                }),
+            )
+            .child("M↓")
             .into_any_element()
     }
 
@@ -1417,6 +1545,27 @@ fn escape_markdown_label(label: &str) -> String {
         .replace(']', "\\]")
 }
 
+/// Normalizes heading text to the anchor form used by wiki-link navigation.
+fn normalize_markdown_anchor(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('#')
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(|character| {
+            if character.is_whitespace() || character == '_' {
+                '-'
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 fn preview_image_source(source: &str, document_dir: &Path) -> gpui::ImageSource {
     if let Ok(url) = url::Url::parse(source) {
         if url.scheme() == "file" {
@@ -1679,6 +1828,17 @@ impl Render for RootView {
             let _ = self.editor_view.update(cx, |view, _| {
                 view.set_on_outline_viewport_change(viewport_callback);
             });
+
+            let root = cx.weak_entity();
+            let complex_link_callback: crate::ui::editor::ComplexLinkCallback =
+                std::sync::Arc::new(move |target, cx: &mut App| {
+                    let _ = root.update(cx, |root, cx| {
+                        root.open_complex_markdown_target(&target, cx);
+                    });
+                });
+            let _ = self.editor_view.update(cx, |view, _| {
+                view.set_on_complex_link(complex_link_callback);
+            });
         }
 
         let (doc_path, doc_dirty, doc_revision) = {
@@ -1712,6 +1872,7 @@ impl Render for RootView {
                 let _ = self.inline_markdown.update(cx, |state, cx| {
                     if target_rev >= state.source_revision {
                         state.spans = std::sync::Arc::new(parsed.spans);
+                        state.components = std::sync::Arc::new(parsed.components);
                         state.source_revision = target_rev;
                         state.parse_millis = parsed.parse_millis;
                         cx.notify();
@@ -1735,6 +1896,7 @@ impl Render for RootView {
                         let _ = inline_markdown.update(cx, |state, cx| {
                             if target_rev >= state.source_revision {
                                 state.spans = std::sync::Arc::new(parsed.spans);
+                                state.components = std::sync::Arc::new(parsed.components);
                                 state.source_revision = target_rev;
                                 state.parse_millis = parsed.parse_millis;
                                 cx.notify();
@@ -1765,6 +1927,11 @@ impl Render for RootView {
         } else {
             Theme::muted()
         };
+        let live_markdown_color = if self.editor_view.read(cx).live_markdown_enabled() {
+            Theme::control_accent()
+        } else {
+            Theme::muted()
+        };
         let resize_line_color = if self.resizing_sidebar {
             gpui::rgba(0x2d7fd299)
         } else {
@@ -1785,6 +1952,12 @@ impl Render for RootView {
             outline_position,
             has_right_sidebar,
             mode_toggle_color,
+            cx,
+        );
+        let live_markdown_toggle = self.render_titlebar_live_markdown_toggle(
+            outline_position,
+            has_right_sidebar,
+            live_markdown_color,
             cx,
         );
         let top_chrome = div()
@@ -1825,6 +1998,7 @@ impl Render for RootView {
             })
             .child(tab_bar)
             .child(outline_toggle)
+            .child(live_markdown_toggle)
             .child(mode_toggle);
 
         div()
@@ -1884,6 +2058,9 @@ impl Render for RootView {
             }))
             .on_action(cx.listener(|this, _: &ToggleOutline, _window, cx| {
                 this.toggle_outline(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleLiveMarkdown, _window, cx| {
+                this.toggle_live_markdown(cx);
             }))
             .on_action(cx.listener(|this, _: &TogglePreview, _window, cx| {
                 this.toggle_preview(cx);
@@ -2148,7 +2325,7 @@ mod tests {
     use super::{
         BlankTitlebarMouseAction, OpenTargetKind, blank_titlebar_mouse_action,
         classify_open_target, document_title, move_vec_item, next_tab_index, previous_tab_index,
-        preview_find_char_range_to_utf16,
+        normalize_markdown_anchor, preview_find_char_range_to_utf16,
         tab_index_after_close, utf16_offset_to_char_offset,
     };
     use camino::Utf8PathBuf;
@@ -2240,5 +2417,12 @@ mod tests {
             preview_find_char_range_to_utf16(query, &(1..3)),
             1..4
         );
+    }
+
+    #[test]
+    fn markdown_anchor_normalization_matches_wiki_heading_rules() {
+        assert_eq!(normalize_markdown_anchor("Hello World"), "hello-world");
+        assert_eq!(normalize_markdown_anchor("  ## 中文 标题 ##  "), "中文-标题");
+        assert_eq!(normalize_markdown_anchor("already--linked"), "already-linked");
     }
 }
