@@ -258,7 +258,7 @@ impl Render for FileExplorerView {
                     .pr(px(8.))
                     .py(px(3.))
                     .cursor_pointer()
-                    .when(is_active, |this| this.bg(Theme::panel_alt()))
+                    .when(is_active, |this| this.bg(Theme::navigation_active_bg()))
                     .hover(|this| this.bg(Theme::panel_alt()))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -286,7 +286,7 @@ impl Render for FileExplorerView {
                                     .h(px(if is_active { 6. } else { 4. }))
                                     .rounded_full()
                                     .bg(if is_active {
-                                        Theme::control_accent()
+                                        Theme::navigation_accent()
                                     } else {
                                         Theme::muted()
                                     }),
@@ -298,11 +298,7 @@ impl Render for FileExplorerView {
                             .line_height(px(20.))
                             .overflow_hidden()
                             .flex_1()
-                            .text_color(if is_active {
-                                Theme::control_accent()
-                            } else {
-                                Theme::text()
-                            })
+                            .text_color(Theme::text())
                             .child(ellipsize_chars(&title, 64)),
                     )
             })
@@ -323,7 +319,7 @@ impl Render for FileExplorerView {
                     .px(px(10.))
                     .py(px(4.))
                     .cursor_pointer()
-                    .when(is_active, |this| this.bg(Theme::panel_alt()))
+                    .when(is_active, |this| this.bg(Theme::navigation_active_bg()))
                     .hover(|this| this.bg(Theme::panel_alt()))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -338,7 +334,7 @@ impl Render for FileExplorerView {
                             .text_xs()
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_color(if is_active {
-                                Theme::control_accent()
+                                Theme::navigation_accent()
                             } else {
                                 Theme::muted()
                             })
@@ -351,11 +347,7 @@ impl Render for FileExplorerView {
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_sm()
-                            .text_color(if is_active {
-                                Theme::control_accent()
-                            } else {
-                                Theme::text()
-                            })
+                            .text_color(Theme::text())
                             .child(ellipsize_chars(&file_name, 48)),
                     )
             })

@@ -1884,12 +1884,12 @@ impl Render for RootView {
 
         let outline_position = settings::get_outline_position();
         let outline_toggle_color = if self.outline_visible {
-            Theme::control_accent()
+            Theme::navigation_accent()
         } else {
             Theme::muted()
         };
         let mode_toggle_color = if self.preview_visible {
-            Theme::control_accent()
+            Theme::navigation_accent()
         } else {
             Theme::muted()
         };

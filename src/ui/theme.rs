@@ -40,6 +40,8 @@ impl ThemeName {
                 muted: rgb(0xabb0b6),
                 accent: rgb(0xff9940),
                 selection_bg: rgba(0xff994033),
+                navigation_accent: rgb(0x8795a1),
+                navigation_active_bg: rgb(0xe3e7ea),
                 is_dark: false,
             },
             ThemeName::AyuDark => ThemeColors {
@@ -53,6 +55,8 @@ impl ThemeName {
                 muted: rgb(0x565b66),
                 accent: rgb(0xe6b450),
                 selection_bg: rgba(0xe6b45033),
+                navigation_accent: rgb(0x7f8fa3),
+                navigation_active_bg: rgb(0x202631),
                 is_dark: true,
             },
             ThemeName::AyuMirage => ThemeColors {
@@ -66,6 +70,8 @@ impl ThemeName {
                 muted: rgb(0x707a8c),
                 accent: rgb(0xffcc66),
                 selection_bg: rgba(0xffcc6633),
+                navigation_accent: rgb(0x8796aa),
+                navigation_active_bg: rgb(0x343b49),
                 is_dark: true,
             },
         }
@@ -84,6 +90,8 @@ pub struct ThemeColors {
     pub muted: Rgba,
     pub accent: Rgba,
     pub selection_bg: Rgba,
+    pub navigation_accent: Rgba,
+    pub navigation_active_bg: Rgba,
     pub is_dark: bool,
 }
 
@@ -145,6 +153,14 @@ impl Theme {
     pub fn selection_bg() -> Rgba {
         system_colors::selection_background(current_colors().selection_bg)
     }
+    /// Returns the subdued foreground used by persistent navigation controls.
+    pub fn navigation_accent() -> Rgba {
+        current_colors().navigation_accent
+    }
+    /// Returns the low-contrast background used by selected navigation rows.
+    pub fn navigation_active_bg() -> Rgba {
+        current_colors().navigation_active_bg
+    }
     /// Returns the system control accent for toolbar and navigation active states.
     pub fn control_accent() -> Rgba {
         system_colors::control_accent(current_colors().accent)
@@ -178,4 +194,34 @@ fn current_colors() -> ThemeColors {
 pub fn set_theme(name: ThemeName) -> bool {
     settings::set_theme_name(name);
     name.is_dark()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ayu_light_navigation_palette_matches_the_subdued_sidebar_style() {
+        let colors = ThemeName::AyuLight.colors();
+
+        assert_eq!(
+            (colors.navigation_accent, colors.navigation_active_bg),
+            (rgb(0x8795a1), rgb(0xe3e7ea))
+        );
+    }
+
+    #[test]
+    fn navigation_accents_stay_separate_from_content_accents() {
+        let palettes = [
+            ThemeName::AyuLight.colors(),
+            ThemeName::AyuDark.colors(),
+            ThemeName::AyuMirage.colors(),
+        ];
+
+        assert!(
+            palettes
+                .iter()
+                .all(|colors| colors.navigation_accent != colors.accent)
+        );
+    }
 }
