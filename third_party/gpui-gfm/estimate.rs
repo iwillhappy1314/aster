@@ -32,6 +32,33 @@ pub fn estimate_parsed_markdown_height_px(
   estimate_blocks_height_px(parsed.blocks(), wrap_columns, line_height_px, 0)
 }
 
+/// Estimate each top-level block height for a variable-height virtual list.
+///
+/// The returned values include the same trailing block gap and heading top margin used by
+/// `render_top_level_block`, allowing unrendered rows to contribute a stable scroll extent.
+pub fn estimate_parsed_markdown_block_heights_px(
+  parsed: &ParsedMarkdown,
+  wrap_columns: usize,
+  line_height_px: f32,
+) -> Vec<f32> {
+  parsed
+    .blocks()
+    .iter()
+    .enumerate()
+    .map(|(index, block)| {
+      let heading_margin = if index > 0 && matches!(block, Block::Heading { .. }) {
+        HEADING_EXTRA_TOP_MARGIN_PX
+      } else {
+        0.0
+      };
+      (estimate_block_height_px(block, wrap_columns, line_height_px, 0)
+        + BASE_BLOCK_GAP_PX
+        + heading_margin)
+        .max(1.0)
+    })
+    .collect()
+}
+
 /// Estimate height of a list of blocks.
 fn estimate_blocks_height_px(
   blocks: &[Block],
@@ -285,6 +312,16 @@ mod tests {
     let blocks = vec![Block::Paragraph(vec![Inline::Text("Hello".into())])];
     let h = estimate_blocks_height_px(&blocks, 80, 20.0, 0);
     assert!(h >= 20.0);
+  }
+
+  #[test]
+  fn virtual_block_estimates_cover_every_block_and_render_gap() {
+    let parsed = crate::parse::parse_markdown("intro\n\n# Heading\n\n```bash\necho ok\n```");
+    let estimates = estimate_parsed_markdown_block_heights_px(&parsed, 80, 20.0);
+
+    assert_eq!(estimates.len(), parsed.blocks().len());
+    assert!(estimates.iter().all(|height| *height > 0.0));
+    assert!(estimates[1] > estimates[0]);
   }
 
   #[test]

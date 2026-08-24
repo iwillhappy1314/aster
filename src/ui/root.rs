@@ -29,6 +29,7 @@ use gpui::{
     px, size,
 };
 use gpui_component::notification::NotificationList;
+use gpui_gfm::estimate::estimate_parsed_markdown_block_heights_px;
 use gpui_gfm::{
     CodeSyntaxTheme, InteractiveScrollbarAxis, InteractiveScrollbarState, MarkdownRenderOptions,
     MarkdownTheme, ParsedMarkdown, parse_markdown, parsed_markdown_heading_indices,
@@ -36,9 +37,11 @@ use gpui_gfm::{
     render_parsed_markdown_blocks,
 };
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
+use std::cell::Cell;
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,6 +60,23 @@ const DOCUMENT_TAB_TITLE_MAX_WIDTH: f32 = 172.0;
 const DOCUMENT_TAB_TITLE_FONT_SIZE: f32 = 14.0;
 /// Horizontal inset shared by normal and virtualized Markdown previews.
 const PREVIEW_CONTENT_PADDING_X: f32 = 32.0;
+/// Approximate monospace-independent character width used by Markdown height estimates.
+const PREVIEW_ESTIMATED_CHARACTER_WIDTH: f32 = 8.8;
+/// Body line height used by the Markdown preview's compact text style.
+const PREVIEW_ESTIMATED_LINE_HEIGHT: f32 = 20.0;
+
+/// Returns a stable wrapping-column estimate for the visible preview width.
+fn preview_wrap_columns(window_width: f32, outline_visible: bool, sidebar_width: f32) -> usize {
+    let outline_width = if outline_visible {
+        sidebar_width + SIDEBAR_DIVIDER_WIDTH
+    } else {
+        0.0
+    };
+    let content_width = (window_width - outline_width - PREVIEW_CONTENT_PADDING_X * 2.0).max(1.0);
+    (content_width / PREVIEW_ESTIMATED_CHARACTER_WIDTH)
+        .floor()
+        .max(8.0) as usize
+}
 
 #[cfg(target_os = "macos")]
 thread_local! {
@@ -406,6 +426,8 @@ pub struct RootView {
     preview_markdown_options: MarkdownRenderOptions,
     /// Parsed tree keyed by document revision, including sources too large for the old LRU.
     preview_parsed_markdown: Option<(u64, ParsedMarkdown)>,
+    /// Estimated virtual block heights keyed by document revision and available wrap columns.
+    preview_block_height_estimates: Option<(u64, usize, Arc<Vec<f32>>)>,
     /// Direct preview child indices for headings, in Outline order.
     preview_heading_child_indices: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
 }
@@ -460,9 +482,10 @@ impl RootView {
             preview_find_marked_range: None,
             preview_scroll_handle: ScrollHandle::new(),
             preview_scrollbar_state: InteractiveScrollbarState::default(),
-            preview_list_state: ListState::new(0, ListAlignment::Top, px(800.)),
+            preview_list_state: ListState::new(0, ListAlignment::Top, px(800.)).measure_all(),
             preview_markdown_options: MarkdownRenderOptions::default(),
             preview_parsed_markdown: None,
+            preview_block_height_estimates: None,
             preview_heading_child_indices: Default::default(),
         }
     }
@@ -566,9 +589,10 @@ impl RootView {
         self.preview_find_marked_range = None;
         self.preview_scroll_handle = ScrollHandle::new();
         self.preview_scrollbar_state = InteractiveScrollbarState::default();
-        self.preview_list_state = ListState::new(0, ListAlignment::Top, px(800.));
+        self.preview_list_state = ListState::new(0, ListAlignment::Top, px(800.)).measure_all();
         self.preview_markdown_options = MarkdownRenderOptions::default();
         self.preview_parsed_markdown = None;
+        self.preview_block_height_estimates = None;
         self.preview_heading_child_indices = Default::default();
         self.focus_preview_on_render = self.preview_visible;
         self.defer_preview_render_once = false;
@@ -2280,6 +2304,7 @@ impl Render for RootView {
             // selectable-text registry while the editor is showing the same large source.
             self.preview_list_state.reset(0);
             self.preview_markdown_options = MarkdownRenderOptions::default();
+            self.preview_block_height_estimates = None;
             if let Ok(mut indices) = self.preview_heading_child_indices.lock() {
                 indices.clear();
             }
@@ -2636,9 +2661,34 @@ impl Render for RootView {
                         }
 
                         let (preview_content, preview_scrollbar) = if preview_virtualized {
-                            if parsed_changed {
-                                let block_count = parsed.blocks().len();
+                            let block_count = parsed.blocks().len();
+                            let window_width: f32 = window.bounds().size.width.into();
+                            let wrap_columns = preview_wrap_columns(
+                                window_width,
+                                self.outline_visible,
+                                self.sidebar_width,
+                            );
+                            let estimates_changed = self
+                                .preview_block_height_estimates
+                                .as_ref()
+                                .is_none_or(|(revision, columns, _)| {
+                                    *revision != doc_revision || *columns != wrap_columns
+                                });
+                            if estimates_changed {
+                                let previous_offset = self.preview_list_state.logical_scroll_top();
+                                let previous_count = self.preview_list_state.item_count();
+                                let estimates =
+                                    Arc::new(estimate_parsed_markdown_block_heights_px(
+                                        &parsed,
+                                        wrap_columns,
+                                        PREVIEW_ESTIMATED_LINE_HEIGHT,
+                                    ));
                                 self.preview_list_state.reset(block_count);
+                                if previous_count > 0 && !parsed_changed {
+                                    self.preview_list_state.scroll_to(previous_offset);
+                                }
+                                self.preview_block_height_estimates =
+                                    Some((doc_revision, wrap_columns, estimates));
                             }
                             let explorer = self.file_explorer_view.clone();
                             let headings = heading_child_indices.clone();
@@ -2657,6 +2707,12 @@ impl Render for RootView {
 
                             let list_parsed = parsed.clone();
                             let list_options = markdown_options.clone();
+                            let estimated_heights = self
+                                .preview_block_height_estimates
+                                .as_ref()
+                                .map(|(_, _, estimates)| estimates.clone())
+                                .unwrap_or_default();
+                            let estimate_seed_calls = Rc::new(Cell::new(0usize));
                             let content = div()
                                 .id("preview-virtual-scroll")
                                 .size_full()
@@ -2672,6 +2728,17 @@ impl Render for RootView {
                                 }))
                                 .child(
                                     list(self.preview_list_state.clone(), move |index, _, cx| {
+                                        let seeded = estimate_seed_calls.get();
+                                        if estimates_changed && seeded < block_count {
+                                            estimate_seed_calls.set(seeded + 1);
+                                            return div()
+                                                .w_full()
+                                                .h(px(estimated_heights
+                                                    .get(index)
+                                                    .copied()
+                                                    .unwrap_or(PREVIEW_ESTIMATED_LINE_HEIGHT)))
+                                                .into_any_element();
+                                        }
                                         div()
                                             .w_full()
                                             .px(px(PREVIEW_CONTENT_PADDING_X))
@@ -2825,8 +2892,8 @@ mod tests {
         BlankTitlebarMouseAction, OpenTargetKind, RootView, blank_titlebar_mouse_action,
         classify_open_target, document_title, move_vec_item, next_tab_index,
         normalize_markdown_anchor, preview_find_char_range_to_utf16, preview_find_match_count,
-        previous_tab_index, queue_latest_operation, save_outcome_allows_close,
-        tab_index_after_close, utf16_offset_to_char_offset,
+        preview_wrap_columns, previous_tab_index, queue_latest_operation,
+        save_outcome_allows_close, tab_index_after_close, utf16_offset_to_char_offset,
     };
     use crate::model::document::DocumentState;
     use crate::model::inline_markdown::InlineMarkdownState;
@@ -2842,6 +2909,15 @@ mod tests {
         assert_eq!(preview_find_match_count("Hello hello HELLO", "hello"), 3);
         assert_eq!(preview_find_match_count("aaaa", "aa"), 2);
         assert_eq!(preview_find_match_count("中文中文", "中文"), 2);
+    }
+
+    #[test]
+    fn preview_wrap_columns_account_for_outline_and_content_padding() {
+        let full_width = preview_wrap_columns(1_000.0, false, 300.0);
+        let outlined = preview_wrap_columns(1_000.0, true, 300.0);
+
+        assert!(outlined < full_width);
+        assert_eq!(preview_wrap_columns(1.0, true, 400.0), 8);
     }
 
     /// Builds a real root view for deterministic foreground/background persistence tests.
