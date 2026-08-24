@@ -55,6 +55,8 @@ const TITLEBAR_CONTROL_WIDTH: f32 = NATIVE_TITLEBAR_HEIGHT;
 const DOCUMENT_TAB_TITLE_MAX_WIDTH: f32 = 172.0;
 /// Font size used by document titles in the custom tab bar.
 const DOCUMENT_TAB_TITLE_FONT_SIZE: f32 = 14.0;
+/// Horizontal inset shared by normal and virtualized Markdown previews.
+const PREVIEW_CONTENT_PADDING_X: f32 = 32.0;
 
 #[cfg(target_os = "macos")]
 thread_local! {
@@ -2670,16 +2672,18 @@ impl Render for RootView {
                                 }))
                                 .child(
                                     list(self.preview_list_state.clone(), move |index, _, cx| {
-                                        render_parsed_markdown_block(
-                                            &list_parsed,
-                                            index,
-                                            &list_options,
-                                            cx,
-                                        )
+                                        div()
+                                            .w_full()
+                                            .px(px(PREVIEW_CONTENT_PADDING_X))
+                                            .child(render_parsed_markdown_block(
+                                                &list_parsed,
+                                                index,
+                                                &list_options,
+                                                cx,
+                                            ))
+                                            .into_any_element()
                                     })
                                     .size_full()
-                                    .pl(px(32.))
-                                    .pr(px(32.))
                                     .py(px(24.)),
                                 )
                                 .into_any_element();
@@ -2702,8 +2706,7 @@ impl Render for RootView {
                                 .flex()
                                 .flex_col()
                                 .gap_2()
-                                .pl(px(32.))
-                                .pr(px(32.))
+                                .px(px(PREVIEW_CONTENT_PADDING_X))
                                 .py(px(24.))
                                 .overflow_y_scroll()
                                 .overflow_x_hidden()

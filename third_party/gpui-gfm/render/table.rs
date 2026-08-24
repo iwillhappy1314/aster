@@ -35,7 +35,7 @@ pub fn render_table(table: &Table, options: &MarkdownRenderOptions, cx: &App) ->
   let table_content_width = column_widths.iter().sum::<f32>();
 
   // Header row
-  let mut header_row = div().flex().bg(theme.accent.opacity(0.14));
+  let mut header_row = div().flex().bg(theme.code_background);
   for (col, width) in column_widths.iter().enumerate().take(column_count) {
     let cell = table
       .headers

@@ -944,7 +944,7 @@ fn render_complex_component_detail(
                             cell.border_r_1().border_color(Theme::border())
                         })
                         .when(row_index == 0, |cell| {
-                            cell.bg(Theme::selection_bg())
+                            cell.bg(Theme::code_block_bg())
                                 .font_weight(gpui::FontWeight::BOLD)
                         });
                     if let Some(cell) = cell {
