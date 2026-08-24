@@ -23,7 +23,8 @@ use crate::github::GithubIssueReferenceContext;
 use crate::types::{CodeBlock, ParsedMarkdown, Table};
 
 pub use interactive_scrollbar::{
-  InteractiveScrollbarAxis, InteractiveScrollbarState, render_interactive_scrollbar,
+  InteractiveScrollbarAxis, InteractiveScrollbarState, render_interactive_list_scrollbar,
+  render_interactive_scrollbar,
 };
 
 /// A link click handler.
@@ -129,6 +130,10 @@ impl DetailsState {
     self.counter.store(0, Ordering::Relaxed);
   }
 
+  pub(crate) fn set_counter(&self, value: usize) {
+    self.counter.store(value, Ordering::Relaxed);
+  }
+
   /// Get the next details block ID.
   pub fn next_id(&self) -> usize {
     self.counter.fetch_add(1, Ordering::Relaxed)
@@ -203,6 +208,10 @@ impl SelectionState {
   /// Reset the text-block counter before a new render pass.
   pub fn reset_counter(&self) {
     self.counter.store(0, Ordering::Relaxed);
+  }
+
+  pub(crate) fn set_counter(&self, value: usize) {
+    self.counter.store(value, Ordering::Relaxed);
   }
 
   /// Get the next text-block ID.
@@ -309,6 +318,14 @@ impl SelectionState {
   pub fn selected_text(&self, text_id: usize, text: &str) -> Option<String> {
     let range = self.selection_range_for(text_id, text)?;
     text.get(range).map(|s| s.to_string())
+  }
+}
+
+impl Drop for SelectionState {
+  fn drop(&mut self) {
+    if Arc::strong_count(&self.selection) == 1 {
+      selectable_text::remove_cross_block_state(self);
+    }
   }
 }
 
@@ -781,6 +798,30 @@ pub fn render_parsed_markdown_blocks(
   }
 }
 
+/// Returns top-level block indices for document headings without rendering any blocks.
+pub fn parsed_markdown_heading_indices(parsed: &ParsedMarkdown) -> Vec<usize> {
+  parsed
+    .blocks()
+    .iter()
+    .enumerate()
+    .filter_map(|(index, block)| matches!(block, crate::types::Block::Heading { .. }).then_some(index))
+    .collect()
+}
+
+/// Renders one top-level block with deterministic state IDs for virtual scrolling.
+pub fn render_parsed_markdown_block(
+  parsed: &ParsedMarkdown,
+  block_index: usize,
+  options: &MarkdownRenderOptions,
+  cx: &App,
+) -> AnyElement {
+  const BLOCK_STATE_ID_STRIDE: usize = 1_000_000;
+  let counter_base = block_index.saturating_mul(BLOCK_STATE_ID_STRIDE);
+  options.details_state.set_counter(counter_base);
+  options.selection_state.set_counter(counter_base);
+  blocks::render_top_level_block(parsed.blocks(), block_index, options, cx)
+}
+
 /// Render a markdown source string to a GPUI element.
 pub fn render_markdown(source: &str, options: &MarkdownRenderOptions, cx: &App) -> AnyElement {
   render_markdown_impl(source, options, None, cx)
@@ -887,6 +928,13 @@ pub fn render_parsed_markdown(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn virtual_heading_indices_are_top_level_block_indices() {
+    let parsed = crate::parse::parse_markdown("intro\n\n# One\n\nbody\n\n## Two");
+
+    assert_eq!(parsed_markdown_heading_indices(&parsed), vec![1, 3]);
+  }
 
   #[test]
   fn details_state_default_closed() {

@@ -5,7 +5,8 @@ use std::rc::Rc;
 
 use gpui::{
   AnyElement, App, Bounds, Hsla, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-  ScrollDelta, ScrollHandle, ScrollWheelEvent, Window, canvas, fill, point, prelude::*, px, size,
+  ListState, ScrollDelta, ScrollHandle, ScrollWheelEvent, Window, canvas, fill, point, prelude::*,
+  px, size,
 };
 
 const SCROLLBAR_TRACK_SIZE_PX: f32 = 10.0;
@@ -174,6 +175,178 @@ pub fn render_interactive_scrollbar(
   .absolute()
   .inset_0()
   .into_any_element()
+}
+
+/// Renders the same vertical scrollbar for GPUI's variable-height virtual list.
+pub fn render_interactive_list_scrollbar(
+  state: InteractiveScrollbarState,
+  list_state: ListState,
+  color: Hsla,
+) -> AnyElement {
+  let paint_state = state.clone();
+  let down_state = state.clone();
+  let move_state = state.clone();
+  let up_state = state;
+  let paint_list = list_state.clone();
+  let down_list = list_state.clone();
+  let move_list = list_state.clone();
+  let up_list = list_state;
+
+  canvas(
+    move |_, _, _| {},
+    move |bounds: Bounds<Pixels>, (), window: &mut Window, _cx: &mut App| {
+      let paint_geometry = list_scrollbar_geometry(bounds, &paint_list);
+      let view_id = window.current_view();
+
+      window.on_mouse_event({
+        let state = down_state.clone();
+        let list = down_list.clone();
+        move |event: &MouseDownEvent, phase, _, cx| {
+          if !phase.bubble() {
+            return;
+          }
+          let Some(geometry) = list_scrollbar_geometry(bounds, &list) else {
+            return;
+          };
+          if !geometry.track.contains(&event.position) {
+            return;
+          }
+          cx.stop_propagation();
+          list.scrollbar_drag_started();
+          let pointer_in_thumb = if geometry.thumb_hit.contains(&event.position) {
+            event.position.y - geometry.thumb_hit.top()
+          } else {
+            geometry.thumb_length / 2.
+          };
+          let mut inner = state.inner.get();
+          inner.drag = Some(ScrollbarDrag { pointer_in_thumb });
+          state.inner.set(inner);
+          set_list_scroll_offset_for_pointer(
+            &list,
+            geometry,
+            event.position.y,
+            pointer_in_thumb,
+          );
+          cx.notify(view_id);
+        }
+      });
+
+      window.on_mouse_event({
+        let state = move_state.clone();
+        let list = move_list.clone();
+        move |event: &MouseMoveEvent, _, _, cx| {
+          let mut inner = state.inner.get();
+          let hovered = bounds.contains(&event.position);
+          if inner.hovered != hovered {
+            inner.hovered = hovered;
+            state.inner.set(inner);
+            cx.notify(view_id);
+          }
+          let Some(drag) = inner.drag else {
+            return;
+          };
+          if !event.dragging() {
+            return;
+          }
+          let Some(geometry) = list_scrollbar_geometry(bounds, &list) else {
+            return;
+          };
+          cx.stop_propagation();
+          set_list_scroll_offset_for_pointer(
+            &list,
+            geometry,
+            event.position.y,
+            drag.pointer_in_thumb,
+          );
+          cx.notify(view_id);
+        }
+      });
+
+      window.on_mouse_event({
+        let state = up_state.clone();
+        let list = up_list.clone();
+        move |_: &MouseUpEvent, phase, _, cx| {
+          if !phase.bubble() {
+            return;
+          }
+          let mut inner = state.inner.get();
+          if inner.drag.take().is_some() {
+            state.inner.set(inner);
+            list.scrollbar_drag_ended();
+            cx.stop_propagation();
+            cx.notify(view_id);
+          }
+        }
+      });
+
+      let Some(geometry) = paint_geometry else {
+        return;
+      };
+      let interaction = paint_state.inner.get();
+      if !interaction.hovered && interaction.drag.is_none() {
+        return;
+      }
+      window.paint_quad(fill(geometry.thumb_fill, color));
+    },
+  )
+  .absolute()
+  .inset_0()
+  .into_any_element()
+}
+
+fn list_scrollbar_geometry(
+  bounds: Bounds<Pixels>,
+  list: &ListState,
+) -> Option<ScrollbarGeometry> {
+  let viewport_length = list.viewport_bounds().size.height;
+  let max_offset = list.max_offset_for_scrollbar().height;
+  let track_length = bounds.size.height;
+  if viewport_length <= px(0.) || max_offset <= px(0.) || track_length <= px(0.) {
+    return None;
+  }
+  let content_length = viewport_length + max_offset;
+  let thumb_length = (viewport_length / content_length * track_length)
+    .max(px(SCROLLBAR_MIN_THUMB_LENGTH_PX))
+    .min(track_length);
+  let travel = track_length - thumb_length;
+  let offset = list.scroll_px_offset_for_scrollbar().y;
+  let thumb_start = travel * (-offset / max_offset).clamp(0., 1.);
+  let track = Bounds {
+    origin: point(bounds.right() - px(SCROLLBAR_TRACK_SIZE_PX), bounds.top()),
+    size: size(px(SCROLLBAR_TRACK_SIZE_PX), bounds.size.height),
+  };
+  let thumb_hit = Bounds {
+    origin: point(track.left(), track.top() + thumb_start),
+    size: size(track.size.width, thumb_length),
+  };
+  let thumb_fill = Bounds {
+    origin: point(
+      track.right() - px(SCROLLBAR_EDGE_INSET_PX + SCROLLBAR_THUMB_SIZE_PX),
+      thumb_hit.top(),
+    ),
+    size: size(px(SCROLLBAR_THUMB_SIZE_PX), thumb_length),
+  };
+  Some(ScrollbarGeometry {
+    track,
+    thumb_hit,
+    thumb_fill,
+    thumb_length,
+    max_offset,
+  })
+}
+
+fn set_list_scroll_offset_for_pointer(
+  list: &ListState,
+  geometry: ScrollbarGeometry,
+  pointer: Pixels,
+  pointer_in_thumb: Pixels,
+) {
+  let travel = geometry.track.size.height - geometry.thumb_length;
+  if travel <= px(0.) {
+    return;
+  }
+  let progress = ((pointer - pointer_in_thumb - geometry.track.top()) / travel).clamp(0., 1.);
+  list.set_offset_from_scrollbar(point(px(0.), -geometry.max_offset * progress));
 }
 
 /// Stops a horizontal gesture from also reaching the document's vertical scroller.

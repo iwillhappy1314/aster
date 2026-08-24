@@ -2,6 +2,7 @@ use crate::services::complex_markdown::{ComplexMarkdownComponent, ComplexMarkdow
 use crate::services::syntax::{SyntaxKind, SyntaxSpan};
 use std::cmp::Reverse;
 use std::ops::Range;
+use std::sync::Arc;
 
 /// Determines which source boundary owns a collapsed display position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,7 +48,7 @@ struct ProjectionEdit {
 /// Maintains the rendered text and a total source/display position mapping.
 #[derive(Clone, Debug)]
 pub struct DisplayProjection {
-    pub display_text: String,
+    pub display_text: Arc<str>,
     source_len: usize,
     segments: Vec<ProjectionSegment>,
 }
@@ -55,9 +56,14 @@ pub struct DisplayProjection {
 impl DisplayProjection {
     /// Creates a one-to-one projection used by Source mode and safe fallbacks.
     pub fn from_source(source: &str) -> Self {
+        Self::from_shared_source(Arc::from(source))
+    }
+
+    /// Creates an identity projection without copying an already shared source buffer.
+    pub fn from_shared_source(source: Arc<str>) -> Self {
         let source_len = source.len();
         Self {
-            display_text: source.to_string(),
+            display_text: source,
             source_len,
             segments: vec![ProjectionSegment {
                 source: 0..source_len,
@@ -293,7 +299,7 @@ impl DisplayProjection {
         }
 
         Self {
-            display_text,
+            display_text: Arc::from(display_text),
             source_len: source.len(),
             segments,
         }
@@ -453,6 +459,16 @@ fn ranges_intersect(left: &Range<usize>, right: &Range<usize>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_source_identity_projection_reuses_the_source_allocation() {
+        let source: Arc<str> = Arc::from("large source");
+        let projection = DisplayProjection::from_shared_source(source.clone());
+
+        assert!(Arc::ptr_eq(&source, &projection.display_text));
+        assert_eq!(projection.source_to_display_byte(7), 7);
+        assert_eq!(projection.display_to_source_byte(7), 7);
+    }
     use crate::services::syntax::markdown_spans;
 
     #[test]
@@ -476,7 +492,7 @@ mod tests {
         let projection = DisplayProjection::from_markdown(source, &spans, active);
 
         assert_eq!(
-            projection.display_text,
+            projection.display_text.as_ref(),
             "active **bold**\nother strong and site"
         );
     }
@@ -488,7 +504,7 @@ mod tests {
         let projection =
             DisplayProjection::from_markdown(source, &spans, source.len()..source.len());
 
-        assert_eq!(projection.display_text, "中");
+        assert_eq!(projection.display_text.as_ref(), "中");
         assert_eq!(
             projection.source_to_display_byte_with_affinity(1, ProjectionAffinity::Left),
             0
@@ -515,7 +531,7 @@ mod tests {
         let projection =
             DisplayProjection::from_markdown(source, &spans, source.len()..source.len());
 
-        assert_eq!(projection.display_text, "• item\n☑ done\n");
+        assert_eq!(projection.display_text.as_ref(), "• item\n☑ done\n");
         assert!(matches!(
             projection.atom_at_display_byte(0),
             Some((_, ProjectionAtom::Bullet))
@@ -562,7 +578,7 @@ mod tests {
             .display_text
             .find('\u{200B}')
             .expect("table atom");
-        assert_eq!(projection.display_text, "before\n\u{200B}\nafter");
+        assert_eq!(projection.display_text.as_ref(), "before\n\u{200B}\nafter");
         assert!(matches!(
             projection.atom_at_display_byte(table_byte),
             Some((
@@ -582,7 +598,7 @@ mod tests {
         let projection =
             DisplayProjection::from_markdown_with_components(source, &spans, &components, 0..6);
 
-        assert_eq!(projection.display_text, "before\n\nafter");
+        assert_eq!(projection.display_text.as_ref(), "before\n\nafter");
         assert!(!projection.display_text.contains("tshirt-2.jpg"));
         assert!(matches!(
             projection.atom_at_display_byte("before\n".len()),

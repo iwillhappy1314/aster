@@ -64,6 +64,24 @@ pub(crate) fn render_top_level_blocks(
   (elements, heading_child_indices)
 }
 
+/// Render one direct child using the same spacing as the full document renderer.
+pub(crate) fn render_top_level_block(
+  blocks: &[Block],
+  index: usize,
+  options: &MarkdownRenderOptions,
+  cx: &App,
+) -> AnyElement {
+  let Some(block) = blocks.get(index) else {
+    return div().into_any_element();
+  };
+  let element = render_block(block, options, 0, cx);
+  let mut wrapper = div().w_full().min_w_0().flex_shrink_0().pb(px(8.0));
+  if index > 0 && matches!(block, Block::Heading { .. }) {
+    wrapper = wrapper.mt(px(10.0));
+  }
+  wrapper.child(element).into_any_element()
+}
+
 /// Render a single block.
 fn render_block(
   block: &Block,

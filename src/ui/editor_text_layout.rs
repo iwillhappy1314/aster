@@ -5,12 +5,13 @@ use crate::services::syntax::{
 use crate::ui::editor_projection::DisplayProjection;
 use crate::ui::theme::Theme;
 use gpui::{
-    AnyElement, App, Bounds, Entity, HighlightStyle, ImageSource, MouseButton, ObjectFit, Pixels,
-    Point, StyledText, Window, deferred, div, img, prelude::*, px,
+    AnyElement, App, Bounds, Entity, HighlightStyle, ImageSource, ListState, MouseButton,
+    ObjectFit, Pixels, Point, StyledText, Window, deferred, div, img, list, prelude::*, px,
 };
 use gpui_component::input::{Input, InputState};
 use gpui_component::Sizable as _;
 use gpui_gfm::{heading_font_size, heading_font_weight};
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -29,6 +30,7 @@ const MONOSPACE_DIGIT_WIDTH_RATIO: f32 = 0.6;
 const TABLE_CELL_HORIZONTAL_PADDING: f32 = 10.0;
 const TABLE_CELL_LINE_HEIGHT_RATIO: f32 = 1.618_034;
 const TABLE_CELL_VERTICAL_PADDING: f32 = 7.0;
+const VIRTUAL_EDITOR_ROW_MAX_BYTES: usize = 16 * 1024;
 
 /// Receives source ranges when a rendered complex component is clicked.
 pub type ComplexComponentClickHandler =
@@ -59,10 +61,12 @@ struct EditorLineLayout {
 
 /// Aggregates independently-sized line layouts behind the same byte/position
 /// mapping operations the editor previously performed on one `TextLayout`.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct EditorTextLayout {
-    lines: Vec<EditorLineLayout>,
+    lines: Arc<Mutex<VecDeque<EditorLineLayout>>>,
     display_len: usize,
+    /// Full layouts keep every row; virtual layouts retain only a bounded working set.
+    max_retained_lines: usize,
 }
 
 impl EditorTextLayout {
@@ -102,18 +106,11 @@ impl EditorTextLayout {
             .unwrap_or(px(0.))
     }
 
-    fn line_for_index(&self, index: usize) -> Option<&EditorLineLayout> {
-        let index = index.min(self.display_len);
-        let line_index = self
-            .lines
-            .partition_point(|line| line.display_range.end < index);
-        self.lines.get(line_index).or_else(|| self.lines.last())
-    }
+    fn closest_line(&self, position: Point<Pixels>) -> Option<EditorLineLayout> {
+        let lines = self.lines.lock().ok()?;
+        let mut closest: Option<(EditorLineLayout, Pixels)> = None;
 
-    fn closest_line(&self, position: Point<Pixels>) -> Option<&EditorLineLayout> {
-        let mut closest: Option<(&EditorLineLayout, Pixels)> = None;
-
-        for line in &self.lines {
+        for line in lines.iter() {
             let Some(bounds) = line
                 .prepainted_bounds
                 .lock()
@@ -131,18 +128,69 @@ impl EditorTextLayout {
             };
 
             if distance == px(0.) {
-                return Some(line);
+                return Some(line.clone());
             }
 
             if closest
                 .as_ref()
                 .is_none_or(|(_, closest_distance)| distance < *closest_distance)
             {
-                closest = Some((line, distance));
+                closest = Some((line.clone(), distance));
             }
         }
 
         closest.map(|(line, _)| line)
+    }
+
+    fn line_for_index(&self, index: usize) -> Option<EditorLineLayout> {
+        let index = index.min(self.display_len);
+        let lines = self.lines.lock().ok()?;
+        lines
+            .iter()
+            .find(|line| line.display_range.start <= index && index <= line.display_range.end)
+            .cloned()
+            .or_else(|| {
+                lines
+                    .iter()
+                    .min_by_key(|line| {
+                        if index < line.display_range.start {
+                            line.display_range.start - index
+                        } else {
+                            index.saturating_sub(line.display_range.end)
+                        }
+                    })
+                    .cloned()
+            })
+    }
+
+    fn register_line(&self, line: EditorLineLayout) {
+        let Ok(mut lines) = self.lines.lock() else {
+            return;
+        };
+        lines.retain(|existing| existing.display_range != line.display_range);
+        lines.push_back(line);
+        while lines.len() > self.max_retained_lines {
+            lines.pop_front();
+        }
+    }
+
+    fn virtualized(display_len: usize) -> Self {
+        Self {
+            lines: Default::default(),
+            display_len,
+            // Several viewports of wrapped rows are enough for pointer mapping and IME bounds.
+            max_retained_lines: 1024,
+        }
+    }
+}
+
+impl Default for EditorTextLayout {
+    fn default() -> Self {
+        Self {
+            lines: Default::default(),
+            display_len: 0,
+            max_retained_lines: usize::MAX,
+        }
     }
 }
 
@@ -169,7 +217,7 @@ pub fn render_editor_text(
     active_table_cell: Option<&ActiveTableCellEditor>,
     on_table_cell_click: TableCellClickHandler,
 ) -> EditorTextRender {
-    let display_ranges = display_line_ranges(display_text);
+    let display_ranges = editor_line_ranges(display_text);
     let heading_levels = markdown_heading_levels(source_text);
     let line_kinds = markdown_line_kinds(source_text);
     let source_line_starts = source_line_starts(source_text);
@@ -180,7 +228,7 @@ pub fn render_editor_text(
     );
 
     let mut container = div().relative().w_full().min_w_0().flex().flex_col();
-    let mut layouts = Vec::with_capacity(display_ranges.len());
+    let mut layouts = VecDeque::with_capacity(display_ranges.len());
     let mut highlight_start = 0usize;
 
     debug_assert!(
@@ -402,9 +450,96 @@ pub fn render_editor_text(
     EditorTextRender {
         element: container.into_any_element(),
         layout: EditorTextLayout {
-            lines: layouts,
+            lines: Arc::new(Mutex::new(layouts)),
             display_len: display_text.len(),
+            max_retained_lines: usize::MAX,
         },
+        left_padding,
+    }
+}
+
+/// Builds a visible-only source editor for large documents.
+///
+/// Line ranges are cheap metadata; GPUI text layouts and row elements are created only for the
+/// current viewport and a small overdraw region maintained by `ListState`.
+pub fn render_virtualized_editor_text(
+    display_text: Arc<str>,
+    display_ranges: Arc<Vec<Range<usize>>>,
+    highlights: Arc<Vec<(Range<usize>, HighlightStyle)>>,
+    body_font_size: f32,
+    show_line_numbers: bool,
+    list_state: ListState,
+) -> EditorTextRender {
+    let (_, left_padding) = line_number_gutter_layout(
+        show_line_numbers,
+        display_ranges.len(),
+        body_font_size,
+    );
+    let layout = EditorTextLayout::virtualized(display_text.len());
+    let layout_for_rows = layout.clone();
+    let ranges_for_rows = display_ranges.clone();
+
+    let element = list(list_state, move |line_index, _window, _cx| {
+        let Some(display_range) = ranges_for_rows.get(line_index).cloned() else {
+            return div().into_any_element();
+        };
+        let line_text = &display_text[display_range.clone()];
+        let rendered_text = if line_text.is_empty() {
+            EMPTY_LINE_PLACEHOLDER.to_string()
+        } else {
+            line_text.to_string()
+        };
+        let highlight_start = highlights.partition_point(|(range, _)| range.end <= display_range.start);
+        let line_highlights = if line_text.is_empty() {
+            Vec::new()
+        } else {
+            highlights_for_line(highlights.as_slice(), &display_range, highlight_start)
+        };
+        let mut styled = StyledText::new(rendered_text.clone());
+        if !line_highlights.is_empty() {
+            styled = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                StyledText::new(rendered_text.clone()).with_highlights(line_highlights)
+            }))
+            .unwrap_or_else(|_| StyledText::new(rendered_text));
+        }
+
+        let text_layout = styled.layout().clone();
+        let prepainted_bounds = Arc::new(Mutex::new(None));
+        layout_for_rows.register_line(EditorLineLayout {
+            display_range,
+            layout: text_layout,
+            prepainted_bounds: prepainted_bounds.clone(),
+        });
+
+        let mut line = editor_display_line(line_index, prepainted_bounds)
+            .w_full()
+            .text_size(px(body_font_size))
+            .line_height(px(body_text_line_height(body_font_size)))
+            .child(styled);
+        if show_line_numbers {
+            let gutter_width = line_number_gutter_width(ranges_for_rows.len(), body_font_size);
+            line = line.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_full()
+                    .mr(px(LINE_NUMBER_GUTTER_GAP))
+                    .w(px(gutter_width))
+                    .text_right()
+                    .text_size(px(body_font_size))
+                    .text_color(Theme::muted())
+                    .child((line_index + 1).to_string()),
+            );
+        }
+        line.into_any_element()
+    })
+    .size_full()
+    .py(px(24.))
+    .into_any_element();
+
+    EditorTextRender {
+        element,
+        layout,
         left_padding,
     }
 }
@@ -1088,7 +1223,7 @@ fn line_number_gutter_layout(
     (gutter_width, left_padding)
 }
 
-fn display_line_ranges(text: &str) -> Vec<Range<usize>> {
+pub(crate) fn editor_line_ranges(text: &str) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     let mut start = 0usize;
 
@@ -1101,6 +1236,33 @@ fn display_line_ranges(text: &str) -> Vec<Range<usize>> {
 
     ranges.push(start..text.len());
     ranges
+}
+
+/// Returns bounded virtual rows, splitting a pathological single source line at UTF-8 boundaries.
+pub(crate) fn virtual_editor_row_ranges(text: &str) -> Vec<Range<usize>> {
+    let mut rows = Vec::new();
+    for line in editor_line_ranges(text) {
+        if line.is_empty() {
+            rows.push(line);
+            continue;
+        }
+        let mut start = line.start;
+        while start < line.end {
+            let mut end = (start + VIRTUAL_EDITOR_ROW_MAX_BYTES).min(line.end);
+            while end > start && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end == start {
+                end = text[start..line.end]
+                    .char_indices()
+                    .nth(1)
+                    .map_or(line.end, |(offset, _)| start + offset);
+            }
+            rows.push(start..end);
+            start = end;
+        }
+    }
+    rows
 }
 
 /// Returns the byte offset at which every source line begins.
@@ -1152,9 +1314,20 @@ mod tests {
     #[test]
     fn line_ranges_keep_empty_lines_and_trailing_line() {
         assert_eq!(
-            display_line_ranges("a\n\nb\n"),
+            editor_line_ranges("a\n\nb\n"),
             vec![0..1, 2..2, 3..4, 5..5]
         );
+    }
+
+    #[test]
+    fn virtual_rows_bound_a_single_oversized_line() {
+        let text = "中".repeat(VIRTUAL_EDITOR_ROW_MAX_BYTES);
+        let rows = virtual_editor_row_ranges(&text);
+
+        assert!(rows.len() > 1);
+        assert!(rows.iter().all(|range| range.len() <= VIRTUAL_EDITOR_ROW_MAX_BYTES));
+        assert_eq!(rows.first().unwrap().start, 0);
+        assert_eq!(rows.last().unwrap().end, text.len());
     }
 
     #[test]
@@ -1189,12 +1362,13 @@ mod tests {
     fn pointer_mapping_skips_lines_that_have_not_been_prepainted() {
         let layout = StyledText::new("offscreen").layout().clone();
         let editor_layout = EditorTextLayout {
-            lines: vec![EditorLineLayout {
+            lines: Arc::new(Mutex::new(VecDeque::from([EditorLineLayout {
                 display_range: 0..9,
                 layout,
                 prepainted_bounds: Arc::new(Mutex::new(None)),
-            }],
+            }]))),
             display_len: 9,
+            max_retained_lines: usize::MAX,
         };
 
         assert!(editor_layout.closest_line(Point::default()).is_none());

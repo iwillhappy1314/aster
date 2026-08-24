@@ -33,9 +33,11 @@ pub use render::{
   InteractiveScrollbarState, ListItemView, MarkdownRenderOptions, MarkdownTheme,
   RenderOverrides, RenderedMarkdownBlocks,
   code_syntax_highlights,
-  render_interactive_scrollbar, render_markdown, render_markdown_blocks_cached,
-  render_markdown_cached, render_parsed_markdown, render_parsed_markdown_blocks,
+  render_interactive_list_scrollbar, render_interactive_scrollbar, render_markdown,
+  render_markdown_blocks_cached,
+  render_markdown_cached, render_parsed_markdown, render_parsed_markdown_block,
+  render_parsed_markdown_blocks, parsed_markdown_heading_indices,
 };
 #[cfg(feature = "gpui-render")]
 pub use typography::{heading_font_size, heading_font_weight};
-pub use types::ParsedMarkdown;
+pub use types::{ParsedMarkdown, virtualize_parsed_markdown};

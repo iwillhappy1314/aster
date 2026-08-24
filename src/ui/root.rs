@@ -16,29 +16,35 @@ use crate::services::tasks::Debouncer;
 use crate::ui::editor::EditorView;
 use crate::ui::file_explorer::{FileExplorerView, list_markdown_files};
 use crate::ui::theme::{Theme, ThemeName};
+use crate::ui::VIRTUALIZED_DOCUMENT_BYTES;
 
 use camino::Utf8PathBuf;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, AnyWindowHandle, App, AppContext, Bounds, ClickEvent, ClipboardItem, Context,
     ElementInputHandler, Entity, EntityInputHandler, ExternalPaths, FocusHandle, FontWeight,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Pixels, Render, ScrollHandle, StatefulInteractiveElement, Styled,
-    UTF16Selection, Window, canvas, div, px, size,
+    InteractiveElement, IntoElement, KeyDownEvent, ListAlignment, ListOffset, ListState,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render,
+    ScrollHandle, StatefulInteractiveElement, Styled, UTF16Selection, Window, canvas, div, list,
+    px, size,
 };
 use gpui_component::notification::NotificationList;
 use gpui_gfm::{
-    CodeSyntaxTheme, InteractiveScrollbarAxis, InteractiveScrollbarState, MarkdownCache,
-    MarkdownRenderOptions, MarkdownTheme, render_interactive_scrollbar,
-    render_markdown_blocks_cached,
+    CodeSyntaxTheme, InteractiveScrollbarAxis, InteractiveScrollbarState, MarkdownRenderOptions,
+    MarkdownTheme, ParsedMarkdown, parse_markdown,
+    parsed_markdown_heading_indices, render_interactive_list_scrollbar,
+    render_interactive_scrollbar, render_parsed_markdown_block, render_parsed_markdown_blocks,
+    virtualize_parsed_markdown,
 };
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 const INLINE_SYNC_PARSE_MAX_BYTES: usize = 64 * 1024;
+const PREVIEW_VIRTUAL_BLOCK_MAX_BYTES: usize = 16 * 1024;
 /// Height reserved for macOS native titlebar controls.
 const NATIVE_TITLEBAR_HEIGHT: f32 = 38.0;
 /// Width of the draggable divider rendered beside the document Outline.
@@ -368,7 +374,7 @@ pub struct RootView {
     /// Highest document revision for which an inline parse has been scheduled.
     scheduled_inline_revision: u64,
     /// Cached document text to avoid O(n) rope-to-string conversion every frame
-    cached_doc_text: Option<(u64, String)>,
+    cached_doc_text: Option<(u64, Arc<str>)>,
     /// Whether we've installed the outline-click reveal callback.
     outline_reveal_installed: bool,
     /// Current font size in points (8-32)
@@ -397,10 +403,12 @@ pub struct RootView {
     preview_scroll_handle: ScrollHandle,
     /// Hover and drag state for the preview's interactive vertical scrollbar.
     preview_scrollbar_state: InteractiveScrollbarState,
+    /// Variable-height list used by large Markdown previews.
+    preview_list_state: ListState,
     /// Persistent gpui-gfm state so selection and interactive Markdown survive re-renders.
     preview_markdown_options: MarkdownRenderOptions,
-    /// Parsed Markdown cache reused by the preview across GPUI render passes.
-    preview_markdown_cache: MarkdownCache,
+    /// Parsed tree keyed by document revision, including sources too large for the old LRU.
+    preview_parsed_markdown: Option<(u64, ParsedMarkdown)>,
     /// Direct preview child indices for headings, in Outline order.
     preview_heading_child_indices: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
 }
@@ -454,8 +462,9 @@ impl RootView {
             preview_find_marked_range: None,
             preview_scroll_handle: ScrollHandle::new(),
             preview_scrollbar_state: InteractiveScrollbarState::default(),
+            preview_list_state: ListState::new(0, ListAlignment::Top, px(800.)),
             preview_markdown_options: MarkdownRenderOptions::default(),
-            preview_markdown_cache: MarkdownCache::default(),
+            preview_parsed_markdown: None,
             preview_heading_child_indices: Default::default(),
         }
     }
@@ -559,8 +568,9 @@ impl RootView {
         self.preview_find_marked_range = None;
         self.preview_scroll_handle = ScrollHandle::new();
         self.preview_scrollbar_state = InteractiveScrollbarState::default();
+        self.preview_list_state = ListState::new(0, ListAlignment::Top, px(800.));
         self.preview_markdown_options = MarkdownRenderOptions::default();
-        self.preview_markdown_cache = MarkdownCache::default();
+        self.preview_parsed_markdown = None;
         self.preview_heading_child_indices = Default::default();
         self.focus_preview_on_render = self.preview_visible;
     }
@@ -2038,6 +2048,33 @@ fn preview_find_char_range_to_utf16(text: &str, range: &Range<usize>) -> Range<u
     start..end
 }
 
+/// Counts non-overlapping ASCII-case-insensitive matches without allocating lowercase copies.
+fn preview_find_match_count(text: &str, query: &str) -> usize {
+    if query.is_empty() || query.len() > text.len() {
+        return 0;
+    }
+    let query = query.as_bytes();
+    let bytes = text.as_bytes();
+    let mut count = 0usize;
+    let mut start = 0usize;
+    while start + query.len() <= bytes.len() {
+        let end = start + query.len();
+        if text.is_char_boundary(start)
+            && text.is_char_boundary(end)
+            && bytes[start..end]
+                .iter()
+                .map(u8::to_ascii_lowercase)
+                .eq(query.iter().map(u8::to_ascii_lowercase))
+        {
+            count += 1;
+            start = end;
+        } else {
+            start += 1;
+        }
+    }
+    count
+}
+
 /// Implements macOS text-input callbacks for the preview Find query, including IME composition.
 impl EntityInputHandler for RootView {
     fn text_for_range(
@@ -2164,12 +2201,13 @@ impl Render for RootView {
             preview_focus_handle.focus(window);
             self.focus_preview_on_render = false;
         }
-        // Install the Outline reveal callback once. The editor uses TextLayout's
-        // exact Y position; preview uses ScrollHandle's real direct-child bounds.
+        // Install the Outline reveal callback once. Small previews use direct-child
+        // bounds; virtual previews jump to the heading's top-level block index.
         if !self.outline_reveal_installed {
             self.outline_reveal_installed = true;
             let editor = self.editor_view.clone();
             let preview_scroll = self.preview_scroll_handle.clone();
+            let preview_list = self.preview_list_state.clone();
             let preview_heading_indices = self.preview_heading_child_indices.clone();
             let callback: crate::ui::file_explorer::RevealCallback =
                 std::sync::Arc::new(move |heading_ordinal, byte_start, cx: &mut App| {
@@ -2180,6 +2218,10 @@ impl Render for RootView {
                         .ok()
                         .and_then(|indices| indices.get(heading_ordinal).copied());
                     if let Some(child_index) = child_index {
+                        preview_list.scroll_to(ListOffset {
+                            item_ix: child_index,
+                            offset_in_item: px(0.),
+                        });
                         if let Some(child_bounds) = preview_scroll.bounds_for_item(child_index) {
                             let viewport = preview_scroll.bounds();
                             let max = preview_scroll.max_offset();
@@ -2241,22 +2283,42 @@ impl Render for RootView {
             if cached_rev == doc_revision {
                 text.clone()
             } else {
-                let text = self.document.read(cx).text();
+                let text = Arc::<str>::from(self.document.read(cx).text());
                 self.cached_doc_text = Some((doc_revision, text.clone()));
                 text
             }
         } else {
-            let text = self.document.read(cx).text();
+            let text = Arc::<str>::from(self.document.read(cx).text());
             self.cached_doc_text = Some((doc_revision, text.clone()));
             text
         };
+        if !self.preview_visible && self.preview_parsed_markdown.take().is_some() {
+            // A hidden preview must not pin the parsed tree, list measurements, or the
+            // selectable-text registry while the editor is showing the same large source.
+            self.preview_list_state.reset(0);
+            self.preview_markdown_options = MarkdownRenderOptions::default();
+            if let Ok(mut indices) = self.preview_heading_child_indices.lock() {
+                indices.clear();
+            }
+        }
         let inline_rev = self.inline_markdown.read(cx).source_revision;
 
         if doc_revision != inline_rev && self.scheduled_inline_revision < doc_revision {
             self.scheduled_inline_revision = doc_revision;
             let last_edit = self.document.read(cx).last_edit.clone();
             let target_rev = doc_revision;
-            if doc_text.len() <= INLINE_SYNC_PARSE_MAX_BYTES {
+            if doc_text.len() > VIRTUALIZED_DOCUMENT_BYTES {
+                // The large editor intentionally renders literal source lines. Publishing an
+                // empty, revision-current result prevents a redundant whole-document inline
+                // parse and keeps stale ranges out of the editor.
+                let _ = self.inline_markdown.update(cx, |state, cx| {
+                    state.spans = Default::default();
+                    state.components = Default::default();
+                    state.source_revision = target_rev;
+                    state.parse_millis = 0;
+                    cx.notify();
+                });
+            } else if doc_text.len() <= INLINE_SYNC_PARSE_MAX_BYTES {
                 // Small/medium notes: parse inline to avoid style flicker between keystrokes.
                 let parsed = compute_inline_spans(&doc_text, last_edit.as_ref());
                 let _ = self.inline_markdown.update(cx, |state, cx| {
@@ -2576,22 +2638,135 @@ impl Render for RootView {
                                 }),
                             );
                         }
-                        let markdown_blocks = render_markdown_blocks_cached(
-                            &doc_text,
-                            &markdown_options,
-                            &mut self.preview_markdown_cache,
-                            cx,
-                        );
-                        let preview_find_active = self.preview_find_active;
-                        let preview_find_query = self.preview_find_query.clone();
-                        let preview_find_count = markdown_options.preview_search_match_count();
-                        let preview_input_focus_handle = preview_focus_handle.clone();
-                        let preview_input_entity = preview_input_entity.clone();
-                        let heading_child_indices = markdown_blocks.heading_child_indices.clone();
+                        let preview_virtualized = doc_text.len() > VIRTUALIZED_DOCUMENT_BYTES;
+                        let parsed_changed = self
+                            .preview_parsed_markdown
+                            .as_ref()
+                            .is_none_or(|(revision, _)| *revision != doc_revision);
+                        if parsed_changed {
+                            let parsed = parse_markdown(doc_text.as_ref());
+                            let parsed = if preview_virtualized {
+                                virtualize_parsed_markdown(
+                                    &parsed,
+                                    PREVIEW_VIRTUAL_BLOCK_MAX_BYTES,
+                                )
+                            } else {
+                                parsed
+                            };
+                            self.preview_parsed_markdown = Some((doc_revision, parsed));
+                        }
+                        let parsed = self
+                            .preview_parsed_markdown
+                            .as_ref()
+                            .map(|(_, parsed)| parsed.clone())
+                            .unwrap_or_else(|| parse_markdown(""));
+                        let heading_child_indices = parsed_markdown_heading_indices(&parsed);
                         if let Ok(mut indices) = self.preview_heading_child_indices.lock() {
                             *indices = heading_child_indices.clone();
                         }
-                        self.sync_preview_outline_active(&heading_child_indices, cx);
+
+                        let (preview_content, preview_scrollbar) = if preview_virtualized {
+                            if parsed_changed {
+                                let block_count = parsed.blocks().len();
+                                self.preview_list_state.reset(block_count);
+                            }
+                            let explorer = self.file_explorer_view.clone();
+                            let headings = heading_child_indices.clone();
+                            self.preview_list_state.set_scroll_handler(move |event, _, cx| {
+                                let first_visible = event.visible_range.start;
+                                let active = (!headings.is_empty()).then(|| {
+                                    headings
+                                        .partition_point(|block| *block <= first_visible)
+                                        .saturating_sub(1)
+                                });
+                                let _ = explorer.update(cx, |view, cx| {
+                                    view.set_active_outline(active, cx);
+                                });
+                            });
+
+                            let list_parsed = parsed.clone();
+                            let list_options = markdown_options.clone();
+                            let content = div()
+                                .id("preview-virtual-scroll")
+                                .size_full()
+                                .overflow_hidden()
+                                .track_focus(&preview_focus_handle)
+                                .on_key_down(cx.listener({
+                                    let preview_focus_handle = preview_focus_handle.clone();
+                                    move |this, event: &KeyDownEvent, window, cx| {
+                                        if preview_focus_handle.is_focused(window) {
+                                            this.handle_preview_find_key(event, cx);
+                                        }
+                                    }
+                                }))
+                                .child(
+                                    list(self.preview_list_state.clone(), move |index, _, cx| {
+                                        render_parsed_markdown_block(
+                                            &list_parsed,
+                                            index,
+                                            &list_options,
+                                            cx,
+                                        )
+                                    })
+                                    .size_full()
+                                    .pl(px(32.))
+                                    .pr(px(32.))
+                                    .py(px(24.)),
+                                )
+                                .into_any_element();
+                            let scrollbar = render_interactive_list_scrollbar(
+                                preview_scrollbar_state,
+                                self.preview_list_state.clone(),
+                                Theme::muted().into(),
+                            );
+                            (content, scrollbar)
+                        } else {
+                            let markdown_blocks =
+                                render_parsed_markdown_blocks(&parsed, &markdown_options, cx);
+                            self.sync_preview_outline_active(
+                                &markdown_blocks.heading_child_indices,
+                                cx,
+                            );
+                            let content = div()
+                                .id("preview-scroll")
+                                .size_full()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .pl(px(32.))
+                                .pr(px(32.))
+                                .py(px(24.))
+                                .overflow_y_scroll()
+                                .overflow_x_hidden()
+                                .track_scroll(&self.preview_scroll_handle)
+                                .track_focus(&preview_focus_handle)
+                                .on_key_down(cx.listener({
+                                    let preview_focus_handle = preview_focus_handle.clone();
+                                    move |this, event: &KeyDownEvent, window, cx| {
+                                        if preview_focus_handle.is_focused(window) {
+                                            this.handle_preview_find_key(event, cx);
+                                        }
+                                    }
+                                }))
+                                .children(markdown_blocks.elements)
+                                .into_any_element();
+                            let scrollbar = render_interactive_scrollbar(
+                                InteractiveScrollbarAxis::Vertical,
+                                preview_scrollbar_state,
+                                preview_scroll_handle,
+                                Theme::muted().into(),
+                            );
+                            (content, scrollbar)
+                        };
+                        let preview_find_active = self.preview_find_active;
+                        let preview_find_query = self.preview_find_query.clone();
+                        let preview_find_count = if preview_virtualized {
+                            preview_find_match_count(doc_text.as_ref(), &self.preview_find_query)
+                        } else {
+                            markdown_options.preview_search_match_count()
+                        };
+                        let preview_input_focus_handle = preview_focus_handle.clone();
+                        let preview_input_entity = preview_input_entity.clone();
                         div()
                             .relative()
                             .flex_1()
@@ -2612,29 +2787,7 @@ impl Render for RootView {
                                     }
                                 },
                             ))
-                            .child(
-                                div()
-                                    .id("preview-scroll")
-                                    .size_full()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .pl(px(32.))
-                                    .pr(px(32.))
-                                    .py(px(24.))
-                                    .overflow_y_scroll()
-                                    .overflow_x_hidden()
-                                    .track_scroll(&self.preview_scroll_handle)
-                                    .track_focus(&preview_focus_handle)
-                                    .on_key_down(cx.listener(
-                                        move |this, event: &KeyDownEvent, window, cx| {
-                                            if preview_focus_handle.is_focused(window) {
-                                                this.handle_preview_find_key(event, cx);
-                                            }
-                                        },
-                                    ))
-                                    .children(markdown_blocks.elements),
-                            )
+                            .child(preview_content)
                             .when(preview_find_active, |this| {
                                 this.child(
                                     div()
@@ -2677,14 +2830,7 @@ impl Render for RootView {
                                         ),
                                 )
                             })
-                            .child(
-                                render_interactive_scrollbar(
-                                    InteractiveScrollbarAxis::Vertical,
-                                    preview_scrollbar_state,
-                                    preview_scroll_handle,
-                                    Theme::muted().into(),
-                                ),
-                            )
+                            .child(preview_scrollbar)
                             .into_any_element()
                     } else {
                         div()
@@ -2706,8 +2852,9 @@ mod tests {
     use super::{
         BlankTitlebarMouseAction, OpenTargetKind, RootView, blank_titlebar_mouse_action,
         classify_open_target, document_title, move_vec_item, next_tab_index, previous_tab_index,
-        normalize_markdown_anchor, preview_find_char_range_to_utf16, queue_latest_operation,
-        save_outcome_allows_close, tab_index_after_close, utf16_offset_to_char_offset,
+        normalize_markdown_anchor, preview_find_char_range_to_utf16, preview_find_match_count,
+        queue_latest_operation, save_outcome_allows_close, tab_index_after_close,
+        utf16_offset_to_char_offset,
     };
     use crate::model::document::DocumentState;
     use crate::model::inline_markdown::InlineMarkdownState;
@@ -2717,6 +2864,13 @@ mod tests {
     use camino::Utf8PathBuf;
     use gpui::{AppContext, Context, TestAppContext, Window};
     use gpui_component::notification::NotificationList;
+
+    #[test]
+    fn large_preview_find_count_is_all_document_and_non_overlapping() {
+        assert_eq!(preview_find_match_count("Hello hello HELLO", "hello"), 3);
+        assert_eq!(preview_find_match_count("aaaa", "aa"), 2);
+        assert_eq!(preview_find_match_count("中文中文", "中文"), 2);
+    }
 
     /// Builds a real root view for deterministic foreground/background persistence tests.
     fn build_test_root(window: &mut Window, cx: &mut Context<RootView>) -> RootView {
