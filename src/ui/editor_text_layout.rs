@@ -19,7 +19,9 @@ use std::sync::{Arc, Mutex};
 const EMPTY_LINE_PLACEHOLDER: &str = "\u{200B}";
 const BODY_TEXT_LINE_HEIGHT_RATIO: f32 = 1.75;
 const CODE_BLOCK_TOP_MARGIN: f32 = 8.0;
+const CODE_BLOCK_TOP_PADDING: f32 = 12.0;
 pub(crate) const EDITOR_HORIZONTAL_PADDING: f32 = 32.0;
+const LIST_ITEM_BOTTOM_MARGIN: f32 = 4.0;
 const LINE_NUMBER_GUTTER_GAP: f32 = 12.0;
 const LINE_NUMBER_GUTTER_LEFT_INSET: f32 = 4.0;
 const MIN_LINE_NUMBER_GUTTER_WIDTH: f32 = 16.0;
@@ -270,14 +272,10 @@ pub fn render_editor_text(
         line = match line_kind {
             MarkdownLineKind::Quote => line.border_l_2().border_color(Theme::muted()).pl(px(12.)),
             MarkdownLineKind::CodeFence | MarkdownLineKind::CodeBody => {
-                line.when(starts_code_block, |line| {
-                    line.mt(px(CODE_BLOCK_TOP_MARGIN))
-                })
-                .bg(Theme::code_block_bg())
-                .px(px(12.))
+                style_code_block_line(line, starts_code_block)
             }
             MarkdownLineKind::List { indent } | MarkdownLineKind::Task { indent } => {
-                line.pl(px((indent as f32) * 4.0))
+                style_list_item_line(line, indent)
             }
             MarkdownLineKind::Paragraph | MarkdownLineKind::HorizontalRule => line,
         };
@@ -566,6 +564,28 @@ fn table_cell_line_height(body_font_size: f32) -> f32 {
 /// Returns the explicit line height used by wrapping body text in live Markdown.
 fn body_text_line_height(body_font_size: f32) -> f32 {
     body_font_size * BODY_TEXT_LINE_HEIGHT_RATIO
+}
+
+/// Applies shared code-block styling and the opening line's internal top spacing.
+fn style_code_block_line(
+    line: gpui::Stateful<gpui::Div>,
+    starts_code_block: bool,
+) -> gpui::Stateful<gpui::Div> {
+    line.when(starts_code_block, |line| {
+        line.mt(px(CODE_BLOCK_TOP_MARGIN))
+            .pt(px(CODE_BLOCK_TOP_PADDING))
+    })
+    .bg(Theme::code_block_bg())
+    .px(px(12.))
+}
+
+/// Applies list indentation and a small inter-item gap without changing wrapped line height.
+fn style_list_item_line(
+    line: gpui::Stateful<gpui::Div>,
+    indent: usize,
+) -> gpui::Stateful<gpui::Div> {
+    line.pl(px((indent as f32) * 4.0))
+        .mb(px(LIST_ITEM_BOTTOM_MARGIN))
 }
 
 /// Returns whether the source line begins the referenced fenced code block.
@@ -1330,6 +1350,17 @@ mod tests {
     }
 
     #[test]
+    fn list_items_add_block_spacing_between_inline_code_backgrounds() {
+        let mut line = style_list_item_line(div().id("list-item-line"), 2);
+
+        assert_eq!(
+            line.style().margin.bottom,
+            Some(px(LIST_ITEM_BOTTOM_MARGIN).into())
+        );
+        assert_eq!(line.style().padding.left, Some(px(8.0).into()));
+    }
+
+    #[test]
     fn only_the_opening_fence_receives_code_block_top_spacing() {
         let source = "before\n```text\ncode\n```\nafter";
         let blocks = crate::services::syntax::fenced_code_blocks(source);
@@ -1337,5 +1368,17 @@ mod tests {
         assert!(code_block_starts_on_source_line(&blocks, Some(0), 7));
         assert!(!code_block_starts_on_source_line(&blocks, Some(0), 15));
         assert!(!code_block_starts_on_source_line(&blocks, None, 7));
+    }
+
+    #[test]
+    fn only_the_opening_fence_receives_internal_code_block_top_padding() {
+        let mut opening_line = style_code_block_line(div().id("opening-code-line"), true);
+        let mut body_line = style_code_block_line(div().id("body-code-line"), false);
+
+        assert_eq!(
+            opening_line.style().padding.top,
+            Some(px(CODE_BLOCK_TOP_PADDING).into())
+        );
+        assert_eq!(body_line.style().padding.top, Default::default());
     }
 }
