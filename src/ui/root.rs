@@ -2307,18 +2307,7 @@ impl Render for RootView {
             self.scheduled_inline_revision = doc_revision;
             let last_edit = self.document.read(cx).last_edit.clone();
             let target_rev = doc_revision;
-            if doc_text.len() > VIRTUALIZED_DOCUMENT_BYTES {
-                // The large editor intentionally renders literal source lines. Publishing an
-                // empty, revision-current result prevents a redundant whole-document inline
-                // parse and keeps stale ranges out of the editor.
-                let _ = self.inline_markdown.update(cx, |state, cx| {
-                    state.spans = Default::default();
-                    state.components = Default::default();
-                    state.source_revision = target_rev;
-                    state.parse_millis = 0.0;
-                    cx.notify();
-                });
-            } else if doc_text.len() <= INLINE_SYNC_PARSE_MAX_BYTES {
+            if doc_text.len() <= INLINE_SYNC_PARSE_MAX_BYTES {
                 // Small/medium notes: parse inline to avoid style flicker between keystrokes.
                 let parsed = compute_inline_spans(&doc_text, last_edit.as_ref());
                 let _ = self.inline_markdown.update(cx, |state, cx| {
@@ -2333,7 +2322,7 @@ impl Render for RootView {
                     }
                 });
             } else {
-                // Large notes: debounce and parse in background to protect typing latency.
+                // Medium and large notes keep Live Markdown, but parse off the UI thread.
                 let text = doc_text.clone();
                 let inline_markdown = self.inline_markdown.clone();
                 self.inline_debounce.schedule(cx, move |_, cx| {

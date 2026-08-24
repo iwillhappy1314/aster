@@ -458,23 +458,35 @@ pub fn render_editor_text(
     }
 }
 
-/// Builds a visible-only source editor for large documents.
+/// Builds a visible-only live-Markdown editor for large documents.
 ///
 /// Line ranges are cheap metadata; GPUI text layouts and row elements are created only for the
 /// current viewport and a small overdraw region maintained by `ListState`.
 pub fn render_virtualized_editor_text(
     display_text: Arc<str>,
+    source_text: Arc<str>,
+    projection: Arc<DisplayProjection>,
     display_ranges: Arc<Vec<Range<usize>>>,
     highlights: Arc<Vec<(Range<usize>, HighlightStyle)>>,
     body_font_size: f32,
     show_line_numbers: bool,
+    document_directory: Option<PathBuf>,
+    code_blocks: Arc<Vec<FencedCodeBlock>>,
+    on_code_block_hover: CodeBlockHoverHandler,
+    selected_component: Option<Range<usize>>,
+    on_component_click: ComplexComponentClickHandler,
+    active_table_cell: Option<ActiveTableCellEditor>,
+    on_table_cell_click: TableCellClickHandler,
     list_state: ListState,
 ) -> EditorTextRender {
-    let (_, left_padding) = line_number_gutter_layout(
+    let (line_number_gutter_width, left_padding) = line_number_gutter_layout(
         show_line_numbers,
         display_ranges.len(),
         body_font_size,
     );
+    let heading_levels = Arc::new(markdown_heading_levels(source_text.as_ref()));
+    let line_kinds = Arc::new(markdown_line_kinds(source_text.as_ref()));
+    let source_line_starts = Arc::new(source_line_starts(source_text.as_ref()));
     let layout = EditorTextLayout::virtualized(display_text.len());
     let layout_for_rows = layout.clone();
     let ranges_for_rows = display_ranges.clone();
@@ -504,33 +516,182 @@ pub fn render_virtualized_editor_text(
         }
 
         let text_layout = styled.layout().clone();
-        let prepainted_bounds = Arc::new(Mutex::new(None));
-        layout_for_rows.register_line(EditorLineLayout {
-            display_range,
-            layout: text_layout,
-            prepainted_bounds: prepainted_bounds.clone(),
+        let source_byte = projection.display_to_source_byte(display_range.start);
+        let source_line_index = source_line_index_for_byte(
+            source_line_starts.as_slice(),
+            source_text.len(),
+            source_byte,
+        );
+        let heading_level = heading_levels
+            .get(source_line_index)
+            .copied()
+            .flatten();
+        let line_kind = line_kinds
+            .get(source_line_index)
+            .copied()
+            .unwrap_or(MarkdownLineKind::Paragraph);
+        let source_line_start = source_line_starts
+            .get(source_line_index)
+            .copied()
+            .unwrap_or(source_byte);
+        let code_block_index = code_blocks
+            .iter()
+            .enumerate()
+            .find(|(_, block)| {
+                block.source_range.start <= source_byte && source_byte < block.source_range.end
+            })
+            .map(|(index, _)| index);
+        let starts_code_block = code_block_starts_on_source_line(
+            code_blocks.as_slice(),
+            code_block_index,
+            source_line_start,
+        );
+        let complex_component = projection.complex_atom_for_display_line(&display_range);
+        let hides_component_label = complex_component.as_ref().is_some_and(|(_, kind)| {
+            matches!(
+                kind,
+                ComplexMarkdownKind::Image { .. } | ComplexMarkdownKind::Table { .. }
+            )
         });
 
-        let mut line = editor_display_line(line_index, prepainted_bounds)
-            .w_full()
-            .text_size(px(body_font_size))
-            .line_height(px(body_text_line_height(body_font_size)))
-            .child(styled);
+        let prepainted_bounds = Arc::new(Mutex::new(None));
+        let mut line = editor_display_line(line_index, prepainted_bounds.clone()).w_full();
+        if let Some(level) = heading_level {
+            line = line
+                .text_size(heading_font_size(level))
+                .font_weight(heading_font_weight(level));
+        } else {
+            line = line
+                .text_size(px(body_font_size))
+                .line_height(px(body_text_line_height(body_font_size)));
+        }
+        line = match line_kind {
+            MarkdownLineKind::Quote => line.border_l_2().border_color(Theme::muted()).pl(px(12.)),
+            MarkdownLineKind::CodeFence | MarkdownLineKind::CodeBody => {
+                style_code_block_line(line, starts_code_block)
+            }
+            MarkdownLineKind::List { indent } | MarkdownLineKind::Task { indent } => {
+                style_list_item_line(line, indent)
+            }
+            MarkdownLineKind::Paragraph | MarkdownLineKind::HorizontalRule => line,
+        };
+        if let Some(code_block_index) = code_block_index {
+            let hover_handler = on_code_block_hover.clone();
+            line = line.on_hover(move |hovered, _window, cx| {
+                hover_handler(code_block_index, *hovered, cx);
+            });
+        }
+        line = if hides_component_label {
+            line.child(hidden_projection_layout_anchor(styled))
+        } else {
+            line.child(styled)
+        };
+        if let Some((source_range, kind)) = complex_component
+            && is_block_component(&kind)
+        {
+            let is_table = matches!(kind, ComplexMarkdownKind::Table { .. });
+            let is_selected = !is_table && selected_component.as_ref() == Some(&source_range);
+            let uses_border = component_uses_border(&kind);
+            let uses_panel = component_uses_panel(&kind);
+            let repeat_click_edits_source = component_repeat_click_edits_source(&kind);
+            let click_range = source_range.clone();
+            let click_handler = on_component_click.clone();
+            let source_click_range = source_range.clone();
+            let source_click_handler = on_component_click.clone();
+            line = if is_table {
+                line.mb(px(8.))
+            } else {
+                line.mt(px(4.))
+                    .mb(px(8.))
+                    .when(uses_panel, |component| {
+                        component
+                            .p(px(10.))
+                            .rounded(px(8.))
+                            .bg(Theme::panel_alt())
+                    })
+                    .when(uses_border, |component| {
+                        component.border_1().border_color(if is_selected {
+                            Theme::accent()
+                        } else {
+                            Theme::border()
+                        })
+                    })
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                        click_handler(
+                            click_range.clone(),
+                            repeat_click_edits_source,
+                            window,
+                            cx,
+                        );
+                        cx.stop_propagation();
+                    })
+            };
+            if let Some(detail) = render_complex_component_detail(
+                &kind,
+                document_directory.as_deref(),
+                active_table_cell.as_ref(),
+                &on_table_cell_click,
+                body_font_size,
+            ) {
+                line = line.child(detail);
+            }
+            if is_selected {
+                line = if component_reveals_source_when_selected(&kind) {
+                    line.child(
+                        div()
+                            .mt(px(8.))
+                            .text_size(px(body_font_size))
+                            .text_color(Theme::text())
+                            .cursor_text()
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                source_click_handler(
+                                    source_click_range.clone(),
+                                    true,
+                                    window,
+                                    cx,
+                                );
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                source_text
+                                    .get(source_range.clone())
+                                    .unwrap_or_default()
+                                    .trim_end_matches(['\r', '\n'])
+                                    .to_string(),
+                            ),
+                    )
+                } else {
+                    line.child(
+                        div()
+                            .mt(px(8.))
+                            .text_xs()
+                            .text_color(Theme::accent())
+                            .child("Selected · click again to edit source"),
+                    )
+                };
+            }
+        }
         if show_line_numbers {
-            let gutter_width = line_number_gutter_width(ranges_for_rows.len(), body_font_size);
             line = line.child(
                 div()
                     .absolute()
                     .top_0()
                     .right_full()
                     .mr(px(LINE_NUMBER_GUTTER_GAP))
-                    .w(px(gutter_width))
+                    .w(px(line_number_gutter_width))
                     .text_right()
                     .text_size(px(body_font_size))
                     .text_color(Theme::muted())
                     .child((line_index + 1).to_string()),
             );
         }
+
+        layout_for_rows.register_line(EditorLineLayout {
+            display_range,
+            layout: text_layout,
+            prepainted_bounds,
+        });
         line.into_any_element()
     })
     .size_full()
