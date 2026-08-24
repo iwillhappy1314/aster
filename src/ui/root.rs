@@ -1,13 +1,14 @@
 use crate::commands::{
     Copy, Find, FontSizeDecrease, FontSizeIncrease, FontSizeReset, NewFile, NextTab, OpenFile,
-    OutlinePositionLeft, OutlinePositionRight, PreviousTab, SaveFile, SaveFileAs, SelectAll,
+    OutlinePositionLeft, OutlinePositionRight, PreviousTab, Quit, SaveFile, SaveFileAs, SelectAll,
     ToggleLineNumbers, ToggleLiveMarkdown, ToggleOutline, TogglePreview,
 };
 use crate::model::document::DocumentState;
 use crate::model::inline_markdown::InlineMarkdownState;
-use crate::services::fs::{
-    pick_open_path_async, pick_save_path_async, read_to_string, write_atomic,
+use crate::services::document_persistence::{
+    DocumentSaveOutcome, DocumentSaveSnapshot, apply_document_save, write_document_snapshot,
 };
+use crate::services::fs::{pick_open_path_async, pick_save_path_async, read_to_string};
 use crate::services::inline_markdown::compute_inline_spans;
 use crate::services::settings::{self, OutlinePosition, Settings};
 use crate::services::tasks::Debouncer;
@@ -18,11 +19,11 @@ use crate::ui::theme::{Theme, ThemeName};
 use camino::Utf8PathBuf;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, AppContext, Bounds, ClickEvent, ClipboardItem, Context, ElementInputHandler,
-    Entity, EntityInputHandler, ExternalPaths, FocusHandle, FontWeight, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Render, ScrollHandle, StatefulInteractiveElement, Styled, UTF16Selection, Window, canvas, div,
-    px, size,
+    AnyElement, AnyWindowHandle, App, AppContext, Bounds, ClickEvent, ClipboardItem, Context,
+    ElementInputHandler, Entity, EntityInputHandler, ExternalPaths, FocusHandle, FontWeight,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Render, ScrollHandle, StatefulInteractiveElement, Styled,
+    UTF16Selection, Window, canvas, div, px, size,
 };
 use gpui_component::notification::NotificationList;
 use gpui_gfm::{
@@ -169,6 +170,29 @@ enum OpenTargetKind {
     Directory,
     MarkdownFile,
     Unsupported,
+}
+
+/// Identifies the exact close operation that should resume after an asynchronous save.
+#[derive(Clone, Copy)]
+enum CloseContinuation {
+    Tab {
+        tab_id: usize,
+        window: AnyWindowHandle,
+    },
+    Window {
+        window: AnyWindowHandle,
+    },
+    QuitApp,
+}
+
+/// Returns whether a completed save is safe to follow with a destructive close action.
+fn save_outcome_allows_close(outcome: &DocumentSaveOutcome) -> bool {
+    matches!(
+        outcome,
+        DocumentSaveOutcome::Saved {
+            document_unchanged: true
+        }
+    )
 }
 
 /// Returns the supported open behavior for a filesystem path.
@@ -532,80 +556,153 @@ impl RootView {
         cx.add_recent_document(path.as_std_path());
     }
 
+    /// Saves the active document, capturing its entity and revision before any picker opens.
     fn save_document(&mut self, cx: &mut Context<Self>, force_save_as: bool) {
-        let current_path = self.document.read(cx).path.clone();
+        let document = self.document.clone();
+        let snapshot = DocumentSaveSnapshot::capture(document.read(cx));
 
-        // If we have a path and not forcing save-as, save directly
-        if !force_save_as {
-            if let Some(path) = current_path {
-                self.do_save_to_path_sync(path, cx);
-                return;
-            }
+        if !force_save_as && let Some(path) = snapshot.original_path.clone() {
+            let outcome = self.save_snapshot_to_path(&document, &snapshot, path, cx);
+            self.present_save_failure(&outcome);
+            return;
         }
 
-        // Need to show file picker - use async dialog
-        let receiver = pick_save_path_async(cx, current_path.as_ref());
+        self.start_save_as(document, snapshot, None, cx);
+    }
+
+    /// Normalizes a selected save path to the default Markdown extension.
+    fn normalize_save_path(mut path: Utf8PathBuf) -> Utf8PathBuf {
+        if path.extension().is_none() {
+            path.set_extension("md");
+        }
+        path
+    }
+
+    /// Writes one immutable snapshot and applies its result only to the captured document.
+    fn save_snapshot_to_path(
+        &mut self,
+        document: &Entity<DocumentState>,
+        snapshot: &DocumentSaveSnapshot,
+        path: Utf8PathBuf,
+        cx: &mut Context<Self>,
+    ) -> DocumentSaveOutcome {
+        let path = Self::normalize_save_path(path);
+        if let Err(error) = write_document_snapshot(&path, snapshot) {
+            return DocumentSaveOutcome::Failed {
+                path: Some(path),
+                message: error.to_string(),
+            };
+        }
+
+        let document_unchanged = document.update(cx, |document, cx| {
+            let unchanged = apply_document_save(document, path.clone(), snapshot);
+            cx.notify();
+            unchanged
+        });
+        cx.add_recent_document(path.as_std_path());
+        DocumentSaveOutcome::Saved { document_unchanged }
+    }
+
+    /// Shows a visible error for a failed save while leaving the document dirty.
+    fn present_save_failure(&self, outcome: &DocumentSaveOutcome) {
+        let DocumentSaveOutcome::Failed { path, message } = outcome else {
+            return;
+        };
+        let target = path
+            .as_ref()
+            .map(|path| format!("'{}'", path))
+            .unwrap_or_else(|| "the selected file".to_string());
+        MessageDialog::new()
+            .set_level(MessageLevel::Error)
+            .set_title("Save failed")
+            .set_description(format!("Could not save {target}.\n\n{message}"))
+            .set_buttons(MessageButtons::Ok)
+            .show();
+    }
+
+    /// Starts Save As for a captured document and optionally resumes its close intent.
+    fn start_save_as(
+        &mut self,
+        document: Entity<DocumentState>,
+        snapshot: DocumentSaveSnapshot,
+        continuation: Option<CloseContinuation>,
+        cx: &mut Context<Self>,
+    ) {
+        let receiver = pick_save_path_async(cx, snapshot.original_path.as_ref());
 
         cx.spawn(async move |this, cx| {
-            if let Ok(Ok(Some(path))) = receiver.await {
-                if let Ok(mut utf8_path) = Utf8PathBuf::try_from(path) {
-                    if utf8_path.extension().is_none() {
-                        utf8_path.set_extension("md");
-                    }
+            let outcome = match receiver.await {
+                Ok(Ok(Some(path))) => match Utf8PathBuf::try_from(path) {
+                    Ok(path) => this
+                        .update(cx, |this, cx| {
+                            this.save_snapshot_to_path(&document, &snapshot, path, cx)
+                        })
+                        .unwrap_or_else(|error| DocumentSaveOutcome::Failed {
+                            path: None,
+                            message: error.to_string(),
+                        }),
+                    Err(path) => DocumentSaveOutcome::Failed {
+                        path: None,
+                        message: format!(
+                            "The selected path is not valid UTF-8: {}",
+                            path.as_path().display()
+                        ),
+                    },
+                },
+                Ok(Ok(None)) => DocumentSaveOutcome::Cancelled,
+                Ok(Err(error)) => DocumentSaveOutcome::Failed {
+                    path: None,
+                    message: error.to_string(),
+                },
+                Err(error) => DocumentSaveOutcome::Failed {
+                    path: None,
+                    message: error.to_string(),
+                },
+            };
 
-                    // Read document contents and write synchronously
-                    let contents_result =
-                        this.update(&mut *cx, |this, cx| this.document.read(cx).text());
+            let _ = this.update(cx, |this, _| this.present_save_failure(&outcome));
+            if !save_outcome_allows_close(&outcome) {
+                return;
+            }
 
-                    if let Ok(contents) = contents_result {
-                        if write_atomic(&utf8_path, &contents).is_ok() {
-                            let _ = this.update(&mut *cx, |this, cx| {
-                                let _ = this.document.update(cx, |d, cx| {
-                                    d.path = Some(utf8_path.clone());
-                                    d.save_snapshot();
-                                    cx.notify();
-                                });
-                                cx.add_recent_document(utf8_path.as_std_path());
-                                // Note: Notifications require window context, skipping in async
-                            });
-                        }
-                    }
+            match continuation {
+                Some(CloseContinuation::Tab { tab_id, window }) => {
+                    let this = this.clone();
+                    let _ = cx.update_window(window, move |_, window, cx| {
+                        let _ = this.update(cx, |this, cx| {
+                            this.close_tab_without_confirmation(tab_id, window, cx);
+                        });
+                    });
                 }
+                Some(CloseContinuation::Window { window }) => {
+                    let this = this.clone();
+                    let _ = cx.update_window(window, move |_, window, cx| {
+                        let can_close = this
+                            .update(cx, |this, cx| this.confirm_before_window_close(window, cx))
+                            .unwrap_or(false);
+                        if can_close {
+                            window.remove_window();
+                        }
+                    });
+                }
+                Some(CloseContinuation::QuitApp) => {
+                    let _ = cx.update(|cx| cx.dispatch_action(&Quit));
+                }
+                None => {}
             }
         })
         .detach();
     }
 
-    /// Synchronous save for when we have a path and window context
-    fn do_save_to_path_sync(&mut self, mut path: Utf8PathBuf, cx: &mut Context<Self>) {
-        if path.extension().is_none() {
-            path.set_extension("md");
-        }
-
-        let contents = self.document.read(cx).text();
-        match write_atomic(&path, &contents) {
-            Ok(()) => {
-                let _ = self.document.update(cx, |d, cx| {
-                    d.path = Some(path.clone());
-                    d.save_snapshot();
-                    cx.notify();
-                });
-                cx.add_recent_document(path.as_std_path());
-                // Skip notification here too - simplifies and avoids window context issues
-            }
-            Err(_err) => {
-                // Silently fail for async context - no window for notification
-            }
-        }
-    }
-
+    /// Resolves one captured document before executing a potentially destructive close intent.
     fn confirm_can_discard_changes(
         &mut self,
-        _window: &mut Window,
+        document: Entity<DocumentState>,
         cx: &mut Context<Self>,
         prompt: &str,
+        continuation: CloseContinuation,
     ) -> bool {
-        let is_dirty = self.document.read(cx).dirty;
+        let is_dirty = document.read(cx).dirty;
         if !is_dirty {
             return true;
         }
@@ -621,25 +718,23 @@ impl RootView {
             ))
             .show();
 
-        let save_sync = |this: &mut Self, cx: &mut Context<Self>| -> bool {
-            // Only save synchronously if we have an existing path
-            let current_path = this.document.read(cx).path.clone();
-            if let Some(path) = current_path {
-                this.do_save_to_path_sync(path, cx);
-                true
+        let save = |this: &mut Self, cx: &mut Context<Self>| -> bool {
+            let snapshot = DocumentSaveSnapshot::capture(document.read(cx));
+            if let Some(path) = snapshot.original_path.clone() {
+                let outcome = this.save_snapshot_to_path(&document, &snapshot, path, cx);
+                this.present_save_failure(&outcome);
+                save_outcome_allows_close(&outcome)
             } else {
-                // No path - need async dialog, cancel for now
-                // Start async save in background
-                this.save_document(cx, false);
+                this.start_save_as(document, snapshot, Some(continuation), cx);
                 false
             }
         };
 
         match choice {
-            MessageDialogResult::Ok | MessageDialogResult::Yes => save_sync(self, cx),
+            MessageDialogResult::Ok | MessageDialogResult::Yes => save(self, cx),
             MessageDialogResult::No => true,
             MessageDialogResult::Custom(label) => match label.as_str() {
-                "Save" => save_sync(self, cx),
+                "Save" => save(self, cx),
                 "Don't Save" => true,
                 _ => false,
             },
@@ -832,22 +927,57 @@ impl RootView {
 
     /// Resolves every dirty tab before allowing its window or the application to close.
     pub fn confirm_before_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let original_index = self.active_tab_index;
-        for index in 0..self.tabs.len() {
-            self.activate_tab(index, cx);
+        let documents = self
+            .tabs
+            .iter()
+            .map(|tab| tab.document.clone())
+            .collect::<Vec<_>>();
+        for document in documents {
             let title = document_title(
-                self.document.read(cx).path.as_ref(),
-                self.document.read(cx).dirty,
+                document.read(cx).path.as_ref(),
+                document.read(cx).dirty,
             );
             if !self.confirm_can_discard_changes(
-                window,
+                document,
                 cx,
                 &format!("Save changes to {title} before quitting?"),
+                CloseContinuation::QuitApp,
             ) {
                 return false;
             }
         }
-        self.activate_tab(original_index.min(self.tabs.len().saturating_sub(1)), cx);
+        self.persist_window_bounds(window);
+        true
+    }
+
+    /// Resolves every dirty tab before allowing one native window to close.
+    pub fn confirm_before_window_close(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let window_handle = window.window_handle();
+        let documents = self
+            .tabs
+            .iter()
+            .map(|tab| tab.document.clone())
+            .collect::<Vec<_>>();
+        for document in documents {
+            let title = document_title(
+                document.read(cx).path.as_ref(),
+                document.read(cx).dirty,
+            );
+            if !self.confirm_can_discard_changes(
+                document,
+                cx,
+                &format!("Save changes to {title} before closing?"),
+                CloseContinuation::Window {
+                    window: window_handle,
+                },
+            ) {
+                return false;
+            }
+        }
         self.persist_window_bounds(window);
         true
     }
@@ -872,25 +1002,53 @@ impl RootView {
         }
 
         self.activate_tab(index, cx);
+        let tab_id = self.tabs[index].id;
+        let document = self.tabs[index].document.clone();
         let title = document_title(
-            self.document.read(cx).path.as_ref(),
-            self.document.read(cx).dirty,
+            document.read(cx).path.as_ref(),
+            document.read(cx).dirty,
         );
         if !self.confirm_can_discard_changes(
-            window,
+            document,
             cx,
             &format!("Save changes to {title} before closing?"),
+            CloseContinuation::Tab {
+                tab_id,
+                window: window.window_handle(),
+            },
         ) {
             return;
         }
 
-        let Some(next_index) = tab_index_after_close(self.tabs.len(), index) else {
-            self.persist_window_bounds(window);
-            window.remove_window();
+        self.close_tab_without_confirmation(tab_id, window, cx);
+    }
+
+    /// Closes the exact tab named by an earlier close intent without prompting again.
+    fn close_tab_without_confirmation(
+        &mut self,
+        tab_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
             return;
         };
 
+        if self.tabs.len() == 1 {
+            self.persist_window_bounds(window);
+            window.remove_window();
+            return;
+        }
+
+        let active_tab_id = self.tabs.get(self.active_tab_index).map(|tab| tab.id);
+        let fallback_index = tab_index_after_close(self.tabs.len(), index)
+            .expect("multiple tabs always have a successor");
+
         self.tabs.remove(index);
+        let next_index = active_tab_id
+            .filter(|active_tab_id| *active_tab_id != tab_id)
+            .and_then(|active_tab_id| self.tabs.iter().position(|tab| tab.id == active_tab_id))
+            .unwrap_or(fallback_index);
         self.active_tab_index = usize::MAX;
         self.activate_tab(next_index, cx);
     }
@@ -2283,8 +2441,9 @@ mod tests {
         BlankTitlebarMouseAction, OpenTargetKind, blank_titlebar_mouse_action,
         classify_open_target, document_title, move_vec_item, next_tab_index, previous_tab_index,
         normalize_markdown_anchor, preview_find_char_range_to_utf16,
-        tab_index_after_close, utf16_offset_to_char_offset,
+        save_outcome_allows_close, tab_index_after_close, utf16_offset_to_char_offset,
     };
+    use crate::services::document_persistence::DocumentSaveOutcome;
     use camino::Utf8PathBuf;
 
     #[test]
@@ -2322,6 +2481,21 @@ mod tests {
         assert_eq!(tab_index_after_close(3, 1), Some(1));
         assert_eq!(tab_index_after_close(3, 2), Some(1));
         assert_eq!(tab_index_after_close(1, 0), None);
+    }
+
+    #[test]
+    fn close_continues_only_after_saving_an_unchanged_snapshot() {
+        assert!(save_outcome_allows_close(&DocumentSaveOutcome::Saved {
+            document_unchanged: true,
+        }));
+        assert!(!save_outcome_allows_close(&DocumentSaveOutcome::Saved {
+            document_unchanged: false,
+        }));
+        assert!(!save_outcome_allows_close(&DocumentSaveOutcome::Cancelled));
+        assert!(!save_outcome_allows_close(&DocumentSaveOutcome::Failed {
+            path: None,
+            message: "permission denied".to_string(),
+        }));
     }
 
     #[test]

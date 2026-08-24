@@ -365,7 +365,7 @@ fn initial_preview_visible(has_initial_path: bool, remembered_preview_visible: b
 
 fn install_should_close_prompt(window: &mut Window, cx: &mut App, root: gpui::Entity<RootView>) {
     window.on_window_should_close(cx, {
-        move |window, cx| root.update(cx, |root, cx| root.confirm_before_quit(window, cx))
+        move |window, cx| root.update(cx, |root, cx| root.confirm_before_window_close(window, cx))
     });
 }
 

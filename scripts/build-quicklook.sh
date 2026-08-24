@@ -62,6 +62,7 @@ rustup target add "$RUST_TARGET" >/dev/null 2>&1 || true
 # macOS 12+. Keep the Rust objects and Swift extension on the same deployment
 # target so the final linker does not mix incompatible minimum OS versions.
 MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+CARGO_PROFILE_RELEASE_STRIP=none \
 CARGO_TARGET_DIR="$TARGET_DIR" cargo build \
     --release \
     --manifest-path "$RUST_MANIFEST" \

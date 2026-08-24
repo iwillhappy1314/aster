@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use tracing::warn;
+
+use crate::services::fs::write_atomic;
 
 /// Side of the editor where the document Outline is displayed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -197,13 +200,23 @@ impl SettingsManager {
         let Some(ref path) = self.path else { return };
 
         // Ensure parent directory exists
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+        if let Some(parent) = path.parent()
+            && let Err(error) = fs::create_dir_all(parent)
+        {
+            warn!(path = %path.display(), %error, "failed to create settings directory");
+            return;
         }
 
-        // Write atomically via temp file
-        if let Ok(json) = serde_json::to_string_pretty(&self.settings) {
-            let _ = fs::write(path, json);
+        let json = match serde_json::to_vec_pretty(&self.settings) {
+            Ok(json) => json,
+            Err(error) => {
+                warn!(path = %path.display(), %error, "failed to serialize settings");
+                return;
+            }
+        };
+
+        if let Err(error) = write_atomic(path, &json) {
+            warn!(path = %path.display(), %error, "failed to persist settings");
         }
     }
 
@@ -372,8 +385,9 @@ pub fn set_window_bounds(bounds: Bounds<Pixels>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{OutlinePosition, Settings, SidebarSectionOrder, WindowGeometry};
+    use super::{OutlinePosition, Settings, SettingsManager, SidebarSectionOrder, WindowGeometry};
     use gpui::{Bounds, point, px, size};
+    use std::fs;
 
     #[test]
     fn outline_position_defaults_to_right() {
@@ -438,5 +452,20 @@ mod tests {
         };
 
         assert!(!geometry.is_valid());
+    }
+
+    #[test]
+    fn settings_manager_persists_valid_json_through_atomic_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let mut manager = SettingsManager {
+            settings: Settings::default(),
+            path: Some(path.clone()),
+        };
+
+        manager.update(|settings| settings.font_size = 18.0);
+
+        let saved: Settings = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved.font_size, 18.0);
     }
 }

@@ -227,15 +227,25 @@ impl DocumentState {
         self.rope.to_string()
     }
 
+    /// Marks the current in-memory content as the latest successfully saved version.
     pub fn save_snapshot(&mut self) {
-        self.last_saved_hash = self.current_hash();
+        self.last_saved_hash = self.content_hash();
         self.dirty = false;
     }
 
-    fn current_hash(&self) -> u64 {
+    /// Returns a stable process-local hash of the current document content.
+    pub fn content_hash(&self) -> u64 {
         let mut h = DefaultHasher::new();
         self.rope.hash(&mut h);
         h.finish()
+    }
+
+    /// Records a completed disk snapshot and clears dirty only when the document still matches it.
+    pub fn record_saved_snapshot(&mut self, revision: u64, content_hash: u64) -> bool {
+        self.last_saved_hash = content_hash;
+        let unchanged = self.revision == revision && self.content_hash() == content_hash;
+        self.dirty = !unchanged;
+        unchanged
     }
 
     fn bump_revision(&mut self) {
@@ -294,7 +304,7 @@ impl DocumentState {
             });
             self.bump_revision();
             // Update dirty state: dirty if current content differs from saved
-            self.dirty = self.current_hash() != self.last_saved_hash;
+            self.dirty = self.content_hash() != self.last_saved_hash;
             true
         } else {
             false
@@ -324,7 +334,7 @@ impl DocumentState {
             });
             self.bump_revision();
             // Update dirty state: dirty if current content differs from saved
-            self.dirty = self.current_hash() != self.last_saved_hash;
+            self.dirty = self.content_hash() != self.last_saved_hash;
             true
         } else {
             false

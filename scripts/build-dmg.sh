@@ -209,8 +209,10 @@ build_arch() {
 
     echo -e "\n${YELLOW}Building target: ${rust_target}${NC}"
     rustup target add "$rust_target" >/dev/null 2>&1 || true
-    cargo build --release --target "$rust_target"
-    cargo bundle --release --target "$rust_target"
+    # Xcode 27 can produce unloadable proc-macro dylibs when Cargo strips release
+    # debuginfo, resulting in E0463 errors such as a missing `thiserror_impl`.
+    CARGO_PROFILE_RELEASE_STRIP=none cargo build --release --target "$rust_target"
+    CARGO_PROFILE_RELEASE_STRIP=none cargo bundle --release --target "$rust_target"
 
     local bundle_dir
     bundle_dir=$(find "$TARGET_DIR" -path "*${rust_target}/release/bundle/osx" -type d 2>/dev/null | head -1)
