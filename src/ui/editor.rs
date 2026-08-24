@@ -35,6 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const CARET_WIDTH: f32 = 2.0;
+const EDITOR_SCROLLBAR_WIDTH: f32 = 10.0;
 const HEAVY_DOCUMENT_BYTES: usize = 64 * 1024;
 
 pub type OutlineViewportCallback = Arc<dyn Fn(usize, &mut App)>;
@@ -1231,6 +1232,14 @@ impl Focusable for EditorView {
     }
 }
 
+/// Builds the block-layout scroll viewport used by the editor document.
+///
+/// This must remain a normal block container. A flex column asks GPUI to size the projected
+/// Markdown child from its pre-collapse intrinsic height, which creates blank scroll overflow.
+fn editor_scroll_container() -> gpui::Stateful<gpui::Div> {
+    div().id("editor_scroll").relative().size_full()
+}
+
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.start_cursor_blink(cx);
@@ -1471,6 +1480,111 @@ impl Render for EditorView {
             self.search_current_match.min(search_match_count - 1) + 1
         };
 
+        let editor_overlay = div()
+            .absolute()
+            .top_0()
+            .right(px(EDITOR_HORIZONTAL_PADDING + EDITOR_SCROLLBAR_WIDTH))
+            .bottom_0()
+            .left(px(editor_left_padding))
+            .child(
+                canvas(
+                    move |_, window: &mut Window, cx: &mut App| {
+                        let had_pending_reveal = pending_reveal.is_some();
+                        if let Some((source_byte, align_to_top)) = pending_reveal {
+                            reveal_source_byte_after_layout(
+                                &outline_scroll_handle,
+                                &text_layout_for_sync,
+                                outline_projection.as_ref(),
+                                source_byte,
+                                align_to_top,
+                                window,
+                            );
+                        }
+
+                        if !had_pending_reveal
+                            && let Some(callback) = outline_callback.as_ref()
+                            && let Some(source_byte) = source_byte_at_viewport_activation_line(
+                                &outline_scroll_handle,
+                                &text_layout_for_sync,
+                                outline_projection.as_ref(),
+                            )
+                        {
+                            callback(source_byte, cx);
+                        }
+                    },
+                    move |bounds: Bounds<_>, (), window: &mut Window, cx: &mut App| {
+                        if input_enabled {
+                            window.handle_input(
+                                &input_focus_handle,
+                                ElementInputHandler::new(bounds, input_entity.clone()),
+                                cx,
+                            );
+                        }
+
+                        let caret_pos = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            text_layout_for_active_line.position_for_index(cursor_display_byte)
+                        }))
+                        .ok()
+                        .flatten();
+                        let Some(caret_pos) = caret_pos else {
+                            return;
+                        };
+
+                        let line_height = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            text_layout_for_active_line.line_height_for_index(cursor_display_byte)
+                        }))
+                        .ok()
+                        .unwrap_or(px(0.));
+                        if line_height <= px(0.) {
+                            return;
+                        }
+
+                        window.paint_quad(fill(
+                            Bounds {
+                                origin: point(bounds.left(), caret_pos.y),
+                                size: size(bounds.size.width, line_height),
+                            },
+                            hsla_with_alpha(Theme::selection_bg(), 0.14),
+                        ));
+                    },
+                )
+                .size_full(),
+            )
+            .child(
+                canvas(
+                    |_, _, _| {},
+                    move |_, (), window: &mut Window, _cx: &mut App| {
+                        if !draw_caret {
+                            return;
+                        }
+                        let caret_pos = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            text_layout_for_caret.position_for_index(cursor_display_byte)
+                        }))
+                        .ok()
+                        .flatten();
+                        let Some(caret_pos) = caret_pos else {
+                            return;
+                        };
+                        let line_height = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            text_layout_for_caret.line_height_for_index(cursor_display_byte)
+                        }))
+                        .ok()
+                        .unwrap_or(px(0.));
+                        if line_height <= px(0.) {
+                            return;
+                        }
+                        window.paint_quad(fill(
+                            Bounds {
+                                origin: point(caret_pos.x, caret_pos.y),
+                                size: size(px(CARET_WIDTH), line_height),
+                            },
+                            Theme::accent(),
+                        ));
+                    },
+                )
+                .size_full(),
+            );
+
         div()
             .relative()
             .flex_1()
@@ -1482,12 +1596,7 @@ impl Render for EditorView {
                 }
             }))
             .child(
-                div()
-                    .id("editor_scroll")
-                    .relative()
-                    .size_full()
-                    .flex()
-                    .flex_col()
+                editor_scroll_container()
                     .bg(Theme::panel())
                     .pl(px(editor_left_padding))
                     .pr(px(EDITOR_HORIZONTAL_PADDING))
@@ -1497,7 +1606,7 @@ impl Render for EditorView {
                     .font_family("Menlo")
                     .overflow_y_scroll()
                     .overflow_x_hidden()
-                    .scrollbar_width(px(10.))
+                    .scrollbar_width(px(EDITOR_SCROLLBAR_WIDTH))
                     .track_scroll(&self.scroll_handle)
                     .track_focus(&focus_handle)
                     .on_action({
@@ -2005,126 +2114,7 @@ impl Render for EditorView {
                             });
                         })
                     })
-                    .child(
-                        div().relative().w_full().flex_shrink_0().child(
-                            canvas(
-                                move |_, window: &mut Window, cx: &mut App| {
-                                    let had_pending_reveal = pending_reveal.is_some();
-                                    if let Some((source_byte, align_to_top)) = pending_reveal {
-                                        reveal_source_byte_after_layout(
-                                            &outline_scroll_handle,
-                                            &text_layout_for_sync,
-                                            outline_projection.as_ref(),
-                                            source_byte,
-                                            align_to_top,
-                                            window,
-                                        );
-                                    }
-
-                                    if !had_pending_reveal
-                                        && let Some(callback) = outline_callback.as_ref()
-                                        && let Some(source_byte) =
-                                            source_byte_at_viewport_activation_line(
-                                                &outline_scroll_handle,
-                                                &text_layout_for_sync,
-                                                outline_projection.as_ref(),
-                                            )
-                                    {
-                                        callback(source_byte, cx);
-                                    }
-                                },
-                                move |bounds: Bounds<_>,
-                                      (),
-                                      window: &mut Window,
-                                      cx: &mut App| {
-                                    if input_enabled {
-                                        window.handle_input(
-                                            &input_focus_handle,
-                                            ElementInputHandler::new(bounds, input_entity.clone()),
-                                            cx,
-                                        );
-                                    }
-
-                                    let caret_pos =
-                                        std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                            text_layout_for_active_line
-                                                .position_for_index(cursor_display_byte)
-                                        }))
-                                        .ok()
-                                        .flatten();
-                                    let Some(caret_pos) = caret_pos else {
-                                        return;
-                                    };
-
-                                    let line_height =
-                                        std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                            text_layout_for_active_line
-                                                .line_height_for_index(cursor_display_byte)
-                                        }))
-                                        .ok()
-                                        .unwrap_or(px(0.));
-                                    if line_height <= px(0.) {
-                                        return;
-                                    }
-
-                                    window.paint_quad(fill(
-                                        Bounds {
-                                            origin: point(bounds.left(), caret_pos.y),
-                                            size: size(bounds.size.width, line_height),
-                                        },
-                                        hsla_with_alpha(Theme::selection_bg(), 0.14),
-                                    ));
-
-                                },
-                            )
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .size_full(),
-                        )
-                        .child(editor_text_element)
-                        .child(
-                            canvas(
-                                |_, _, _| {},
-                                move |_, (), window: &mut Window, _cx: &mut App| {
-                                    if !draw_caret {
-                                        return;
-                                    }
-                                    let caret_pos =
-                                        std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                            text_layout_for_caret
-                                                .position_for_index(cursor_display_byte)
-                                        }))
-                                        .ok()
-                                        .flatten();
-                                    let Some(caret_pos) = caret_pos else {
-                                        return;
-                                    };
-                                    let line_height =
-                                        std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                            text_layout_for_caret
-                                                .line_height_for_index(cursor_display_byte)
-                                        }))
-                                        .ok()
-                                        .unwrap_or(px(0.));
-                                    if line_height <= px(0.) {
-                                        return;
-                                    }
-                                    window.paint_quad(fill(
-                                        Bounds {
-                                            origin: point(caret_pos.x, caret_pos.y),
-                                            size: size(px(CARET_WIDTH), line_height),
-                                        },
-                                        Theme::accent(),
-                                    ));
-                                },
-                            )
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .size_full(),
-                        ),
-                    )
+                    .child(editor_text_element)
                     .when(self.search_active, |this| {
                         this.child(
                             div()
@@ -2166,6 +2156,7 @@ impl Render for EditorView {
                         )
                     }),
             )
+            .child(editor_overlay)
             .children(context_menu)
             .child(
                 render_interactive_scrollbar(
@@ -2362,6 +2353,13 @@ fn sanitize_highlights(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editor_scroll_uses_block_layout_to_avoid_intrinsic_height_overflow() {
+        let mut scroll = editor_scroll_container();
+
+        assert_eq!(scroll.style().display, None);
+    }
 
     #[test]
     fn find_matches_ascii_case_insensitive() {

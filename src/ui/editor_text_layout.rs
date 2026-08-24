@@ -461,6 +461,103 @@ fn component_reveals_source_when_selected(kind: &ComplexMarkdownKind) -> bool {
     matches!(kind, ComplexMarkdownKind::Image { .. })
 }
 
+/// Holds the rendered text and byte ranges that should receive inline-code styling.
+#[derive(Debug, PartialEq, Eq)]
+struct TableCellDisplay {
+    text: String,
+    inline_code_ranges: Vec<Range<usize>>,
+}
+
+/// Projects Markdown code spans in a table cell into delimiter-free display text.
+fn table_cell_display(source: &str) -> TableCellDisplay {
+    let mut text = String::with_capacity(source.len());
+    let mut inline_code_ranges = Vec::new();
+    let bytes = source.as_bytes();
+    let mut plain_start = 0;
+    let mut cursor = 0;
+
+    while cursor < bytes.len() {
+        if bytes[cursor] != b'`' {
+            cursor += 1;
+            continue;
+        }
+
+        let delimiter_start = cursor;
+        while cursor < bytes.len() && bytes[cursor] == b'`' {
+            cursor += 1;
+        }
+        let delimiter_len = cursor - delimiter_start;
+        let content_start = cursor;
+        let mut candidate = cursor;
+        let mut closing_delimiter = None;
+
+        while candidate < bytes.len() {
+            if bytes[candidate] != b'`' {
+                candidate += 1;
+                continue;
+            }
+
+            let run_start = candidate;
+            while candidate < bytes.len() && bytes[candidate] == b'`' {
+                candidate += 1;
+            }
+            if candidate - run_start == delimiter_len {
+                closing_delimiter = Some((run_start, candidate));
+                break;
+            }
+        }
+
+        let Some((closing_start, closing_end)) = closing_delimiter else {
+            continue;
+        };
+
+        text.push_str(&source[plain_start..delimiter_start]);
+        let normalized = normalized_code_span_text(&source[content_start..closing_start]);
+        let range_start = text.len();
+        text.push_str(&normalized);
+        inline_code_ranges.push(range_start..text.len());
+        plain_start = closing_end;
+        cursor = closing_end;
+    }
+
+    text.push_str(&source[plain_start..]);
+    TableCellDisplay {
+        text,
+        inline_code_ranges,
+    }
+}
+
+/// Applies CommonMark's whitespace normalization to rendered code-span content.
+fn normalized_code_span_text(source: &str) -> String {
+    let normalized = source.replace(['\n', '\r'], " ");
+    if normalized.starts_with(' ')
+        && normalized.ends_with(' ')
+        && !normalized.chars().all(|character| character == ' ')
+    {
+        normalized[1..normalized.len() - 1].to_string()
+    } else {
+        normalized
+    }
+}
+
+/// Builds styled table-cell text using the editor's shared inline-code colors.
+fn render_table_cell_text(source: &str) -> StyledText {
+    let display = table_cell_display(source);
+    let markdown_style = Theme::markdown_style();
+    let highlights = display.inline_code_ranges.into_iter().map(|range| {
+        (
+            range,
+            HighlightStyle {
+                color: Some(markdown_style.foreground.into()),
+                background_color: Some(markdown_style.code_background.into()),
+                ..Default::default()
+            },
+        )
+    });
+
+    StyledText::new(display.text).with_highlights(highlights)
+}
+
 /// Returns the shared pixel line height used by table display and inline editing.
 fn table_cell_line_height(body_font_size: f32) -> f32 {
     body_font_size * TABLE_CELL_LINE_HEIGHT_RATIO
@@ -619,7 +716,7 @@ fn render_complex_component_detail(
                                     handler(clicked_cell.clone(), window, cx);
                                     cx.stop_propagation();
                                 })
-                                .child(div().w_full().child(cell.text));
+                                .child(div().w_full().child(render_table_cell_text(&cell.text)));
                         }
                     }
                     row_element = row_element.child(cell_element);
@@ -1188,6 +1285,33 @@ mod tests {
     fn table_cell_line_height_scales_consistently_with_body_font_size() {
         assert_eq!(table_cell_line_height(16.0), 25.888_544);
         assert_eq!(table_cell_line_height(20.0), 32.360_68);
+    }
+
+    #[test]
+    fn table_cell_display_hides_inline_code_delimiters_and_tracks_utf8_ranges() {
+        let display = table_cell_display("中文主站 `order.pinkeman.com` + `agent.pinkeman.com`");
+
+        assert_eq!(
+            display.text,
+            "中文主站 order.pinkeman.com + agent.pinkeman.com"
+        );
+        assert_eq!(display.inline_code_ranges, vec![13..31, 34..52]);
+    }
+
+    #[test]
+    fn table_cell_display_supports_matching_multi_backtick_delimiters() {
+        let display = table_cell_display("prefix ``a ` b`` suffix");
+
+        assert_eq!(display.text, "prefix a ` b suffix");
+        assert_eq!(display.inline_code_ranges, vec![7..12]);
+    }
+
+    #[test]
+    fn table_cell_display_keeps_unclosed_backticks_literal() {
+        let display = table_cell_display("`production_en");
+
+        assert_eq!(display.text, "`production_en");
+        assert!(display.inline_code_ranges.is_empty());
     }
 
     #[test]
