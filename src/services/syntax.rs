@@ -32,7 +32,11 @@ pub struct SyntaxSpan {
 /// Describes the source and language of one fenced Markdown code block.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FencedCodeBlock {
+    /// Complete fenced block range, including both delimiter lines when present.
+    pub source_range: Range<usize>,
+    /// Optional language declared after the opening fence.
     pub language: Option<String>,
+    /// Editable code content between the opening and closing fences.
     pub content_range: Range<usize>,
 }
 
@@ -204,7 +208,7 @@ pub fn markdown_line_kinds(source: &str) -> Vec<MarkdownLineKind> {
 /// Returns fenced code content ranges together with their optional language identifiers.
 pub fn fenced_code_blocks(source: &str) -> Vec<FencedCodeBlock> {
     let mut blocks = Vec::new();
-    let mut active: Option<(u8, usize, Option<String>, usize)> = None;
+    let mut active: Option<(u8, usize, Option<String>, usize, usize)> = None;
     let mut offset = 0usize;
 
     for raw_line in source.split_inclusive('\n') {
@@ -213,14 +217,23 @@ pub fn fenced_code_blocks(source: &str) -> Vec<FencedCodeBlock> {
         let content = &line[leading..];
 
         if let Some((marker, marker_len)) = fence_prefix(content) {
-            if let Some((active_marker, active_len, language, content_start)) = active.take() {
+            if let Some((active_marker, active_len, language, source_start, content_start)) =
+                active.take()
+            {
                 if marker == active_marker && marker_len >= active_len {
                     blocks.push(FencedCodeBlock {
+                        source_range: source_start..offset + raw_line.len(),
                         language,
                         content_range: content_start..offset,
                     });
                 } else {
-                    active = Some((active_marker, active_len, language, content_start));
+                    active = Some((
+                        active_marker,
+                        active_len,
+                        language,
+                        source_start,
+                        content_start,
+                    ));
                 }
             } else {
                 let language = content[marker_len..].trim();
@@ -228,6 +241,7 @@ pub fn fenced_code_blocks(source: &str) -> Vec<FencedCodeBlock> {
                     marker,
                     marker_len,
                     (!language.is_empty()).then(|| language.to_string()),
+                    offset,
                     offset + raw_line.len(),
                 ));
             }
@@ -236,8 +250,9 @@ pub fn fenced_code_blocks(source: &str) -> Vec<FencedCodeBlock> {
         offset += raw_line.len();
     }
 
-    if let Some((_, _, language, content_start)) = active {
+    if let Some((_, _, language, source_start, content_start)) = active {
         blocks.push(FencedCodeBlock {
+            source_range: source_start..source.len(),
             language,
             content_range: content_start..source.len(),
         });
@@ -584,7 +599,21 @@ dn’t require a patchwork of vendors.
 
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].language.as_deref(), Some("rust"));
+        assert_eq!(
+            &source[blocks[0].source_range.clone()],
+            "```rust\nfn main() {}\n```\n"
+        );
         assert_eq!(&source[blocks[0].content_range.clone()], "fn main() {}\n");
+    }
+
+    #[test]
+    fn unclosed_fenced_code_block_range_extends_to_document_end() {
+        let source = "before\n~~~text\ncode";
+        let blocks = fenced_code_blocks(source);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(&source[blocks[0].source_range.clone()], "~~~text\ncode");
+        assert_eq!(&source[blocks[0].content_range.clone()], "code");
     }
 
     #[test]

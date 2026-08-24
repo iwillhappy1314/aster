@@ -2,7 +2,7 @@ use crate::commands::{
     About, CloseTab, Copy, Cut, Find, FindNext, FindPrevious, FontSizeDecrease, FontSizeIncrease,
     FontSizeReset, NewFile, NextTab, OpenFile, OutlinePositionLeft, OutlinePositionRight, Paste,
     PreviousTab, Quit, Redo, SaveFile, SaveFileAs, SelectAll, ThemeAyuDark, ThemeAyuLight,
-    ThemeAyuMirage, ToggleLiveMarkdown, ToggleOutline, TogglePreview, Undo,
+    ThemeAyuMirage, ToggleLineNumbers, ToggleLiveMarkdown, ToggleOutline, TogglePreview, Undo,
 };
 use crate::services::assets::AsterAssetSource;
 use crate::services::fs::read_to_string;
@@ -113,6 +113,7 @@ pub fn run() {
                 name: "View".into(),
                 items: vec![
                     MenuItem::action("Show or Hide Outline", ToggleOutline),
+                    MenuItem::action("Show or Hide Line Numbers", ToggleLineNumbers),
                     MenuItem::action("Toggle Live Markdown", ToggleLiveMarkdown),
                     MenuItem::submenu(Menu {
                         name: "Outline Position".into(),

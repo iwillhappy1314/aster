@@ -1,10 +1,12 @@
 use crate::services::complex_markdown::{ComplexMarkdownKind, MarkdownTableCell};
-use crate::services::syntax::{MarkdownLineKind, markdown_heading_levels, markdown_line_kinds};
+use crate::services::syntax::{
+    FencedCodeBlock, MarkdownLineKind, markdown_heading_levels, markdown_line_kinds,
+};
 use crate::ui::editor_projection::DisplayProjection;
 use crate::ui::theme::Theme;
 use gpui::{
-    AnyElement, App, Entity, HighlightStyle, ImageSource, MouseButton, ObjectFit, Pixels, Point,
-    StyledText, Window, deferred, div, img, phi, prelude::*, px,
+    AnyElement, App, Bounds, Entity, HighlightStyle, ImageSource, MouseButton, ObjectFit, Pixels,
+    Point, StyledText, Window, deferred, div, img, prelude::*, px,
 };
 use gpui_component::input::{Input, InputState};
 use gpui_component::Sizable as _;
@@ -12,17 +14,26 @@ use gpui_gfm::{heading_font_size, heading_font_weight};
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const EMPTY_LINE_PLACEHOLDER: &str = "\u{200B}";
+const BODY_TEXT_LINE_HEIGHT_RATIO: f32 = 1.75;
+const CODE_BLOCK_TOP_MARGIN: f32 = 8.0;
+pub(crate) const EDITOR_HORIZONTAL_PADDING: f32 = 32.0;
 const LINE_NUMBER_GUTTER_GAP: f32 = 12.0;
 const LINE_NUMBER_GUTTER_LEFT_INSET: f32 = 4.0;
 const MIN_LINE_NUMBER_GUTTER_WIDTH: f32 = 16.0;
 const MONOSPACE_DIGIT_WIDTH_RATIO: f32 = 0.6;
+const TABLE_CELL_HORIZONTAL_PADDING: f32 = 10.0;
+const TABLE_CELL_LINE_HEIGHT_RATIO: f32 = 1.618_034;
+const TABLE_CELL_VERTICAL_PADDING: f32 = 7.0;
 
 /// Receives source ranges when a rendered complex component is clicked.
 pub type ComplexComponentClickHandler =
-    Arc<dyn Fn(Range<usize>, &mut Window, &mut App) + Send + Sync>;
+    Arc<dyn Fn(Range<usize>, bool, &mut Window, &mut App) + Send + Sync>;
+
+/// Receives the stable document-order index when hover enters or leaves a code block.
+pub type CodeBlockHoverHandler = Arc<dyn Fn(usize, bool, &mut App) + Send + Sync>;
 
 /// Receives a table cell when inline editing should begin.
 pub type TableCellClickHandler =
@@ -41,6 +52,7 @@ pub struct ActiveTableCellEditor {
 struct EditorLineLayout {
     display_range: Range<usize>,
     layout: gpui::TextLayout,
+    prepainted_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
 }
 
 /// Aggregates independently-sized line layouts behind the same byte/position
@@ -70,6 +82,7 @@ impl EditorTextLayout {
 
     pub fn position_for_index(&self, index: usize) -> Option<Point<Pixels>> {
         let line = self.line_for_index(index)?;
+        line.prepainted_bounds.lock().ok()?.as_ref()?;
         let local_index = index
             .saturating_sub(line.display_range.start)
             .min(line.display_range.len());
@@ -78,6 +91,11 @@ impl EditorTextLayout {
 
     pub fn line_height_for_index(&self, index: usize) -> Pixels {
         self.line_for_index(index)
+            .filter(|line| {
+                line.prepainted_bounds
+                    .lock()
+                    .is_ok_and(|bounds| bounds.is_some())
+            })
             .map(|line| line.layout.line_height())
             .unwrap_or(px(0.))
     }
@@ -94,7 +112,14 @@ impl EditorTextLayout {
         let mut closest: Option<(&EditorLineLayout, Pixels)> = None;
 
         for line in &self.lines {
-            let bounds = line.layout.bounds();
+            let Some(bounds) = line
+                .prepainted_bounds
+                .lock()
+                .ok()
+                .and_then(|bounds| *bounds)
+            else {
+                continue;
+            };
             let distance = if position.y < bounds.top() {
                 bounds.top() - position.y
             } else if position.y > bounds.bottom() {
@@ -133,7 +158,10 @@ pub fn render_editor_text(
     projection: &DisplayProjection,
     highlights: &[(Range<usize>, HighlightStyle)],
     body_font_size: f32,
+    show_line_numbers: bool,
     document_directory: Option<&Path>,
+    code_blocks: &[FencedCodeBlock],
+    on_code_block_hover: CodeBlockHoverHandler,
     selected_component: Option<&Range<usize>>,
     on_component_click: ComplexComponentClickHandler,
     active_table_cell: Option<&ActiveTableCellEditor>,
@@ -142,9 +170,12 @@ pub fn render_editor_text(
     let display_ranges = display_line_ranges(display_text);
     let heading_levels = markdown_heading_levels(source_text);
     let line_kinds = markdown_line_kinds(source_text);
-    let line_number_gutter_width = line_number_gutter_width(display_ranges.len(), body_font_size);
-    let left_padding =
-        LINE_NUMBER_GUTTER_LEFT_INSET + line_number_gutter_width + LINE_NUMBER_GUTTER_GAP;
+    let source_line_starts = source_line_starts(source_text);
+    let (line_number_gutter_width, left_padding) = line_number_gutter_layout(
+        show_line_numbers,
+        display_ranges.len(),
+        body_font_size,
+    );
 
     let mut container = div().relative().w_full().min_w_0().flex().flex_col();
     let mut layouts = Vec::with_capacity(display_ranges.len());
@@ -184,56 +215,121 @@ pub fn render_editor_text(
         }
 
         let layout = styled.layout().clone();
-        let heading_level = heading_levels.get(line_index).copied().flatten();
+        let source_byte = projection.display_to_source_byte(display_range.start);
+        let source_line_index = source_line_index_for_byte(
+            &source_line_starts,
+            source_text.len(),
+            source_byte,
+        );
+        let heading_level = heading_levels
+            .get(source_line_index)
+            .copied()
+            .flatten();
         let line_kind = line_kinds
-            .get(line_index)
+            .get(source_line_index)
             .copied()
             .unwrap_or(MarkdownLineKind::Paragraph);
+        let source_line_start = source_line_starts
+            .get(source_line_index)
+            .copied()
+            .unwrap_or(source_byte);
+        let code_block_index = code_blocks
+            .iter()
+            .enumerate()
+            .find(|block| {
+                block.1.source_range.start <= source_byte
+                    && source_byte < block.1.source_range.end
+            })
+            .map(|(index, _)| index);
+        let starts_code_block = code_block_starts_on_source_line(
+            code_blocks,
+            code_block_index,
+            source_line_start,
+        );
         let complex_component = projection.complex_atom_for_display_line(display_range);
+        let hides_component_label = complex_component
+            .as_ref()
+            .is_some_and(|(_, kind)| {
+                matches!(
+                    kind,
+                    ComplexMarkdownKind::Image { .. } | ComplexMarkdownKind::Table { .. }
+                )
+            });
 
-        let mut line = div().relative().w_full().min_w_0();
+        let prepainted_bounds = Arc::new(Mutex::new(None));
+        let mut line = editor_display_line(line_index, prepainted_bounds.clone());
         if let Some(level) = heading_level {
             line = line
                 .text_size(heading_font_size(level))
                 .font_weight(heading_font_weight(level));
         } else {
-            line = line.text_size(px(body_font_size));
+            line = line
+                .text_size(px(body_font_size))
+                .line_height(px(body_text_line_height(body_font_size)));
         }
         line = match line_kind {
             MarkdownLineKind::Quote => line.border_l_2().border_color(Theme::muted()).pl(px(12.)),
             MarkdownLineKind::CodeFence | MarkdownLineKind::CodeBody => {
-                line.bg(Theme::code_block_bg()).px(px(12.))
+                line.when(starts_code_block, |line| {
+                    line.mt(px(CODE_BLOCK_TOP_MARGIN))
+                })
+                .bg(Theme::code_block_bg())
+                .px(px(12.))
             }
             MarkdownLineKind::List { indent } | MarkdownLineKind::Task { indent } => {
                 line.pl(px((indent as f32) * 4.0))
             }
             MarkdownLineKind::Paragraph | MarkdownLineKind::HorizontalRule => line,
         };
-        line = line.child(styled);
+        if let Some(code_block_index) = code_block_index {
+            let hover_handler = on_code_block_hover.clone();
+            line = line.on_hover(move |hovered, _window, cx| {
+                hover_handler(code_block_index, *hovered, cx);
+            });
+        }
+        line = if hides_component_label {
+            line.child(hidden_projection_layout_anchor(styled))
+        } else {
+            line.child(styled)
+        };
         if let Some((source_range, kind)) = complex_component
             && is_block_component(&kind)
         {
             let is_table = matches!(kind, ComplexMarkdownKind::Table { .. });
             let is_selected = !is_table && selected_component == Some(&source_range);
+            let uses_border = component_uses_border(&kind);
+            let uses_panel = component_uses_panel(&kind);
+            let repeat_click_edits_source = component_repeat_click_edits_source(&kind);
             let click_range = source_range.clone();
             let click_handler = on_component_click.clone();
+            let source_click_range = source_range.clone();
+            let source_click_handler = on_component_click.clone();
             line = if is_table {
                 line.mb(px(8.))
             } else {
                 line.mt(px(4.))
                     .mb(px(8.))
-                    .p(px(10.))
-                    .rounded(px(8.))
-                    .border_1()
-                    .border_color(if is_selected {
-                        Theme::accent()
-                    } else {
-                        Theme::border()
+                    .when(uses_panel, |component| {
+                        component
+                            .p(px(10.))
+                            .rounded(px(8.))
+                            .bg(Theme::panel_alt())
                     })
-                    .bg(Theme::panel_alt())
+                    .when(uses_border, |component| {
+                        component.border_1().border_color(if is_selected {
+                            Theme::accent()
+                        } else {
+                            Theme::border()
+                        })
+                    })
                     .cursor_pointer()
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                        click_handler(click_range.clone(), window, cx);
+                        click_handler(
+                            click_range.clone(),
+                            repeat_click_edits_source,
+                            window,
+                            cx,
+                        );
                         cx.stop_propagation();
                     })
             };
@@ -247,32 +343,61 @@ pub fn render_editor_text(
                 line = line.child(detail);
             }
             if is_selected {
-                line = line.child(
-                    div()
-                        .mt(px(8.))
-                        .text_xs()
-                        .text_color(Theme::accent())
-                        .child("Selected · click again to edit source"),
-                );
+                line = if component_reveals_source_when_selected(&kind) {
+                    line.child(
+                        div()
+                            .mt(px(8.))
+                            .text_size(px(body_font_size))
+                            .text_color(Theme::text())
+                            .cursor_text()
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                source_click_handler(
+                                    source_click_range.clone(),
+                                    true,
+                                    window,
+                                    cx,
+                                );
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                source_text
+                                    .get(source_range.clone())
+                                    .unwrap_or_default()
+                                    .trim_end_matches(['\r', '\n'])
+                                    .to_string(),
+                            ),
+                    )
+                } else {
+                    line.child(
+                        div()
+                            .mt(px(8.))
+                            .text_xs()
+                            .text_color(Theme::accent())
+                            .child("Selected · click again to edit source"),
+                    )
+                };
             }
         }
-        line = line.child(
-            div()
-                .absolute()
-                .top_0()
-                .right_full()
-                .mr(px(LINE_NUMBER_GUTTER_GAP))
-                .w(px(line_number_gutter_width))
-                .text_right()
-                .text_size(px(body_font_size))
-                .text_color(crate::ui::theme::Theme::muted())
-                .child((line_index + 1).to_string()),
-        );
+        if show_line_numbers {
+            line = line.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_full()
+                    .mr(px(LINE_NUMBER_GUTTER_GAP))
+                    .w(px(line_number_gutter_width))
+                    .text_right()
+                    .text_size(px(body_font_size))
+                    .text_color(crate::ui::theme::Theme::muted())
+                    .child((line_index + 1).to_string()),
+            );
+        }
 
         container = container.child(line);
         layouts.push(EditorLineLayout {
             display_range: display_range.clone(),
             layout,
+            prepainted_bounds,
         });
     }
 
@@ -284,6 +409,82 @@ pub fn render_editor_text(
         },
         left_padding,
     }
+}
+
+/// Returns whether a rendered component should use the shared outline treatment.
+fn component_uses_border(kind: &ComplexMarkdownKind) -> bool {
+    !matches!(kind, ComplexMarkdownKind::Image { .. })
+}
+
+/// Builds a stretchable editor row that preserves its measured block height while scrolling.
+///
+/// Width remains automatic so the parent flex column can stretch every row to the viewport;
+/// a percentage width here would resolve against each row's intrinsic Markdown content.
+fn editor_display_line(
+    line_index: usize,
+    prepainted_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .on_children_prepainted(move |children, _, _| {
+            let first_child = children.first().copied();
+            if let Ok(mut bounds) = prepainted_bounds.lock() {
+                *bounds = first_child;
+            }
+        })
+        .id(("editor-display-line", line_index))
+        .relative()
+        .min_w_0()
+        .flex_shrink_0()
+}
+
+/// Keeps a collapsed component's text layout available for pointer mapping without showing it.
+///
+/// Images and tables replace their projection label with a native component. The editor still
+/// needs that label's `TextLayout` to map clicks on every later line, so the anchor participates
+/// in prepaint while absolute positioning prevents it from changing component height.
+fn hidden_projection_layout_anchor(styled: StyledText) -> gpui::Div {
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .invisible()
+        .child(styled)
+}
+
+/// Returns whether a rendered component should use shared panel background and padding.
+fn component_uses_panel(kind: &ComplexMarkdownKind) -> bool {
+    !matches!(kind, ComplexMarkdownKind::Image { .. })
+}
+
+/// Returns whether first-click selection should expose source below the rendered component.
+fn component_reveals_source_when_selected(kind: &ComplexMarkdownKind) -> bool {
+    matches!(kind, ComplexMarkdownKind::Image { .. })
+}
+
+/// Returns the shared pixel line height used by table display and inline editing.
+fn table_cell_line_height(body_font_size: f32) -> f32 {
+    body_font_size * TABLE_CELL_LINE_HEIGHT_RATIO
+}
+
+/// Returns the explicit line height used by wrapping body text in live Markdown.
+fn body_text_line_height(body_font_size: f32) -> f32 {
+    body_font_size * BODY_TEXT_LINE_HEIGHT_RATIO
+}
+
+/// Returns whether the source line begins the referenced fenced code block.
+fn code_block_starts_on_source_line(
+    code_blocks: &[FencedCodeBlock],
+    code_block_index: Option<usize>,
+    source_line_start: usize,
+) -> bool {
+    code_block_index
+        .and_then(|index| code_blocks.get(index))
+        .is_some_and(|block| block.source_range.start == source_line_start)
+}
+
+/// Returns whether a second click should replace a component preview with editable source.
+pub(crate) fn component_repeat_click_edits_source(kind: &ComplexMarkdownKind) -> bool {
+    !matches!(kind, ComplexMarkdownKind::Image { .. })
 }
 
 /// Returns whether a complex component owns an entire visual block.
@@ -318,7 +519,6 @@ fn render_complex_component_detail(
             let fallback_label = format!("Unable to load image · {target}");
             Some(
                 img(resolve_image_source(target, document_directory))
-                    .mt(px(8.))
                     .w_full()
                     .max_h(px(420.))
                     .object_fit(ObjectFit::Contain)
@@ -328,12 +528,15 @@ fn render_complex_component_detail(
             )
         }
         ComplexMarkdownKind::Table { headers, rows } => {
+            let cell_line_height = table_cell_line_height(body_font_size);
             let column_count = headers
                 .len()
                 .max(rows.iter().map(Vec::len).max().unwrap_or(0))
                 .max(1);
             let mut table = div()
                 .w_full()
+                .min_w_0()
+                .flex_shrink_0()
                 .overflow_hidden()
                 .border_1()
                 .border_color(Theme::border());
@@ -344,11 +547,14 @@ fn render_complex_component_detail(
                     let cell = row.get(column).cloned();
                     let mut cell_element = div()
                         .relative()
-                        .occlude()
+                        // Keep cell clicks away from the source editor while allowing the
+                        // outer editor scroll container to receive wheel events over tables.
+                        .block_mouse_except_scroll()
                         .min_w(px(80.))
                         .flex_1()
-                        .px(px(10.))
-                        .py(px(7.))
+                        .px(px(TABLE_CELL_HORIZONTAL_PADDING))
+                        .py(px(TABLE_CELL_VERTICAL_PADDING))
+                        .line_height(px(cell_line_height))
                         .when(column + 1 < column_count, |cell| {
                             cell.border_r_1().border_color(Theme::border())
                         })
@@ -386,18 +592,22 @@ fn render_complex_component_detail(
                                         .bottom_0()
                                         .left_0()
                                         .flex()
-                                        .px(px(6.))
-                                        .pt(px(7.))
+                                        // The multiline input reserves 10px on its right for
+                                        // caret scrolling. Use the cell's own right padding for
+                                        // that reserve so editing and display wrap identically.
+                                        .pl(px(TABLE_CELL_HORIZONTAL_PADDING))
+                                        .pt(px(TABLE_CELL_VERTICAL_PADDING))
                                         .when(!input_visible, |editor| editor.opacity(0.0))
                                         .child(
                                             Input::new(&input)
                                                 .xsmall()
+                                                .px(px(0.))
                                                 .h_full()
                                                 .appearance(false)
                                                 .bordered(false)
                                                 .focus_bordered(false)
                                                 .text_size(px(body_font_size))
-                                                .line_height(phi()),
+                                                .line_height(px(cell_line_height)),
                                         ),
                                 );
                         } else {
@@ -418,7 +628,13 @@ fn render_complex_component_detail(
                     row.border_t_1().border_color(Theme::border())
                 }));
             }
-            Some(table.into_any_element())
+            Some(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .child(table)
+                    .into_any_element(),
+            )
         }
         ComplexMarkdownKind::Callout { kind, body, .. } => Some(
             div()
@@ -740,6 +956,21 @@ fn line_number_gutter_width(line_count: usize, body_font_size: f32) -> f32 {
         .max(MIN_LINE_NUMBER_GUTTER_WIDTH)
 }
 
+/// Returns the line-number column width and editor inset for the active preference.
+fn line_number_gutter_layout(
+    show_line_numbers: bool,
+    line_count: usize,
+    body_font_size: f32,
+) -> (f32, f32) {
+    if !show_line_numbers {
+        return (0.0, EDITOR_HORIZONTAL_PADDING);
+    }
+
+    let gutter_width = line_number_gutter_width(line_count, body_font_size);
+    let left_padding = LINE_NUMBER_GUTTER_LEFT_INSET + gutter_width + LINE_NUMBER_GUTTER_GAP;
+    (gutter_width, left_padding)
+}
+
 fn display_line_ranges(text: &str) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     let mut start = 0usize;
@@ -753,6 +984,31 @@ fn display_line_ranges(text: &str) -> Vec<Range<usize>> {
 
     ranges.push(start..text.len());
     ranges
+}
+
+/// Returns the byte offset at which every source line begins.
+fn source_line_starts(source: &str) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(source.bytes().filter(|byte| *byte == b'\n').count() + 1);
+    starts.push(0);
+    starts.extend(
+        source
+            .bytes()
+            .enumerate()
+            .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+    );
+    starts
+}
+
+/// Resolves a source byte to its source-line ordinal using precomputed line starts.
+fn source_line_index_for_byte(
+    line_starts: &[usize],
+    source_len: usize,
+    source_byte: usize,
+) -> usize {
+    let source_byte = source_byte.min(source_len);
+    line_starts
+        .partition_point(|line_start| *line_start <= source_byte)
+        .saturating_sub(1)
 }
 
 fn highlights_for_line(
@@ -789,6 +1045,77 @@ mod tests {
         assert_eq!(line_number_gutter_width(9, 16.0), 16.0);
         assert_eq!(line_number_gutter_width(10, 16.0), 23.2);
         assert_eq!(line_number_gutter_width(1_000, 16.0), 42.4);
+    }
+
+    #[test]
+    fn hidden_line_numbers_keep_symmetric_content_padding_without_a_gutter() {
+        assert_eq!(
+            line_number_gutter_layout(false, 1_000, 16.0),
+            (0.0, EDITOR_HORIZONTAL_PADDING)
+        );
+    }
+
+    #[test]
+    fn visible_line_numbers_keep_the_existing_gutter_inset() {
+        assert_eq!(line_number_gutter_layout(true, 10, 16.0), (23.2, 39.2));
+    }
+
+    #[test]
+    fn editor_display_lines_preserve_wrapped_block_height_without_intrinsic_width() {
+        let mut line = editor_display_line(0, Arc::new(Mutex::new(None)));
+
+        assert_eq!(line.style().flex_shrink, Some(0.0));
+        assert_eq!(line.style().size.width, None);
+    }
+
+    #[test]
+    fn pointer_mapping_skips_lines_that_have_not_been_prepainted() {
+        let layout = StyledText::new("offscreen").layout().clone();
+        let editor_layout = EditorTextLayout {
+            lines: vec![EditorLineLayout {
+                display_range: 0..9,
+                layout,
+                prepainted_bounds: Arc::new(Mutex::new(None)),
+            }],
+            display_len: 9,
+        };
+
+        assert!(editor_layout.closest_line(Point::default()).is_none());
+        assert!(editor_layout.position_for_index(0).is_none());
+        assert_eq!(editor_layout.line_height_for_index(0), px(0.));
+    }
+
+    #[test]
+    fn collapsed_table_does_not_shift_heading_style_onto_later_code_comments() {
+        use crate::services::complex_markdown::complex_markdown_components;
+        use crate::services::syntax::{markdown_spans, markdown_heading_levels};
+
+        let source = "| A | B |\n| --- | --- |\n| x | y |\n# Real heading\n```python\n# comment\n```\n";
+        let spans = markdown_spans(source);
+        let components = complex_markdown_components(source);
+        let projection = DisplayProjection::from_markdown_with_components(
+            source,
+            &spans,
+            &components,
+            source.len()..source.len(),
+        );
+        let comment_display_byte = projection.display_text.find("# comment").unwrap();
+        let display_line_index = projection.display_text[..comment_display_byte]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        let source_byte = projection.display_to_source_byte(comment_display_byte);
+        let source_line_index = source_line_index_for_byte(
+            &source_line_starts(source),
+            source.len(),
+            source_byte,
+        );
+
+        assert_eq!(display_line_index, 3);
+        assert_eq!(markdown_heading_levels(source)[display_line_index], Some(1));
+        assert_eq!(source_line_index, 5);
+        assert_eq!(markdown_heading_levels(source)[source_line_index], None);
+        assert_eq!(markdown_line_kinds(source)[source_line_index], MarkdownLineKind::CodeBody);
     }
 
     #[test]
@@ -832,5 +1159,59 @@ mod tests {
             parse_mermaid_edge("A[Source] --> B(Component)"),
             Some(("Source".to_string(), "Component".to_string()))
         );
+    }
+
+    #[test]
+    fn image_preview_has_no_component_border_and_reveals_source_when_selected() {
+        let image = ComplexMarkdownKind::Image {
+            alt: "Logo".to_string(),
+            target: "logo.png".to_string(),
+        };
+
+        assert!(!component_uses_border(&image));
+        assert!(!component_uses_panel(&image));
+        assert!(component_reveals_source_when_selected(&image));
+        assert!(!component_repeat_click_edits_source(&image));
+
+        let callout = ComplexMarkdownKind::Callout {
+            kind: "NOTE".to_string(),
+            title: "Note".to_string(),
+            body: "Body".to_string(),
+        };
+        assert!(component_uses_border(&callout));
+        assert!(component_uses_panel(&callout));
+        assert!(!component_reveals_source_when_selected(&callout));
+        assert!(component_repeat_click_edits_source(&callout));
+    }
+
+    #[test]
+    fn table_cell_line_height_scales_consistently_with_body_font_size() {
+        assert_eq!(table_cell_line_height(16.0), 25.888_544);
+        assert_eq!(table_cell_line_height(20.0), 32.360_68);
+    }
+
+    #[test]
+    fn body_text_line_height_leaves_space_between_wrapped_inline_backgrounds() {
+        assert_eq!(body_text_line_height(16.0), 28.0);
+        assert_eq!(body_text_line_height(20.0), 35.0);
+    }
+
+    #[test]
+    fn list_items_use_the_same_spacious_body_line_height() {
+        let kinds = markdown_line_kinds("- item with `code`\n  - nested `code`\n");
+
+        assert!(matches!(kinds[0], MarkdownLineKind::List { .. }));
+        assert!(matches!(kinds[1], MarkdownLineKind::List { .. }));
+        assert_eq!(body_text_line_height(16.0), 28.0);
+    }
+
+    #[test]
+    fn only_the_opening_fence_receives_code_block_top_spacing() {
+        let source = "before\n```text\ncode\n```\nafter";
+        let blocks = crate::services::syntax::fenced_code_blocks(source);
+
+        assert!(code_block_starts_on_source_line(&blocks, Some(0), 7));
+        assert!(!code_block_starts_on_source_line(&blocks, Some(0), 15));
+        assert!(!code_block_starts_on_source_line(&blocks, None, 7));
     }
 }

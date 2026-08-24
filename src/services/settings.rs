@@ -58,6 +58,9 @@ pub struct Settings {
     /// Whether editable Markdown uses the live presentation instead of raw source styling.
     #[serde(default = "default_live_markdown_enabled")]
     pub live_markdown_enabled: bool,
+    /// Whether editable Markdown shows source line numbers.
+    #[serde(default = "default_line_numbers_visible")]
+    pub line_numbers_visible: bool,
     /// Last valid normal-window geometry, restored on the next launch.
     #[serde(default)]
     pub window_geometry: Option<WindowGeometry>,
@@ -73,6 +76,11 @@ fn default_preview_visible() -> bool {
 
 /// Returns the default editable Markdown presentation preference.
 fn default_live_markdown_enabled() -> bool {
+    true
+}
+
+/// Returns the default line-number visibility for existing and new installations.
+fn default_line_numbers_visible() -> bool {
     true
 }
 
@@ -129,6 +137,7 @@ impl Default for Settings {
             outline_visible: false,
             preview_visible: default_preview_visible(),
             live_markdown_enabled: default_live_markdown_enabled(),
+            line_numbers_visible: default_line_numbers_visible(),
             window_geometry: None,
         }
     }
@@ -292,6 +301,21 @@ pub fn set_live_markdown_enabled(enabled: bool) {
     }
 }
 
+/// Returns whether editors should show source line numbers.
+pub fn get_line_numbers_visible() -> bool {
+    settings()
+        .lock()
+        .map(|s| s.get().line_numbers_visible)
+        .unwrap_or_else(|_| default_line_numbers_visible())
+}
+
+/// Persists whether editors should show source line numbers.
+pub fn set_line_numbers_visible(visible: bool) {
+    if let Ok(mut manager) = settings().lock() {
+        manager.update(|settings| settings.line_numbers_visible = visible);
+    }
+}
+
 /// Convenience function to get current font size
 pub fn get_font_size() -> f32 {
     settings()
@@ -362,6 +386,14 @@ mod tests {
         assert!(!settings.outline_visible);
         assert!(settings.preview_visible);
         assert!(settings.live_markdown_enabled);
+        assert!(settings.line_numbers_visible);
+    }
+
+    #[test]
+    fn missing_line_number_preference_keeps_line_numbers_visible() {
+        let settings: Settings = serde_json::from_str("{}").expect("settings should deserialize");
+
+        assert!(settings.line_numbers_visible);
     }
 
     #[test]

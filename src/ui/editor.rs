@@ -6,11 +6,12 @@ use crate::services::complex_markdown::{
     ComplexMarkdownKind, MarkdownTableCell, complex_markdown_components,
     serialize_table_cell_value,
 };
-use crate::services::syntax::{SyntaxKind, SyntaxSpan, fenced_code_blocks};
+use crate::services::syntax::{FencedCodeBlock, SyntaxKind, SyntaxSpan, fenced_code_blocks};
 use crate::ui::editor_projection::{DisplayProjection, ProjectionAtom, active_line_range};
 use crate::ui::editor_text_layout::{
-    ActiveTableCellEditor, ComplexComponentClickHandler, EditorTextLayout,
-    TableCellClickHandler, render_editor_text,
+    ActiveTableCellEditor, CodeBlockHoverHandler, ComplexComponentClickHandler, EditorTextLayout,
+    TableCellClickHandler, EDITOR_HORIZONTAL_PADDING, component_repeat_click_edits_source,
+    render_editor_text,
 };
 use crate::ui::text_utils::ellipsize_chars;
 use crate::ui::theme::{MarkdownStyle, Theme};
@@ -124,6 +125,37 @@ fn markdown_line_prefix(line: &str) -> Option<MarkdownLinePrefix> {
     None
 }
 
+/// Chooses the source range that must remain literal in the live Markdown projection.
+fn projection_active_source_range(
+    cursor_line: Range<usize>,
+    hovered_code_block: Option<Range<usize>>,
+    table_cell_editing: bool,
+    source_len: usize,
+) -> Range<usize> {
+    if table_cell_editing {
+        source_len..source_len
+    } else {
+        hovered_code_block.unwrap_or(cursor_line)
+    }
+}
+
+/// Returns the complete fenced block containing an insertion point or intersecting a selection.
+fn code_block_range_for_source_range(
+    blocks: &[FencedCodeBlock],
+    source_range: &Range<usize>,
+) -> Option<Range<usize>> {
+    blocks.iter().find_map(|block| {
+        let matches = if source_range.is_empty() {
+            block.source_range.start <= source_range.start
+                && source_range.start < block.source_range.end
+        } else {
+            block.source_range.start < source_range.end
+                && source_range.start < block.source_range.end
+        };
+        matches.then(|| block.source_range.clone())
+    })
+}
+
 pub struct EditorView {
     document: Entity<DocumentState>,
     inline_markdown: Entity<InlineMarkdownState>,
@@ -164,6 +196,8 @@ pub struct EditorView {
     context_menu_position: Option<Point<Pixels>>,
     /// Source range of the complex component selected before entering source editing.
     selected_component: Option<Range<usize>>,
+    /// Document-order index of the fenced-code block currently under the pointer.
+    hovered_code_block_index: Option<usize>,
     /// Native inline editor for the currently active Markdown table cell.
     table_cell_edit: Option<TableCellEdit>,
 }
@@ -198,6 +232,7 @@ impl EditorView {
             on_complex_link: None,
             context_menu_position: None,
             selected_component: None,
+            hovered_code_block_index: None,
             table_cell_edit: None,
         }
     }
@@ -401,13 +436,17 @@ impl EditorView {
         cx.notify();
     }
 
-    /// Selects a complex component first and reveals its complete source on the next click.
+    /// Selects a component and optionally enters raw source editing on a repeated click.
     fn activate_complex_component(
         &mut self,
         source_range: Range<usize>,
+        repeat_click_edits_source: bool,
         cx: &mut Context<Self>,
     ) {
         if self.selected_component.as_ref() == Some(&source_range) {
+            if !repeat_click_edits_source {
+                return;
+            }
             let _ = self.document.update(cx, |doc, cx| {
                 let start = doc.byte_to_char(source_range.start);
                 let end = doc.byte_to_char(source_range.end);
@@ -420,6 +459,27 @@ impl EditorView {
             self.selected_component = Some(source_range);
         }
         cx.notify();
+    }
+
+    /// Updates whole-block source presentation as pointer hover enters or leaves a code block.
+    fn set_code_block_hovered(
+        &mut self,
+        code_block_index: usize,
+        hovered: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let next = if hovered {
+            Some(code_block_index)
+        } else if self.hovered_code_block_index == Some(code_block_index) {
+            None
+        } else {
+            return;
+        };
+        if self.hovered_code_block_index != next {
+            self.hovered_code_block_index = next;
+            self.cached_projection = None;
+            cx.notify();
+        }
     }
 
     /// Deletes the selected component as one undoable source transaction.
@@ -465,19 +525,24 @@ impl EditorView {
     }
 
     /// Builds source-relative syntax colors for fenced code in Live Markdown.
-    fn fenced_code_highlights(&self, source: &str) -> Vec<(Range<usize>, HighlightStyle)> {
+    fn fenced_code_highlights(
+        &self,
+        source: &str,
+        blocks: &[FencedCodeBlock],
+    ) -> Vec<(Range<usize>, HighlightStyle)> {
         let syntax_theme = match Theme::name() {
             crate::ui::theme::ThemeName::AyuLight => CodeSyntaxTheme::AyuLight,
             crate::ui::theme::ThemeName::AyuDark => CodeSyntaxTheme::AyuDark,
             crate::ui::theme::ThemeName::AyuMirage => CodeSyntaxTheme::AyuMirage,
         };
 
-        fenced_code_blocks(source)
-            .into_iter()
+        blocks
+            .iter()
             .filter_map(|block| {
                 block
                     .language
-                    .map(|language| (block.content_range, language))
+                    .clone()
+                    .map(|language| (block.content_range.clone(), language))
             })
             .flat_map(|(content_range, language)| {
                 let content = &source[content_range.clone()];
@@ -1203,16 +1268,27 @@ impl Render for EditorView {
 
         let doc = self.document.read(cx);
         let cursor_source_byte = doc.char_to_byte(doc.cursor);
+        let cursor_or_selection_range = doc
+            .selection_bytes()
+            .unwrap_or(cursor_source_byte..cursor_source_byte);
         let active_source_range = active_line_range(
             text_owned.as_ref(),
-            doc.selection_bytes()
-                .unwrap_or(cursor_source_byte..cursor_source_byte),
+            cursor_or_selection_range.clone(),
         );
-        let projection_active_range = if self.table_cell_edit.is_some() {
-            text_owned.len()..text_owned.len()
-        } else {
-            active_source_range
-        };
+        let code_blocks = fenced_code_blocks(text_owned.as_ref());
+        let editing_code_block =
+            code_block_range_for_source_range(&code_blocks, &cursor_or_selection_range);
+        let hovered_code_block = self.hovered_code_block_index.and_then(|index| {
+            code_blocks
+                .get(index)
+                .map(|block| block.source_range.clone())
+        });
+        let projection_active_range = projection_active_source_range(
+            active_source_range,
+            hovered_code_block.or(editing_code_block),
+            self.table_cell_edit.is_some(),
+            text_owned.len(),
+        );
         let show_caret = doc.selection.is_none();
         let has_selection = doc.selection_range().is_some();
         let draw_caret = show_caret
@@ -1280,7 +1356,9 @@ impl Render for EditorView {
         let syntax_highlights = if inline_spans_are_current {
             let mut source_highlights = self.inline_syntax_highlights(render_spans, markdown_style);
             if self.live_markdown {
-                source_highlights.extend(self.fenced_code_highlights(text_owned.as_ref()));
+                source_highlights.extend(
+                    self.fenced_code_highlights(text_owned.as_ref(), code_blocks.as_slice()),
+                );
             }
             project_editor_highlights(projection.as_ref(), source_highlights)
         } else {
@@ -1311,10 +1389,24 @@ impl Render for EditorView {
             .and_then(|path| path.parent())
             .map(|path| path.as_std_path().to_path_buf());
         let component_editor = cx.entity();
+        let component_focus_handle = focus_handle.clone();
         let on_component_click: ComplexComponentClickHandler = Arc::new(
-            move |source_range, _window, cx| {
+            move |source_range, repeat_click_edits_source, window, cx| {
+                component_focus_handle.focus(window);
                 let _ = component_editor.update(cx, |editor, cx| {
-                    editor.activate_complex_component(source_range, cx);
+                    editor.activate_complex_component(
+                        source_range,
+                        repeat_click_edits_source,
+                        cx,
+                    );
+                });
+            },
+        );
+        let code_block_editor = cx.entity();
+        let on_code_block_hover: CodeBlockHoverHandler = Arc::new(
+            move |code_block_index, hovered, cx| {
+                let _ = code_block_editor.update(cx, |editor, cx| {
+                    editor.set_code_block_hovered(code_block_index, hovered, cx);
                 });
             },
         );
@@ -1338,7 +1430,10 @@ impl Render for EditorView {
             projection.as_ref(),
             &safe_highlights,
             settings::get_font_size(),
+            settings::get_line_numbers_visible(),
             document_directory.as_deref(),
+            code_blocks.as_slice(),
+            on_code_block_hover,
             self.selected_component.as_ref(),
             on_component_click,
             active_table_cell.as_ref(),
@@ -1350,6 +1445,7 @@ impl Render for EditorView {
         self.input_layout = Some(text_layout.clone());
         self.input_projection = Some(projection.clone());
         let text_layout_for_sync = text_layout.clone();
+        let text_layout_for_active_line = text_layout.clone();
         let text_layout_for_caret = text_layout.clone();
         let pending_reveal = self
             .pending_outline_reveal_byte
@@ -1390,9 +1486,11 @@ impl Render for EditorView {
                     .id("editor_scroll")
                     .relative()
                     .size_full()
+                    .flex()
+                    .flex_col()
                     .bg(Theme::panel())
                     .pl(px(editor_left_padding))
-                    .pr(px(32.))
+                    .pr(px(EDITOR_HORIZONTAL_PADDING))
                     .py(px(24.))
                     .text_size(px(settings::get_font_size()))
                     .text_color(markdown_style.foreground)
@@ -1567,12 +1665,14 @@ impl Render for EditorView {
                                 if matches!(kind, ComplexMarkdownKind::Table { .. }) {
                                     return;
                                 }
+                                let repeat_click_edits_source =
+                                    component_repeat_click_edits_source(&kind);
                                 if event.modifiers.platform
                                     && let Some(callback) = complex_link_callback.as_ref()
                                 {
-                                    match kind {
+                                    match &kind {
                                         ComplexMarkdownKind::WikiLink { target, .. } => {
-                                            callback(target, cx_app);
+                                            callback(target.clone(), cx_app);
                                             return;
                                         }
                                         ComplexMarkdownKind::Footnote { label, .. } => {
@@ -1583,7 +1683,11 @@ impl Render for EditorView {
                                     }
                                 }
                                 let _ = editor_handle.update(cx_app, |editor, cx| {
-                                    editor.activate_complex_component(source_range, cx);
+                                    editor.activate_complex_component(
+                                        source_range,
+                                        repeat_click_edits_source,
+                                        cx,
+                                    );
                                 });
                                 return;
                             }
@@ -1902,7 +2006,7 @@ impl Render for EditorView {
                         })
                     })
                     .child(
-                        div().relative().w_full().child(
+                        div().relative().w_full().flex_shrink_0().child(
                             canvas(
                                 move |_, window: &mut Window, cx: &mut App| {
                                     let had_pending_reveal = pending_reveal.is_some();
@@ -1943,7 +2047,7 @@ impl Render for EditorView {
 
                                     let caret_pos =
                                         std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                            text_layout_for_caret
+                                            text_layout_for_active_line
                                                 .position_for_index(cursor_display_byte)
                                         }))
                                         .ok()
@@ -1954,7 +2058,7 @@ impl Render for EditorView {
 
                                     let line_height =
                                         std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                            text_layout_for_caret
+                                            text_layout_for_active_line
                                                 .line_height_for_index(cursor_display_byte)
                                         }))
                                         .ok()
@@ -1971,10 +2075,41 @@ impl Render for EditorView {
                                         hsla_with_alpha(Theme::selection_bg(), 0.14),
                                     ));
 
+                                },
+                            )
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full(),
+                        )
+                        .child(editor_text_element)
+                        .child(
+                            canvas(
+                                |_, _, _| {},
+                                move |_, (), window: &mut Window, _cx: &mut App| {
                                     if !draw_caret {
                                         return;
                                     }
-
+                                    let caret_pos =
+                                        std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                            text_layout_for_caret
+                                                .position_for_index(cursor_display_byte)
+                                        }))
+                                        .ok()
+                                        .flatten();
+                                    let Some(caret_pos) = caret_pos else {
+                                        return;
+                                    };
+                                    let line_height =
+                                        std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                            text_layout_for_caret
+                                                .line_height_for_index(cursor_display_byte)
+                                        }))
+                                        .ok()
+                                        .unwrap_or(px(0.));
+                                    if line_height <= px(0.) {
+                                        return;
+                                    }
                                     window.paint_quad(fill(
                                         Bounds {
                                             origin: point(caret_pos.x, caret_pos.y),
@@ -1988,8 +2123,7 @@ impl Render for EditorView {
                             .top_0()
                             .left_0()
                             .size_full(),
-                        )
-                        .child(editor_text_element),
+                        ),
                     )
                     .when(self.search_active, |this| {
                         this.child(
@@ -2357,5 +2491,37 @@ mod tests {
             text.is_char_boundary(highlight.range.start)
                 && text.is_char_boundary(highlight.range.end)
         }));
+    }
+
+    #[test]
+    fn hovered_code_block_reveals_the_whole_block_instead_of_only_the_cursor_line() {
+        let cursor_line = 18..30;
+        let hovered_block = 7..42;
+
+        assert_eq!(
+            projection_active_source_range(
+                cursor_line,
+                Some(hovered_block.clone()),
+                false,
+                100,
+            ),
+            hovered_block
+        );
+        assert_eq!(
+            projection_active_source_range(18..30, Some(7..42), true, 100),
+            100..100
+        );
+    }
+
+    #[test]
+    fn cursor_inside_code_block_keeps_the_whole_block_source_visible() {
+        let source = "before\n```rust\nfn main() {}\n```\nafter";
+        let blocks = fenced_code_blocks(source);
+        let cursor_byte = source.find("main").unwrap();
+
+        assert_eq!(
+            code_block_range_for_source_range(&blocks, &(cursor_byte..cursor_byte)),
+            Some(blocks[0].source_range.clone())
+        );
     }
 }

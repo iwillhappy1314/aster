@@ -361,9 +361,7 @@ fn complex_component_replacement(
     component: &ComplexMarkdownComponent,
 ) -> ProjectionEdit {
     let label = match &component.kind {
-        ComplexMarkdownKind::Image { alt, .. } => {
-            format!("🖼 {}", if alt.trim().is_empty() { "Image" } else { alt })
-        }
+        ComplexMarkdownKind::Image { .. } => String::new(),
         ComplexMarkdownKind::Table { .. } => "\u{200B}".to_string(),
         ComplexMarkdownKind::Callout { kind, title, .. } => format!("▣ {kind} · {title}"),
         ComplexMarkdownKind::Footnote { label, text } => text
@@ -569,6 +567,27 @@ mod tests {
             Some((
                 _,
                 ProjectionAtom::Complex(ComplexMarkdownKind::Table { .. })
+            ))
+        ));
+    }
+
+    #[test]
+    fn image_component_does_not_render_a_name_label() {
+        use crate::services::complex_markdown::complex_markdown_components;
+
+        let source = "before\n![tshirt-2.jpg](assets/tshirt-2.jpg)\nafter";
+        let spans = markdown_spans(source);
+        let components = complex_markdown_components(source);
+        let projection =
+            DisplayProjection::from_markdown_with_components(source, &spans, &components, 0..6);
+
+        assert_eq!(projection.display_text, "before\n\nafter");
+        assert!(!projection.display_text.contains("tshirt-2.jpg"));
+        assert!(matches!(
+            projection.atom_at_display_byte("before\n".len()),
+            Some((
+                _,
+                ProjectionAtom::Complex(ComplexMarkdownKind::Image { .. })
             ))
         ));
     }

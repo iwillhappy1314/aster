@@ -1,7 +1,7 @@
 use crate::commands::{
     Copy, Find, FontSizeDecrease, FontSizeIncrease, FontSizeReset, NewFile, NextTab, OpenFile,
     OutlinePositionLeft, OutlinePositionRight, PreviousTab, SaveFile, SaveFileAs, SelectAll,
-    ToggleLiveMarkdown, ToggleOutline, TogglePreview,
+    ToggleLineNumbers, ToggleLiveMarkdown, ToggleOutline, TogglePreview,
 };
 use crate::model::document::DocumentState;
 use crate::model::inline_markdown::InlineMarkdownState;
@@ -923,6 +923,16 @@ impl RootView {
         let _ = self.editor_view.update(cx, |editor, cx| {
             editor.set_live_markdown_enabled(enabled, cx);
         });
+        cx.notify();
+    }
+
+    /// Toggles source line numbers for every editor tab without changing document content.
+    fn toggle_line_numbers(&mut self, cx: &mut Context<Self>) {
+        let visible = !settings::get_line_numbers_visible();
+        settings::set_line_numbers_visible(visible);
+        for tab in &self.tabs {
+            let _ = tab.editor_view.update(cx, |_editor, cx| cx.notify());
+        }
         cx.notify();
     }
 
@@ -2061,6 +2071,9 @@ impl Render for RootView {
             }))
             .on_action(cx.listener(|this, _: &ToggleLiveMarkdown, _window, cx| {
                 this.toggle_live_markdown(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleLineNumbers, _window, cx| {
+                this.toggle_line_numbers(cx);
             }))
             .on_action(cx.listener(|this, _: &TogglePreview, _window, cx| {
                 this.toggle_preview(cx);
