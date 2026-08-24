@@ -201,41 +201,42 @@ pub fn run() {
                 .show();
         });
 
-        let mut startup_paths = std::env::args()
+        let startup_paths = std::env::args()
             .skip(1)
-            .filter_map(|arg| parse_open_target(&arg));
-        let initial_path = startup_paths.next();
-        let _ = open_window(cx, initial_path);
-
-        for path in startup_paths {
-            open_path_in_active_window_or_new(cx, path);
+            .filter_map(|arg| parse_open_target(&arg))
+            .collect::<VecDeque<_>>();
+        let has_startup_paths = !startup_paths.is_empty();
+        if has_startup_paths {
+            open_startup_paths(cx, startup_paths);
         }
 
         let queue = pending_urls.clone();
         cx.to_async()
             .spawn(async move |cx| {
+                if !has_startup_paths {
+                    // macOS delivers files opened from Finder through `on_open_urls` shortly
+                    // after application activation. Keep the first window pending briefly so
+                    // the requested document can become that window instead of following an
+                    // already-created blank window.
+                    cx.background_executor()
+                        .timer(Duration::from_millis(200))
+                        .await;
+                    let paths = drain_pending_open_paths(&queue);
+                    let _ = cx.update(|cx| open_startup_paths(cx, paths));
+                }
+
                 loop {
                     cx.background_executor()
                         .timer(Duration::from_millis(200))
                         .await;
-                    let urls: Vec<String> = {
-                        let mut q = queue.lock().expect("open url queue lock poisoned");
-                        let mut drained = Vec::new();
-                        while let Some(u) = q.pop_front() {
-                            drained.push(u);
-                        }
-                        drained
-                    };
-
-                    if urls.is_empty() {
+                    let paths = drain_pending_open_paths(&queue);
+                    if paths.is_empty() {
                         continue;
                     }
 
                     let _ = cx.update(|cx| {
-                        for url in urls {
-                            if let Some(path) = parse_open_target(&url) {
-                                open_path_in_active_window_or_new(cx, path);
-                            }
+                        for path in paths {
+                            open_path_in_active_window_or_new(cx, path);
                         }
                     });
                 }
@@ -382,9 +383,39 @@ fn parse_open_target(raw: &str) -> Option<Utf8PathBuf> {
     Utf8PathBuf::try_from(std::path::PathBuf::from(raw)).ok()
 }
 
+/// Drains Finder/open-event URLs and converts supported file URLs into local paths.
+fn drain_pending_open_paths(
+    queue: &Arc<Mutex<VecDeque<String>>>,
+) -> VecDeque<Utf8PathBuf> {
+    let mut queue = queue.lock().expect("open url queue lock poisoned");
+    queue
+        .drain(..)
+        .filter_map(|url| parse_open_target(&url))
+        .collect()
+}
+
+/// Opens exactly one startup window, using the first requested path when available.
+fn open_startup_paths(cx: &mut App, mut paths: VecDeque<Utf8PathBuf>) {
+    let initial_path = take_initial_startup_path(&mut paths);
+    let _ = open_window(cx, initial_path);
+    for path in paths {
+        open_path_in_active_window_or_new(cx, path);
+    }
+}
+
+/// Removes the path that must populate the single initial application window.
+fn take_initial_startup_path(paths: &mut VecDeque<Utf8PathBuf>) -> Option<Utf8PathBuf> {
+    paths.pop_front()
+}
+
 fn open_path_in_active_window_or_new(cx: &mut App, path: Utf8PathBuf) {
-    if let Some(active_window) = cx.active_window() {
-        if let Some(handle) = active_window.downcast::<RootView>() {
+    let candidate_windows = cx
+        .active_window()
+        .into_iter()
+        .chain(cx.windows())
+        .collect::<Vec<_>>();
+    for candidate_window in candidate_windows {
+        if let Some(handle) = candidate_window.downcast::<RootView>() {
             let _ = handle.update(cx, |root, window, cx| {
                 root.action_open_path(path.clone(), window, cx);
             });
@@ -397,7 +428,10 @@ fn open_path_in_active_window_or_new(cx: &mut App, path: Utf8PathBuf) {
 
 #[cfg(test)]
 mod tests {
-    use super::initial_preview_visible;
+    use super::{drain_pending_open_paths, initial_preview_visible, take_initial_startup_path};
+    use camino::Utf8PathBuf;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn blank_document_always_starts_in_editor_mode() {
@@ -408,5 +442,20 @@ mod tests {
     fn existing_document_uses_remembered_preview_mode() {
         assert!(initial_preview_visible(true, true));
         assert!(!initial_preview_visible(true, false));
+    }
+
+    #[test]
+    fn finder_open_event_becomes_the_initial_window_path() {
+        let path = Utf8PathBuf::from("/tmp/finder-open.md");
+        let queue = Arc::new(Mutex::new(VecDeque::from([
+            url::Url::from_file_path(path.as_std_path())
+                .unwrap()
+                .to_string(),
+        ])));
+        let mut paths = drain_pending_open_paths(&queue);
+
+        assert_eq!(take_initial_startup_path(&mut paths), Some(path));
+        assert!(paths.is_empty());
+        assert!(queue.lock().unwrap().is_empty());
     }
 }
