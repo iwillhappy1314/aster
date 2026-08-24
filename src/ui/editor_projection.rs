@@ -68,6 +68,7 @@ impl DisplayProjection {
     }
 
     /// Creates a live Markdown projection while leaving active source lines editable.
+    #[cfg(test)]
     pub fn from_markdown(
         source: &str,
         spans: &[SyntaxSpan],

@@ -21,13 +21,8 @@ enum InlineSegment {
     runs: Vec<TextRun>,
     url: String,
   },
-  /// An inline image segment.
-  Image {
-    url: String,
-    alt: String,
-    width: Option<String>,
-    height: Option<String>,
-  },
+  /// A non-text image boundary; block images use the dedicated image renderer.
+  Image,
 }
 
 /// Render a list of inlines as GPUI elements.
@@ -175,7 +170,7 @@ fn render_selectable_segmented(
           }
         }
       }
-      InlineSegment::Image { .. } => {
+      InlineSegment::Image => {
         // Images aren't text — skip for now.
         // They would be rendered separately outside the SelectableText.
       }
@@ -290,30 +285,7 @@ fn collect_segments_inner(
         });
       }
 
-      Inline::Image {
-        url,
-        alt,
-        width,
-        height,
-        dark_url,
-        light_url,
-        ..
-      } => {
-        let theme = options.theme();
-        let themed = super::image::select_image_url(
-          url,
-          dark_url.as_deref(),
-          light_url.as_deref(),
-          theme.is_dark,
-        );
-        let resolved = resolve_url(themed, options);
-        segments.push(InlineSegment::Image {
-          url: resolved,
-          alt: alt.clone(),
-          width: width.clone(),
-          height: height.clone(),
-        });
-      }
+      Inline::Image { .. } => segments.push(InlineSegment::Image),
     }
   }
 }
@@ -331,7 +303,7 @@ fn push_to_current_segment(
     || match segments.last() {
       Some(InlineSegment::Link { .. }) => !ctx.link,
       Some(InlineSegment::Text { .. }) => ctx.link,
-      Some(InlineSegment::Image { .. }) => true, // always start new segment after image
+      Some(InlineSegment::Image) => true, // always start new segment after image
       None => true,
     };
 
@@ -358,7 +330,7 @@ fn push_to_current_segment(
       text.push_str(&value);
       runs.push(run);
     }
-    InlineSegment::Image { .. } => {
+    InlineSegment::Image => {
       // Should not happen — we create a new Text/Link segment above.
       unreachable!("push_to_current_segment called with Image as last segment");
     }
@@ -740,7 +712,7 @@ mod tests {
       .filter(|s| match s {
         InlineSegment::Text { text, .. } => !text.is_empty(),
         InlineSegment::Link { text, .. } => !text.is_empty(),
-        InlineSegment::Image { .. } => true, // images are always non-empty
+        InlineSegment::Image => true, // images are always non-empty
       })
       .collect()
   }

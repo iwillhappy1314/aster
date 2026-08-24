@@ -26,8 +26,6 @@ pub struct DocumentState {
     pub cursor: usize,
     pub selection: Option<Range<usize>>, // character indices
     pub selection_anchor: Option<usize>, // starting point for shift/drag selections
-    /// Cached word count - None means needs recalculation
-    word_count_cache: Option<usize>,
     /// Undo/redo history
     pub undo_history: UndoHistory,
     /// Pending edit state for recording operations
@@ -55,7 +53,6 @@ impl DocumentState {
             cursor: 0,
             selection: None,
             selection_anchor: None,
-            word_count_cache: Some(0),
             undo_history: UndoHistory::default(),
             pending_edit: None,
             last_edit: None,
@@ -80,8 +77,6 @@ impl DocumentState {
             new_end_byte: new_bytes,
         });
         // Don't compute hash here - save_snapshot will handle dirty state
-        // Don't compute word count here - it will be computed lazily
-        self.word_count_cache = None;
     }
 
     pub fn len_chars(&self) -> usize {
@@ -167,7 +162,6 @@ impl DocumentState {
             new_end_byte,
         });
         self.clear_selection();
-        self.word_count_cache = None; // Invalidate cache
     }
 
     pub fn delete_range(&mut self, range: Range<usize>) {
@@ -200,7 +194,6 @@ impl DocumentState {
         });
         self.cursor = self.cursor.min(self.rope.len_chars());
         self.clear_selection();
-        self.word_count_cache = None; // Invalidate cache
     }
 
     pub fn select_all(&mut self) {
@@ -247,22 +240,6 @@ impl DocumentState {
 
     fn bump_revision(&mut self) {
         self.revision = self.revision.wrapping_add(1);
-    }
-
-    /// Get word count, computing it if not cached
-    pub fn get_word_count(&mut self) -> usize {
-        if let Some(count) = self.word_count_cache {
-            count
-        } else {
-            // Count words by iterating through rope chunks to avoid full string allocation
-            let count = self
-                .rope
-                .chunks()
-                .flat_map(|chunk| chunk.split_whitespace())
-                .count();
-            self.word_count_cache = Some(count);
-            count
-        }
     }
 
     // ============ Undo/Redo Methods ============
@@ -316,7 +293,6 @@ impl DocumentState {
                 if self.cursor <= r.start { r.end } else { r.start }
             });
             self.bump_revision();
-            self.word_count_cache = None;
             // Update dirty state: dirty if current content differs from saved
             self.dirty = self.current_hash() != self.last_saved_hash;
             true
@@ -347,7 +323,6 @@ impl DocumentState {
                 if self.cursor <= r.start { r.end } else { r.start }
             });
             self.bump_revision();
-            self.word_count_cache = None;
             // Update dirty state: dirty if current content differs from saved
             self.dirty = self.current_hash() != self.last_saved_hash;
             true

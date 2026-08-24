@@ -130,9 +130,9 @@ pub fn run() {
                     MenuItem::submenu(Menu {
                         name: "Theme".into(),
                         items: vec![
-                            MenuItem::action("Ayu Light", ThemeAyuLight),
-                            MenuItem::action("Ayu Dark", ThemeAyuDark),
-                            MenuItem::action("Ayu Mirage", ThemeAyuMirage),
+                            MenuItem::action(ThemeName::AyuLight.label(), ThemeAyuLight),
+                            MenuItem::action(ThemeName::AyuDark.label(), ThemeAyuDark),
+                            MenuItem::action(ThemeName::AyuMirage.label(), ThemeAyuMirage),
                         ],
                     }),
                     MenuItem::separator(),

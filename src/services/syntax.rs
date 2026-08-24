@@ -263,6 +263,7 @@ pub fn fenced_code_blocks(source: &str) -> Vec<FencedCodeBlock> {
 
 /// Returns the ATX heading level (1–6) for a single Markdown source line.
 /// Leading indentation and trailing line endings are ignored.
+#[cfg(test)]
 pub fn markdown_heading_level(raw_line: &str) -> Option<u8> {
     let line = raw_line.trim_end_matches('\n').trim_end_matches('\r');
     let leading = leading_whitespace_bytes(line);
