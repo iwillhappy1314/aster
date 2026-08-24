@@ -65,14 +65,21 @@ const PREVIEW_ESTIMATED_CHARACTER_WIDTH: f32 = 8.8;
 /// Body line height used by the Markdown preview's compact text style.
 const PREVIEW_ESTIMATED_LINE_HEIGHT: f32 = 20.0;
 
-/// Returns a stable wrapping-column estimate for the visible preview width.
-fn preview_wrap_columns(window_width: f32, outline_visible: bool, sidebar_width: f32) -> usize {
+/// Returns the exact width available to the preview list.
+fn preview_viewport_width(window_width: f32, outline_visible: bool, sidebar_width: f32) -> f32 {
     let outline_width = if outline_visible {
         sidebar_width + SIDEBAR_DIVIDER_WIDTH
     } else {
         0.0
     };
-    let content_width = (window_width - outline_width - PREVIEW_CONTENT_PADDING_X * 2.0).max(1.0);
+    (window_width - outline_width).max(1.0)
+}
+
+/// Returns a stable wrapping-column estimate for the visible preview width.
+fn preview_wrap_columns(window_width: f32, outline_visible: bool, sidebar_width: f32) -> usize {
+    let content_width = (preview_viewport_width(window_width, outline_visible, sidebar_width)
+        - PREVIEW_CONTENT_PADDING_X * 2.0)
+        .max(1.0);
     (content_width / PREVIEW_ESTIMATED_CHARACTER_WIDTH)
         .floor()
         .max(8.0) as usize
@@ -426,8 +433,8 @@ pub struct RootView {
     preview_markdown_options: MarkdownRenderOptions,
     /// Parsed tree keyed by document revision, including sources too large for the old LRU.
     preview_parsed_markdown: Option<(u64, ParsedMarkdown)>,
-    /// Estimated virtual block heights keyed by document revision and available wrap columns.
-    preview_block_height_estimates: Option<(u64, usize, Arc<Vec<f32>>)>,
+    /// Estimated virtual block heights keyed by revision, exact viewport width, and wrap columns.
+    preview_block_height_estimates: Option<(u64, u32, usize, Arc<Vec<f32>>)>,
     /// Direct preview child indices for headings, in Outline order.
     preview_heading_child_indices: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
 }
@@ -2197,6 +2204,12 @@ impl Render for RootView {
             preview_focus_handle.focus(window);
             self.focus_preview_on_render = false;
         }
+        let window_width: f32 = window.bounds().size.width.into();
+        let document_viewport_width =
+            preview_viewport_width(window_width, self.outline_visible, self.sidebar_width);
+        let _ = self.editor_view.update(cx, |editor, _| {
+            editor.set_large_document_viewport_width(document_viewport_width);
+        });
         // Install the Outline reveal callback once. Small previews use direct-child
         // bounds; virtual previews jump to the heading's top-level block index.
         if !self.outline_reveal_installed {
@@ -2662,7 +2675,12 @@ impl Render for RootView {
 
                         let (preview_content, preview_scrollbar) = if preview_virtualized {
                             let block_count = parsed.blocks().len();
-                            let window_width: f32 = window.bounds().size.width.into();
+                            let viewport_width = preview_viewport_width(
+                                window_width,
+                                self.outline_visible,
+                                self.sidebar_width,
+                            );
+                            let viewport_width_bits = viewport_width.to_bits();
                             let wrap_columns = preview_wrap_columns(
                                 window_width,
                                 self.outline_visible,
@@ -2671,8 +2689,10 @@ impl Render for RootView {
                             let estimates_changed = self
                                 .preview_block_height_estimates
                                 .as_ref()
-                                .is_none_or(|(revision, columns, _)| {
-                                    *revision != doc_revision || *columns != wrap_columns
+                                .is_none_or(|(revision, width_bits, columns, _)| {
+                                    *revision != doc_revision
+                                        || *width_bits != viewport_width_bits
+                                        || *columns != wrap_columns
                                 });
                             if estimates_changed {
                                 let previous_offset = self.preview_list_state.logical_scroll_top();
@@ -2687,8 +2707,12 @@ impl Render for RootView {
                                 if previous_count > 0 && !parsed_changed {
                                     self.preview_list_state.scroll_to(previous_offset);
                                 }
-                                self.preview_block_height_estimates =
-                                    Some((doc_revision, wrap_columns, estimates));
+                                self.preview_block_height_estimates = Some((
+                                    doc_revision,
+                                    viewport_width_bits,
+                                    wrap_columns,
+                                    estimates,
+                                ));
                             }
                             let explorer = self.file_explorer_view.clone();
                             let headings = heading_child_indices.clone();
@@ -2710,7 +2734,7 @@ impl Render for RootView {
                             let estimated_heights = self
                                 .preview_block_height_estimates
                                 .as_ref()
-                                .map(|(_, _, estimates)| estimates.clone())
+                                .map(|(_, _, _, estimates)| estimates.clone())
                                 .unwrap_or_default();
                             let estimate_seed_calls = Rc::new(Cell::new(0usize));
                             let content = div()
@@ -2892,7 +2916,7 @@ mod tests {
         BlankTitlebarMouseAction, OpenTargetKind, RootView, blank_titlebar_mouse_action,
         classify_open_target, document_title, move_vec_item, next_tab_index,
         normalize_markdown_anchor, preview_find_char_range_to_utf16, preview_find_match_count,
-        preview_wrap_columns, previous_tab_index, queue_latest_operation,
+        preview_viewport_width, preview_wrap_columns, previous_tab_index, queue_latest_operation,
         save_outcome_allows_close, tab_index_after_close, utf16_offset_to_char_offset,
     };
     use crate::model::document::DocumentState;
@@ -2918,6 +2942,18 @@ mod tests {
 
         assert!(outlined < full_width);
         assert_eq!(preview_wrap_columns(1.0, true, 400.0), 8);
+    }
+
+    #[test]
+    fn preview_viewport_width_detects_resize_before_wrap_columns_change() {
+        let width_before = preview_viewport_width(1_000.0, false, 300.0);
+        let width_after = preview_viewport_width(1_001.0, false, 300.0);
+
+        assert_ne!(width_before.to_bits(), width_after.to_bits());
+        assert_eq!(
+            preview_wrap_columns(1_000.0, false, 300.0),
+            preview_wrap_columns(1_001.0, false, 300.0)
+        );
     }
 
     /// Builds a real root view for deterministic foreground/background persistence tests.

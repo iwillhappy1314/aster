@@ -259,7 +259,10 @@ impl DocumentState {
     pub fn load_rope(&mut self, path: Utf8PathBuf, rope: Rope, content_hash: u64) {
         self.path = Some(path);
         self.rope = rope;
-        self.cursor = self.rope.len_chars();
+        // A document opened from disk starts at its beginning. Keeping the cursor at the end
+        // makes the editor's initial cursor-reveal pass scroll even very large files to the
+        // bottom before the user has interacted with them.
+        self.cursor = 0;
         self.clear_selection();
         self.clear_undo_history();
         self.bump_revision();
@@ -383,6 +386,20 @@ impl DocumentState {
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+
+    #[test]
+    fn loaded_document_starts_with_cursor_at_beginning() {
+        let mut doc = DocumentState::new_empty();
+        doc.set_text("placeholder");
+
+        doc.load_rope(
+            Utf8PathBuf::from("large.md"),
+            Rope::from_str("loaded contents"),
+            123,
+        );
+
+        assert_eq!(doc.cursor, 0);
+    }
 
     #[test]
     fn preserves_reverse_selection_direction() {

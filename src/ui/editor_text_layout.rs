@@ -12,10 +12,12 @@ use gpui::{
 use gpui_component::Sizable as _;
 use gpui_component::input::{Input, InputState};
 use gpui_gfm::{heading_font_size, heading_font_weight};
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 const EMPTY_LINE_PLACEHOLDER: &str = "\u{200B}";
@@ -96,8 +98,30 @@ impl EditorTextLayout {
         line.layout.position_for_index(local_index)
     }
 
+    /// Returns a position only when the exact source row is part of the current viewport layout.
+    pub fn visible_position_for_index(&self, index: usize) -> Option<Point<Pixels>> {
+        let line = self.exact_line_for_index(index)?;
+        line.prepainted_bounds.lock().ok()?.as_ref()?;
+        let local_index = index
+            .saturating_sub(line.display_range.start)
+            .min(line.display_range.len());
+        line.layout.position_for_index(local_index)
+    }
+
     pub fn line_height_for_index(&self, index: usize) -> Pixels {
         self.line_for_index(index)
+            .filter(|line| {
+                line.prepainted_bounds
+                    .lock()
+                    .is_ok_and(|bounds| bounds.is_some())
+            })
+            .map(|line| line.layout.line_height())
+            .unwrap_or(px(0.))
+    }
+
+    /// Returns a line height only when the exact source row is currently prepainted.
+    pub fn visible_line_height_for_index(&self, index: usize) -> Pixels {
+        self.exact_line_for_index(index)
             .filter(|line| {
                 line.prepainted_bounds
                     .lock()
@@ -145,23 +169,29 @@ impl EditorTextLayout {
 
     fn line_for_index(&self, index: usize) -> Option<EditorLineLayout> {
         let index = index.min(self.display_len);
+        self.exact_line_for_index(index).or_else(|| {
+            let lines = self.lines.lock().ok()?;
+            lines
+                .iter()
+                .min_by_key(|line| {
+                    if index < line.display_range.start {
+                        line.display_range.start - index
+                    } else {
+                        index.saturating_sub(line.display_range.end)
+                    }
+                })
+                .cloned()
+        })
+    }
+
+    /// Finds the registered row that actually owns an index without snapping to a nearby row.
+    fn exact_line_for_index(&self, index: usize) -> Option<EditorLineLayout> {
+        let index = index.min(self.display_len);
         let lines = self.lines.lock().ok()?;
         lines
             .iter()
             .find(|line| line.display_range.start <= index && index <= line.display_range.end)
             .cloned()
-            .or_else(|| {
-                lines
-                    .iter()
-                    .min_by_key(|line| {
-                        if index < line.display_range.start {
-                            line.display_range.start - index
-                        } else {
-                            index.saturating_sub(line.display_range.end)
-                        }
-                    })
-                    .cloned()
-            })
     }
 
     fn register_line(&self, line: EditorLineLayout) {
@@ -447,6 +477,176 @@ pub fn render_editor_text(
     }
 }
 
+/// Estimates every virtual row without allocating GPUI text layouts or component elements.
+fn estimate_virtual_editor_row_heights(
+    display_text: &str,
+    source_text_len: usize,
+    display_ranges: &[Range<usize>],
+    projection: &DisplayProjection,
+    source_snapshot: &LargeDocumentSourceSnapshot,
+    body_font_size: f32,
+    viewport_width: f32,
+    left_padding: f32,
+) -> Vec<f32> {
+    let content_width =
+        (viewport_width - left_padding - EDITOR_HORIZONTAL_PADDING).max(body_font_size * 8.0);
+
+    display_ranges
+        .iter()
+        .map(|display_range| {
+            let line_text = display_text.get(display_range.clone()).unwrap_or_default();
+            let source_byte = projection.display_to_source_byte(display_range.start);
+            let source_line_index = source_line_index_for_byte(
+                source_snapshot.source_line_starts.as_slice(),
+                source_text_len,
+                source_byte,
+            );
+            let heading_level = source_snapshot
+                .heading_levels
+                .get(source_line_index)
+                .copied()
+                .flatten();
+            let line_kind = source_snapshot
+                .line_kinds
+                .get(source_line_index)
+                .copied()
+                .unwrap_or(MarkdownLineKind::Paragraph);
+            let font_size = heading_level
+                .map(estimated_heading_font_size)
+                .unwrap_or(body_font_size);
+            let line_height = if heading_level.is_some() {
+                font_size * 1.2
+            } else {
+                body_text_line_height(body_font_size)
+            };
+            let wrap_columns = (content_width / (font_size * MONOSPACE_DIGIT_WIDTH_RATIO).max(1.0))
+                .floor()
+                .max(8.0) as usize;
+            let wrapped_lines = estimated_wrapped_editor_lines(line_text, wrap_columns);
+            let mut height = wrapped_lines as f32 * line_height;
+
+            if matches!(
+                line_kind,
+                MarkdownLineKind::List { .. } | MarkdownLineKind::Task { .. }
+            ) {
+                height += LIST_ITEM_BOTTOM_MARGIN;
+            }
+            if matches!(
+                line_kind,
+                MarkdownLineKind::CodeFence | MarkdownLineKind::CodeBody
+            ) {
+                let source_line_start = source_snapshot
+                    .source_line_starts
+                    .get(source_line_index)
+                    .copied()
+                    .unwrap_or(source_byte);
+                let code_block_index = code_block_index_for_source_byte(
+                    source_snapshot.code_blocks.as_slice(),
+                    source_byte,
+                );
+                if code_block_starts_on_source_line(
+                    source_snapshot.code_blocks.as_slice(),
+                    code_block_index,
+                    source_line_start,
+                ) {
+                    height += CODE_BLOCK_TOP_MARGIN + CODE_BLOCK_TOP_PADDING;
+                }
+            }
+            if let Some((_, kind)) = projection.complex_atom_for_display_line(display_range) {
+                height = height.max(estimated_complex_component_height(
+                    &kind,
+                    content_width,
+                    body_font_size,
+                ));
+            }
+
+            height.max(1.0)
+        })
+        .collect()
+}
+
+/// Returns the canonical heading size in logical pixels for list-height estimation.
+fn estimated_heading_font_size(level: u8) -> f32 {
+    match level {
+        1 => 30.0,
+        2 => 24.0,
+        3 => 20.0,
+        4 => 18.0,
+        5 => 16.0,
+        _ => 14.0,
+    }
+}
+
+/// Counts wrapped monospace rows while treating wide Unicode characters as two columns.
+fn estimated_wrapped_editor_lines(text: &str, wrap_columns: usize) -> usize {
+    let columns = text
+        .chars()
+        .map(|character| if character.is_ascii() { 1usize } else { 2usize })
+        .sum::<usize>();
+    columns.max(1).div_ceil(wrap_columns.max(1))
+}
+
+/// Estimates the height of a collapsed Live Markdown component row.
+fn estimated_complex_component_height(
+    kind: &ComplexMarkdownKind,
+    content_width: f32,
+    body_font_size: f32,
+) -> f32 {
+    let body_line_height = body_text_line_height(body_font_size);
+    match kind {
+        ComplexMarkdownKind::Image { .. } => 240.0,
+        ComplexMarkdownKind::Table { headers, rows } => {
+            let column_count = headers
+                .len()
+                .max(rows.iter().map(Vec::len).max().unwrap_or(0))
+                .max(1);
+            let cell_width = (content_width / column_count as f32
+                - TABLE_CELL_HORIZONTAL_PADDING * 2.0)
+                .max(body_font_size * 4.0);
+            let cell_wrap_columns = (cell_width
+                / (body_font_size * MONOSPACE_DIGIT_WIDTH_RATIO).max(1.0))
+            .floor()
+            .max(4.0) as usize;
+            let cell_line_height = table_cell_line_height(body_font_size);
+            let table_height = std::iter::once(headers)
+                .chain(rows.iter())
+                .map(|row| {
+                    let lines = row
+                        .iter()
+                        .map(|cell| estimated_wrapped_editor_lines(&cell.text, cell_wrap_columns))
+                        .max()
+                        .unwrap_or(1);
+                    lines as f32 * cell_line_height + TABLE_CELL_VERTICAL_PADDING * 2.0
+                })
+                .sum::<f32>();
+            table_height + 8.0
+        }
+        ComplexMarkdownKind::Callout { body, .. } => {
+            let wrap_columns = (content_width
+                / (body_font_size * MONOSPACE_DIGIT_WIDTH_RATIO).max(1.0))
+            .floor()
+            .max(8.0) as usize;
+            estimated_wrapped_editor_lines(body, wrap_columns) as f32 * body_line_height + 20.0
+        }
+        ComplexMarkdownKind::Footnote {
+            text: Some(text), ..
+        } => {
+            let wrap_columns = (content_width
+                / (body_font_size * MONOSPACE_DIGIT_WIDTH_RATIO).max(1.0))
+            .floor()
+            .max(8.0) as usize;
+            estimated_wrapped_editor_lines(text, wrap_columns) as f32 * body_line_height + 18.0
+        }
+        ComplexMarkdownKind::Math { block: true, .. } => 56.0,
+        ComplexMarkdownKind::Mermaid { source } => {
+            (source.lines().count().clamp(3, 12) as f32 * body_line_height).max(96.0)
+        }
+        ComplexMarkdownKind::Footnote { text: None, .. }
+        | ComplexMarkdownKind::WikiLink { .. }
+        | ComplexMarkdownKind::Math { block: false, .. } => body_line_height,
+    }
+}
+
 /// Builds a visible-only source editor for large documents.
 ///
 /// Line ranges are cheap metadata; GPUI text layouts and row elements are created only for the
@@ -467,6 +667,8 @@ pub fn render_virtualized_editor_text(
     active_table_cell: Option<ActiveTableCellEditor>,
     on_table_cell_click: TableCellClickHandler,
     list_state: ListState,
+    viewport_width: f32,
+    seed_estimated_heights: bool,
 ) -> EditorTextRender {
     let (line_number_gutter_width, left_padding) =
         line_number_gutter_layout(show_line_numbers, display_ranges.len(), body_font_size);
@@ -477,8 +679,34 @@ pub fn render_virtualized_editor_text(
     let line_kinds = source_snapshot.line_kinds.clone();
     let source_line_starts = source_snapshot.source_line_starts.clone();
     let code_blocks = source_snapshot.code_blocks.clone();
+    let estimated_heights = seed_estimated_heights.then(|| {
+        Arc::new(estimate_virtual_editor_row_heights(
+            display_text.as_ref(),
+            source_text.len(),
+            display_ranges.as_slice(),
+            projection.as_ref(),
+            source_snapshot.as_ref(),
+            body_font_size,
+            viewport_width,
+            left_padding,
+        ))
+    });
+    let estimate_seed_calls = Rc::new(Cell::new(0usize));
+    let row_count = display_ranges.len();
 
     let element = list(list_state, move |line_index, _window, _cx| {
+        let seeded = estimate_seed_calls.get();
+        if seed_estimated_heights && seeded < row_count {
+            estimate_seed_calls.set(seeded + 1);
+            return div()
+                .w_full()
+                .h(px(estimated_heights
+                    .as_ref()
+                    .and_then(|heights| heights.get(line_index))
+                    .copied()
+                    .unwrap_or_else(|| body_text_line_height(body_font_size))))
+                .into_any_element();
+        }
         let Some(display_range) = ranges_for_rows.get(line_index).cloned() else {
             return div().into_any_element();
         };
@@ -1470,6 +1698,47 @@ mod tests {
     }
 
     #[test]
+    fn virtual_row_estimates_cover_every_row_and_account_for_wrapping() {
+        let source = format!("short\n{}", "abcdefghij".repeat(40));
+        let projection = DisplayProjection::from_source(&source);
+        let ranges = virtual_editor_row_ranges(projection.display_text.as_ref());
+        let snapshot = LargeDocumentSourceSnapshot::new(&source);
+        let estimates = estimate_virtual_editor_row_heights(
+            projection.display_text.as_ref(),
+            source.len(),
+            ranges.as_slice(),
+            &projection,
+            &snapshot,
+            14.0,
+            240.0,
+            EDITOR_HORIZONTAL_PADDING,
+        );
+
+        assert_eq!(estimates.len(), ranges.len());
+        assert!(estimates[1] > estimates[0]);
+    }
+
+    #[test]
+    fn virtual_row_estimates_include_opening_code_block_spacing() {
+        let source = "```bash\necho ok\n```";
+        let projection = DisplayProjection::from_source(source);
+        let ranges = virtual_editor_row_ranges(projection.display_text.as_ref());
+        let snapshot = LargeDocumentSourceSnapshot::new(source);
+        let estimates = estimate_virtual_editor_row_heights(
+            projection.display_text.as_ref(),
+            source.len(),
+            ranges.as_slice(),
+            &projection,
+            &snapshot,
+            14.0,
+            800.0,
+            EDITOR_HORIZONTAL_PADDING,
+        );
+
+        assert!(estimates[0] > estimates[1]);
+    }
+
+    #[test]
     fn code_block_lookup_uses_ordered_ranges_and_excludes_boundaries() {
         let source = "before\n```rs\none\n```\nmiddle\n```js\ntwo\n```\nafter";
         let blocks = crate::services::syntax::fenced_code_blocks(source);
@@ -1530,6 +1799,23 @@ mod tests {
         assert!(editor_layout.closest_line(Point::default()).is_none());
         assert!(editor_layout.position_for_index(0).is_none());
         assert_eq!(editor_layout.line_height_for_index(0), px(0.));
+    }
+
+    #[test]
+    fn visible_cursor_mapping_does_not_snap_to_nearest_virtual_row() {
+        let layout = StyledText::new("visible").layout().clone();
+        let editor_layout = EditorTextLayout {
+            lines: Arc::new(Mutex::new(VecDeque::from([EditorLineLayout {
+                display_range: 100..107,
+                layout,
+                prepainted_bounds: Arc::new(Mutex::new(Some(Bounds::default()))),
+            }]))),
+            display_len: 200,
+            max_retained_lines: 1,
+        };
+
+        assert!(editor_layout.visible_position_for_index(0).is_none());
+        assert_eq!(editor_layout.visible_line_height_for_index(0), px(0.));
     }
 
     #[test]

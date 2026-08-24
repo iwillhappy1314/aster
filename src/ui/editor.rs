@@ -215,7 +215,11 @@ pub struct EditorView {
     /// Variable-height list used only by the bounded large-document source renderer.
     large_document_list: ListState,
     /// Revision and line ranges paired with `large_document_list`.
-    large_document_lines: Option<(u64, f32, bool, Arc<str>, Arc<Vec<Range<usize>>>)>,
+    large_document_lines: Option<(u64, f32, bool, bool, Arc<str>, Arc<Vec<Range<usize>>>)>,
+    /// Exact editor viewport width supplied by the root layout.
+    large_document_viewport_width: Option<f32>,
+    /// Viewport width used when the virtual list last seeded every row height.
+    large_document_measured_width_bits: Option<u32>,
     /// Source-derived metadata keyed only by document revision.
     large_document_source_snapshot: Option<(u64, Arc<LargeDocumentSourceSnapshot>)>,
     /// Full projected syntax colors reused while scrolling an unchanged large document.
@@ -258,8 +262,10 @@ impl EditorView {
             selected_component: None,
             hovered_code_block_index: None,
             table_cell_edit: None,
-            large_document_list: ListState::new(0, ListAlignment::Top, px(800.)),
+            large_document_list: ListState::new(0, ListAlignment::Top, px(800.)).measure_all(),
             large_document_lines: None,
+            large_document_viewport_width: None,
+            large_document_measured_width_bits: None,
             large_document_source_snapshot: None,
             large_document_highlights: None,
             large_document_cursor_line: None,
@@ -274,6 +280,7 @@ impl EditorView {
         }
         self.large_document_list.reset(0);
         self.large_document_lines = None;
+        self.large_document_measured_width_bits = None;
         self.large_document_source_snapshot = None;
         self.large_document_highlights = None;
         self.large_document_cursor_line = None;
@@ -282,6 +289,11 @@ impl EditorView {
         self.input_projection = None;
         self.cached_projection = None;
         self.cached_text = None;
+    }
+
+    /// Updates the exact width available to the editor without scheduling an extra render.
+    pub fn set_large_document_viewport_width(&mut self, width: f32) {
+        self.large_document_viewport_width = Some(width.max(1.0));
     }
 
     fn start_cursor_blink(&mut self, cx: &mut Context<Self>) {
@@ -1332,6 +1344,7 @@ impl Render for EditorView {
             // cache as soon as the document no longer needs virtualization.
             self.large_document_list.reset(0);
             self.large_document_lines = None;
+            self.large_document_measured_width_bits = None;
             self.large_document_cursor_line = None;
             self.large_document_source_snapshot = None;
             self.large_document_highlights = None;
@@ -1529,35 +1542,46 @@ impl Render for EditorView {
             });
         let editor_font_size = settings::get_font_size();
         let show_line_numbers = settings::get_line_numbers_visible();
+        let mut virtual_line_ranges_for_pointer = None;
         let editor_text = if virtualized_document {
             let large_style_changed = self.large_document_lines.as_ref().is_some_and(
-                |(_, font_size, line_numbers, _, _)| {
+                |(_, font_size, line_numbers, _, _, _)| {
                     *font_size != editor_font_size || *line_numbers != show_line_numbers
                 },
             );
-            let large_projection_changed =
-                self.large_document_lines
-                    .as_ref()
-                    .is_some_and(|(_, _, _, display_text, _)| {
-                        !Arc::ptr_eq(display_text, &projection.display_text)
-                    });
+            let large_presentation_changed = self
+                .large_document_lines
+                .as_ref()
+                .is_some_and(|(_, _, _, live_markdown, _, _)| *live_markdown != self.live_markdown);
             let cached_lines = self.large_document_lines.as_ref().and_then(
-                |(revision, font_size, line_numbers, display_text, ranges)| {
+                |(revision, font_size, line_numbers, live_markdown, display_text, ranges)| {
                     (*revision == doc_revision
                         && *font_size == editor_font_size
                         && *line_numbers == show_line_numbers
+                        && *live_markdown == self.live_markdown
                         && Arc::ptr_eq(display_text, &projection.display_text))
                     .then(|| ranges.clone())
                 },
             );
+            let viewport_width = self
+                .large_document_viewport_width
+                .unwrap_or_else(|| f32::from(window.bounds().size.width))
+                .max(1.0);
+            let viewport_width_bits = viewport_width.to_bits();
+            let width_changed =
+                self.large_document_measured_width_bits != Some(viewport_width_bits);
+            let mut seed_estimated_heights = false;
             let line_ranges = cached_lines.unwrap_or_else(|| {
                 let ranges = Arc::new(virtual_editor_row_ranges(projection.display_text.as_ref()));
                 let old_count = self.large_document_list.item_count();
                 let new_count = ranges.len();
-                if old_count == 0 {
+                if old_count == 0 || large_style_changed || large_presentation_changed {
+                    let previous_offset = self.large_document_list.logical_scroll_top();
                     self.large_document_list.reset(new_count);
-                } else if large_style_changed || large_projection_changed {
-                    self.large_document_list.reset(new_count);
+                    if old_count > 0 {
+                        self.large_document_list.scroll_to(previous_offset);
+                    }
+                    seed_estimated_heights = true;
                 } else if old_count == new_count {
                     let changed_lines = self.document.read(cx).last_edit.as_ref().map(|edit| {
                         let start = line_index_for_byte(ranges.as_slice(), edit.start_byte);
@@ -1599,11 +1623,25 @@ impl Render for EditorView {
                     doc_revision,
                     editor_font_size,
                     show_line_numbers,
+                    self.live_markdown,
                     projection.display_text.clone(),
                     ranges.clone(),
                 ));
                 ranges
             });
+            if width_changed && !seed_estimated_heights {
+                let previous_offset = self.large_document_list.logical_scroll_top();
+                let item_count = self.large_document_list.item_count();
+                self.large_document_list.reset(item_count);
+                if item_count > 0 {
+                    self.large_document_list.scroll_to(previous_offset);
+                }
+                seed_estimated_heights = true;
+            }
+            if seed_estimated_heights {
+                self.large_document_measured_width_bits = Some(viewport_width_bits);
+            }
+            virtual_line_ranges_for_pointer = Some(line_ranges.clone());
             render_virtualized_editor_text(
                 projection.display_text.clone(),
                 text_owned.clone(),
@@ -1620,6 +1658,8 @@ impl Render for EditorView {
                 active_table_cell,
                 on_table_cell_click,
                 self.large_document_list.clone(),
+                viewport_width,
+                seed_estimated_heights,
             )
         } else {
             render_editor_text(
@@ -1652,7 +1692,7 @@ impl Render for EditorView {
             .map(|byte| (byte, true))
             .or_else(|| self.pending_scroll_to_byte.take().map(|byte| (byte, false)));
         if virtualized_document
-            && let Some((_, _, _, _, line_ranges)) = self.large_document_lines.as_ref()
+            && let Some((_, _, _, _, _, line_ranges)) = self.large_document_lines.as_ref()
         {
             if let Some((source_byte, _)) = pending_reveal {
                 let line_index = line_index_for_byte(line_ranges.as_slice(), source_byte);
@@ -1744,7 +1784,8 @@ impl Render for EditorView {
                         }
 
                         let caret_pos = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                            text_layout_for_active_line.position_for_index(cursor_display_byte)
+                            text_layout_for_active_line
+                                .visible_position_for_index(cursor_display_byte)
                         }))
                         .ok()
                         .flatten();
@@ -1753,7 +1794,8 @@ impl Render for EditorView {
                         };
 
                         let line_height = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                            text_layout_for_active_line.line_height_for_index(cursor_display_byte)
+                            text_layout_for_active_line
+                                .visible_line_height_for_index(cursor_display_byte)
                         }))
                         .ok()
                         .unwrap_or(px(0.));
@@ -1780,7 +1822,7 @@ impl Render for EditorView {
                             return;
                         }
                         let caret_pos = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                            text_layout_for_caret.position_for_index(cursor_display_byte)
+                            text_layout_for_caret.visible_position_for_index(cursor_display_byte)
                         }))
                         .ok()
                         .flatten();
@@ -1788,7 +1830,7 @@ impl Render for EditorView {
                             return;
                         };
                         let line_height = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                            text_layout_for_caret.line_height_for_index(cursor_display_byte)
+                            text_layout_for_caret.visible_line_height_for_index(cursor_display_byte)
                         }))
                         .ok()
                         .unwrap_or(px(0.));
@@ -1981,6 +2023,7 @@ impl Render for EditorView {
                         let focus_handle = focus_handle.clone();
                         let doc_handle = self.document.clone();
                         let editor_handle = cx.entity();
+                        let line_ranges_for_pointer = virtual_line_ranges_for_pointer.clone();
                         let complex_link_callback = self.on_complex_link.clone();
                         let layout_for_event = text_layout.clone();
                         let projection_for_event = projection.clone();
@@ -2028,7 +2071,17 @@ impl Render for EditorView {
                                 });
                                 return;
                             }
+                            let source_byte = byte_idx
+                                .map(|byte| projection_for_event.display_to_source_byte(byte));
+                            let cursor_line = source_byte.and_then(|byte| {
+                                line_ranges_for_pointer
+                                    .as_ref()
+                                    .map(|ranges| line_index_for_byte(ranges.as_slice(), byte))
+                            });
                             let _ = editor_handle.update(cx_app, |editor, cx| {
+                                if let Some(cursor_line) = cursor_line {
+                                    editor.large_document_cursor_line = Some(cursor_line);
+                                }
                                 if editor.selected_component.take().is_some() {
                                     cx.notify();
                                 }
@@ -2049,8 +2102,6 @@ impl Render for EditorView {
                                     cx.notify();
                                     return;
                                 }
-                                let source_byte = byte_idx
-                                    .map(|b| projection_for_event.display_to_source_byte(b));
                                 if let Some(byte_idx) = source_byte.map(|b| doc.byte_to_char(b)) {
                                     if event.modifiers.shift {
                                         let anchor = doc.selection_anchor.unwrap_or(doc.cursor);
@@ -2065,24 +2116,37 @@ impl Render for EditorView {
                     })
                     .on_mouse_move({
                         let doc_handle = self.document.clone();
+                        let editor_handle = cx.entity();
+                        let line_ranges_for_pointer = virtual_line_ranges_for_pointer.clone();
                         let layout_for_event = text_layout.clone();
                         let projection_for_event = projection.clone();
                         move |event: &MouseMoveEvent, _window: &mut Window, cx_app: &mut App| {
                             if !event.dragging() {
                                 return;
                             }
-                            let _ = doc_handle.update(cx_app, |doc, cx| {
-                                let byte_idx = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                    layout_for_event.index_for_position(event.position)
-                                }))
-                                .ok()
-                                .map(|res| match res {
-                                    Ok(ix) => ix,
-                                    Err(ix) => ix,
+                            let byte_idx = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                layout_for_event.index_for_position(event.position)
+                            }))
+                            .ok()
+                            .map(|result| match result {
+                                Ok(index) => index,
+                                Err(index) => index,
+                            });
+                            let source_byte = byte_idx
+                                .map(|byte| projection_for_event.display_to_source_byte(byte));
+                            if let Some(cursor_line) = source_byte.and_then(|byte| {
+                                line_ranges_for_pointer
+                                    .as_ref()
+                                    .map(|ranges| line_index_for_byte(ranges.as_slice(), byte))
+                            }) {
+                                let _ = editor_handle.update(cx_app, |editor, _| {
+                                    editor.large_document_cursor_line = Some(cursor_line);
                                 });
-                                let source_byte = byte_idx
-                                    .map(|b| projection_for_event.display_to_source_byte(b));
-                                if let Some(byte_idx) = source_byte.map(|b| doc.byte_to_char(b)) {
+                            }
+                            let _ = doc_handle.update(cx_app, |doc, cx| {
+                                if let Some(byte_idx) =
+                                    source_byte.map(|byte| doc.byte_to_char(byte))
+                                {
                                     let anchor = doc.selection_anchor.unwrap_or(doc.cursor);
                                     doc.set_selection(anchor, byte_idx);
                                     cx.notify();
