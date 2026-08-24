@@ -1137,50 +1137,6 @@ impl RootView {
             .into_any_element()
     }
 
-    /// Renders the Source and Live Markdown presentation toggle beside Preview.
-    fn render_titlebar_live_markdown_toggle(
-        &self,
-        outline_position: OutlinePosition,
-        has_right_sidebar: bool,
-        live_markdown_color: gpui::Rgba,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let preview_offset = if outline_position == OutlinePosition::Right {
-            if has_right_sidebar {
-                self.sidebar_width + SIDEBAR_DIVIDER_WIDTH
-            } else {
-                TITLEBAR_CONTROL_WIDTH
-            }
-        } else {
-            0.0
-        };
-
-        div()
-            .id("titlebar-live-markdown-toggle")
-            .absolute()
-            .top_0()
-            .right(px(preview_offset + TITLEBAR_CONTROL_WIDTH))
-            .size(px(TITLEBAR_CONTROL_WIDTH))
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor_pointer()
-            .text_xs()
-            .font_weight(FontWeight::BOLD)
-            .text_color(live_markdown_color)
-            .hover(|this| this.bg(Theme::panel()))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                    window.prevent_default();
-                    cx.stop_propagation();
-                    this.toggle_live_markdown(cx);
-                }),
-            )
-            .child("M↓")
-            .into_any_element()
-    }
-
     /// Renders the interactive document tabs and new-tab button in the custom title bar.
     fn render_tab_bar(
         &self,
@@ -1937,11 +1893,6 @@ impl Render for RootView {
         } else {
             Theme::muted()
         };
-        let live_markdown_color = if self.editor_view.read(cx).live_markdown_enabled() {
-            Theme::control_accent()
-        } else {
-            Theme::muted()
-        };
         let resize_line_color = if self.resizing_sidebar {
             gpui::rgba(0x2d7fd299)
         } else {
@@ -1962,12 +1913,6 @@ impl Render for RootView {
             outline_position,
             has_right_sidebar,
             mode_toggle_color,
-            cx,
-        );
-        let live_markdown_toggle = self.render_titlebar_live_markdown_toggle(
-            outline_position,
-            has_right_sidebar,
-            live_markdown_color,
             cx,
         );
         let top_chrome = div()
@@ -2008,7 +1953,6 @@ impl Render for RootView {
             })
             .child(tab_bar)
             .child(outline_toggle)
-            .child(live_markdown_toggle)
             .child(mode_toggle);
 
         div()

@@ -25,10 +25,26 @@ pub fn parse_comrak(source: &str) -> Vec<Block> {
   for node in root.children() {
     let mut is_centered_open = false;
     let mut is_centered_close = false;
+    let mut is_self_contained_centered_block = false;
 
     if let NodeValue::HtmlBlock(ref html_block) = node.data.borrow().value {
       is_centered_open = html::is_centered_div_open(&html_block.literal);
       is_centered_close = html::is_centered_div_close(&html_block.literal);
+      is_self_contained_centered_block =
+        is_centered_open && html_block_contains_div_close(&html_block.literal);
+    }
+
+    if is_self_contained_centered_block {
+      let centered_block = Block::Aligned {
+        center: true,
+        blocks: blocks_from_node(node),
+      };
+      if centered_div_depth > 0 {
+        centered_div_blocks.push(centered_block);
+      } else {
+        blocks.push(centered_block);
+      }
+      continue;
     }
 
     if is_centered_open {
@@ -65,6 +81,17 @@ pub fn parse_comrak(source: &str) -> Vec<Block> {
   }
 
   blocks
+}
+
+/// Returns whether one HTML block contains a syntactically complete closing `div` tag.
+fn html_block_contains_div_close(source: &str) -> bool {
+  let lowercase = source.to_ascii_lowercase();
+  lowercase.match_indices("</div").any(|(start, _)| {
+    let suffix = &lowercase[start + "</div".len()..];
+    suffix
+      .find('>')
+      .is_some_and(|end| suffix[..end].trim().is_empty())
+  })
 }
 
 /// Configure comrak with GFM extensions.
@@ -393,6 +420,30 @@ mod tests {
         .any(|b| matches!(b, Block::Aligned { center: true, .. })),
       "expected centered aligned block, got: {blocks:?}"
     );
+  }
+
+  #[test]
+  fn closed_centered_html_block_does_not_center_following_markdown() {
+    let md = r#"<div align="center">
+<tr style="border: none;">
+<td width="180px" style="border: none;">
+<img src="./logo.png" alt="Aster logo" width="160"/>
+</td>
+<td style="border: none; padding-left: 20px;">
+<h1 align="center" style="font-size: 3em;">Aster</h1>
+</td>
+</tr>
+</table>
+</div>
+
+Ordinary paragraph.
+
+## Download"#;
+    let blocks = parse_comrak(md);
+
+    assert!(matches!(blocks.first(), Some(Block::Aligned { center: true, .. })));
+    assert!(matches!(blocks.get(1), Some(Block::Paragraph(_))));
+    assert!(matches!(blocks.get(2), Some(Block::Heading { level: 2, .. })));
   }
 
   #[test]

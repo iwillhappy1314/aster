@@ -397,6 +397,13 @@ mod tests {
     }
 
     #[test]
+    fn missing_editor_mode_preference_defaults_to_visual_editing() {
+        let settings: Settings = serde_json::from_str("{}").expect("settings should deserialize");
+
+        assert!(settings.live_markdown_enabled);
+    }
+
+    #[test]
     fn sidebar_sections_default_to_outline_first_and_toggle_both_ways() {
         assert_eq!(
             SidebarSectionOrder::default(),

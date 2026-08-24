@@ -114,7 +114,7 @@ pub fn run() {
                 items: vec![
                     MenuItem::action("Show or Hide Outline", ToggleOutline),
                     MenuItem::action("Show or Hide Line Numbers", ToggleLineNumbers),
-                    MenuItem::action("Toggle Live Markdown", ToggleLiveMarkdown),
+                    MenuItem::action("Toggle Markdown Source Mode", ToggleLiveMarkdown),
                     MenuItem::submenu(Menu {
                         name: "Outline Position".into(),
                         items: vec![
