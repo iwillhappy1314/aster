@@ -2315,7 +2315,7 @@ impl Render for RootView {
                     state.spans = Default::default();
                     state.components = Default::default();
                     state.source_revision = target_rev;
-                    state.parse_millis = 0;
+                    state.parse_millis = 0.0;
                     cx.notify();
                 });
             } else if doc_text.len() <= INLINE_SYNC_PARSE_MAX_BYTES {

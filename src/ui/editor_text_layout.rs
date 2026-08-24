@@ -440,7 +440,7 @@ pub fn render_editor_text(
         }
 
         container = container.child(line);
-        layouts.push(EditorLineLayout {
+        layouts.push_back(EditorLineLayout {
             display_range: display_range.clone(),
             layout,
             prepainted_bounds,

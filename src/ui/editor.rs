@@ -11,8 +11,7 @@ use crate::ui::editor_projection::{DisplayProjection, ProjectionAtom, active_lin
 use crate::ui::editor_text_layout::{
     ActiveTableCellEditor, CodeBlockHoverHandler, ComplexComponentClickHandler, EditorTextLayout,
     TableCellClickHandler, EDITOR_HORIZONTAL_PADDING, component_repeat_click_edits_source,
-    editor_line_ranges, render_editor_text, render_virtualized_editor_text,
-    virtual_editor_row_ranges,
+    render_editor_text, render_virtualized_editor_text, virtual_editor_row_ranges,
 };
 use crate::ui::VIRTUALIZED_DOCUMENT_BYTES;
 use crate::ui::text_utils::ellipsize_chars;
@@ -2530,6 +2529,7 @@ fn sanitize_highlights(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::editor_text_layout::editor_line_ranges;
 
     #[test]
     fn virtual_line_lookup_handles_boundaries_and_trailing_empty_lines() {
