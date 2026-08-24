@@ -222,8 +222,7 @@ impl DisplayProjection {
                 let ProjectionSegmentKind::Atom(atom) = &segment.kind else {
                     return None;
                 };
-                (display_byte <= segment.display.end)
-                    .then(|| (segment.source.clone(), atom.clone()))
+                (display_byte < segment.display.end).then(|| (segment.source.clone(), atom.clone()))
             })
     }
 
@@ -718,6 +717,33 @@ mod tests {
                 ProjectionAtom::Complex(ComplexMarkdownKind::Table { .. })
             ))
         ));
+    }
+
+    #[test]
+    fn table_component_preserves_an_explicit_following_blank_line() {
+        use crate::services::complex_markdown::complex_markdown_components;
+
+        let source = "| A | B |\n| --- | --- |\n| 1 | 2 |\n\nafter";
+        let spans = markdown_spans(source);
+        let components = complex_markdown_components(source);
+        let projection =
+            DisplayProjection::from_markdown_with_components(source, &spans, &components, 0..0);
+
+        assert_eq!(projection.display_text.as_ref(), "\u{200B}\n\nafter");
+    }
+
+    #[test]
+    fn table_atom_does_not_claim_the_following_blank_line() {
+        use crate::services::complex_markdown::complex_markdown_components;
+
+        let source = "| A | B |\n| --- | --- |\n| 1 | 2 |\n\nafter";
+        let spans = markdown_spans(source);
+        let components = complex_markdown_components(source);
+        let projection =
+            DisplayProjection::from_markdown_with_components(source, &spans, &components, 0..0);
+        let blank_line_byte = "\u{200B}\n".len();
+
+        assert!(projection.atom_at_display_byte(blank_line_byte).is_none());
     }
 
     #[test]

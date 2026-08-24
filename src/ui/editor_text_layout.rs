@@ -383,7 +383,7 @@ pub fn render_editor_text(
             let source_click_range = source_range.clone();
             let source_click_handler = on_component_click.clone();
             line = if is_table {
-                line.mb(px(8.))
+                line
             } else {
                 line.mt(px(4.))
                     .mb(px(8.))
@@ -619,7 +619,7 @@ fn estimated_complex_component_height(
                     lines as f32 * cell_line_height + TABLE_CELL_VERTICAL_PADDING * 2.0
                 })
                 .sum::<f32>();
-            table_height + 8.0
+            table_height
         }
         ComplexMarkdownKind::Callout { body, .. } => {
             let wrap_columns = (content_width
@@ -812,7 +812,7 @@ pub fn render_virtualized_editor_text(
             let source_click_range = source_range.clone();
             let source_click_handler = on_component_click.clone();
             line = if is_table {
-                line.mb(px(8.))
+                line
             } else {
                 line.mt(px(4.))
                     .mb(px(8.))
@@ -924,6 +924,7 @@ fn editor_display_line(
     prepainted_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
 ) -> gpui::Stateful<gpui::Div> {
     div()
+        .child(editor_line_pointer_anchor())
         .on_children_prepainted(move |children, _, _| {
             let first_child = children.first().copied();
             if let Ok(mut bounds) = prepainted_bounds.lock() {
@@ -934,6 +935,17 @@ fn editor_display_line(
         .relative()
         .min_w_0()
         .flex_shrink_0()
+}
+
+/// Covers the full visual row so empty Markdown lines retain a clickable pointer-mapping area.
+fn editor_line_pointer_anchor() -> gpui::Div {
+    div()
+        .absolute()
+        .top_0()
+        .right_0()
+        .bottom_0()
+        .left_0()
+        .opacity(0.0)
 }
 
 /// Keeps a collapsed component's text layout available for pointer mapping without showing it.
@@ -1734,6 +1746,28 @@ mod tests {
 
         assert_eq!(estimates.len(), ranges.len());
         assert!(estimates[1] > estimates[0]);
+    }
+
+    #[test]
+    fn table_height_estimate_has_no_implicit_bottom_margin() {
+        let kind = ComplexMarkdownKind::Table {
+            headers: vec![MarkdownTableCell {
+                text: "Header".to_string(),
+                source_range: 0..6,
+            }],
+            rows: vec![vec![MarkdownTableCell {
+                text: "Value".to_string(),
+                source_range: 0..5,
+            }]],
+        };
+        let body_font_size = 16.0;
+        let expected_height =
+            2.0 * (table_cell_line_height(body_font_size) + TABLE_CELL_VERTICAL_PADDING * 2.0);
+
+        assert_eq!(
+            estimated_complex_component_height(&kind, 800.0, body_font_size),
+            expected_height
+        );
     }
 
     #[test]
