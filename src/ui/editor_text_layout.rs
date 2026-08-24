@@ -34,6 +34,7 @@ pub struct ActiveTableCellEditor {
     pub source_range: Range<usize>,
     pub input: Entity<InputState>,
     pub layout_text: String,
+    pub input_visible: bool,
 }
 
 #[derive(Clone)]
@@ -360,13 +361,16 @@ fn render_complex_component_detail(
                             .is_some_and(|active| active.source_range == cell.source_range)
                         {
                             let input = active_table_cell.expect("active table cell").input.clone();
+                            let input_visible = active_table_cell
+                                .expect("active table cell")
+                                .input_visible;
                             cell_element = cell_element
                                 // Preserve the cell's normal wrapped-text height while the
-                                // absolutely-positioned input handles editing above it.
+                                // input completes its first width-aware layout behind it.
                                 .child(
                                     div()
                                         .w_full()
-                                        .invisible()
+                                        .when(input_visible, |snapshot| snapshot.invisible())
                                         .child(
                                             active_table_cell
                                                 .expect("active table cell")
@@ -384,6 +388,7 @@ fn render_complex_component_detail(
                                         .flex()
                                         .px(px(6.))
                                         .pt(px(7.))
+                                        .when(!input_visible, |editor| editor.opacity(0.0))
                                         .child(
                                             Input::new(&input)
                                                 .xsmall()

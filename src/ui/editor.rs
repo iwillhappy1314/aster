@@ -50,7 +50,9 @@ struct TableCellEdit {
     source_range: Range<usize>,
     input: Entity<InputState>,
     layout_text: String,
+    input_visible: bool,
     scroll_offset: Point<Pixels>,
+    input_reveal_task: Option<gpui::Task<()>>,
     scroll_restore_task: Option<gpui::Task<()>>,
     _subscription: Subscription,
 }
@@ -305,15 +307,35 @@ impl EditorView {
         });
         let _ = self.document.update(cx, |doc, _| doc.begin_edit());
         self.selected_component = None;
+        let source_start = cell.source_range.start;
         self.table_cell_edit = Some(TableCellEdit {
             source_range: cell.source_range,
             input: input.clone(),
             layout_text,
+            input_visible: false,
             scroll_offset,
+            input_reveal_task: None,
             scroll_restore_task: None,
             _subscription: subscription,
         });
         input.update(cx, |input, cx| input.focus(window, cx));
+        let entity = cx.entity();
+        let reveal_task = cx.spawn(async move |_editor, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(32))
+                .await;
+            let _ = entity.update(cx, |editor, cx| {
+                if let Some(active) = &mut editor.table_cell_edit
+                    && active.source_range.start == source_start
+                {
+                    active.input_visible = true;
+                    cx.notify();
+                }
+            });
+        });
+        if let Some(active) = &mut self.table_cell_edit {
+            active.input_reveal_task = Some(reveal_task);
+        }
         self.cached_projection = None;
         cx.notify();
     }
@@ -1308,6 +1330,7 @@ impl Render for EditorView {
             source_range: edit.source_range.clone(),
             input: edit.input.clone(),
             layout_text: edit.layout_text.clone(),
+            input_visible: edit.input_visible,
         });
         let editor_text = render_editor_text(
             &projection.display_text,
