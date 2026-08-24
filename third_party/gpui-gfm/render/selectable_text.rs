@@ -486,6 +486,12 @@ fn selection_state_key(selection_state: &SelectionState) -> usize {
   Arc::as_ptr(&selection_state.selection) as usize
 }
 
+/// Releases text copies retained for a preview whose persistent selection state is gone.
+pub(crate) fn remove_cross_block_state(selection_state: &SelectionState) {
+  let key = selection_state_key(selection_state);
+  CROSS_BLOCK_SELECTIONS.lock().unwrap().remove(&key);
+}
+
 fn register_cross_block_text(selection_state: &SelectionState, text_id: usize, text: &str) {
   let key = selection_state_key(selection_state);
   let mut all = CROSS_BLOCK_SELECTIONS.lock().unwrap();
@@ -647,8 +653,17 @@ fn cross_block_selected_text(selection_state: &SelectionState) -> Option<String>
 
   let start_id = active.anchor_text_id.min(active.head_text_id);
   let end_id = active.anchor_text_id.max(active.head_text_id);
+  // Virtualized previews reserve an ID range per Markdown block. Walk only registered
+  // text IDs so copying a selection never scans the sparse numeric gaps between blocks.
+  let mut text_ids = state
+    .texts
+    .keys()
+    .copied()
+    .filter(|text_id| *text_id >= start_id && *text_id <= end_id)
+    .collect::<Vec<_>>();
+  text_ids.sort_unstable();
   let mut parts = Vec::new();
-  for text_id in start_id..=end_id {
+  for text_id in text_ids {
     let Some(text) = state.texts.get(&text_id) else {
       continue;
     };
@@ -963,6 +978,27 @@ mod tests {
       options.selected_preview_text().as_deref(),
       Some("first\nsecond")
     );
+  }
+
+  #[test]
+  fn cross_block_copy_walks_sparse_virtual_block_ids() {
+    let state = SelectionState::default();
+    register_cross_block_text(&state, 0, "first");
+    register_cross_block_text(&state, 1_000_000, "second");
+    set_cross_block_selection(
+      &state,
+      CrossBlockSelection {
+        anchor_text_id: 0,
+        anchor: 0,
+        head_text_id: 1_000_000,
+        head: 6,
+        dragging: false,
+        mode: SelectionMode::Char,
+        initial_range: None,
+      },
+    );
+
+    assert_eq!(cross_block_selected_text(&state).as_deref(), Some("first\nsecond"));
   }
 
   #[test]

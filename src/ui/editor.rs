@@ -1,33 +1,35 @@
 use crate::commands::{Copy, Cut, Find, FindNext, FindPrevious, Paste, Redo, SelectAll, Undo};
 use crate::model::document::DocumentState;
 use crate::model::inline_markdown::InlineMarkdownState;
-use crate::services::settings;
 use crate::services::complex_markdown::{
-    ComplexMarkdownKind, MarkdownTableCell, complex_markdown_components,
-    serialize_table_cell_value,
+    ComplexMarkdownKind, MarkdownTableCell, complex_markdown_components, serialize_table_cell_value,
 };
+use crate::services::settings;
 use crate::services::syntax::{FencedCodeBlock, SyntaxKind, SyntaxSpan, fenced_code_blocks};
+use crate::ui::VIRTUALIZED_DOCUMENT_BYTES;
 use crate::ui::editor_projection::{DisplayProjection, ProjectionAtom, active_line_range};
 use crate::ui::editor_text_layout::{
-    ActiveTableCellEditor, CodeBlockHoverHandler, ComplexComponentClickHandler, EditorTextLayout,
-    TableCellClickHandler, EDITOR_HORIZONTAL_PADDING, component_repeat_click_edits_source,
-    render_editor_text,
+    ActiveTableCellEditor, CodeBlockHoverHandler, ComplexComponentClickHandler,
+    EDITOR_HORIZONTAL_PADDING, EditorTextLayout, LargeDocumentSourceSnapshot,
+    TableCellClickHandler, component_repeat_click_edits_source, render_editor_text,
+    render_virtualized_editor_text, virtual_editor_row_ranges,
 };
 use crate::ui::text_utils::ellipsize_chars;
-use crate::ui::theme::{MarkdownStyle, Theme};
+use crate::ui::theme::{MarkdownStyle, Theme, ThemeName};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, App, AppContext, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight, HighlightStyle,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement, Pixels, Point, Render, ScrollHandle, StatefulInteractiveElement, Subscription,
-    StrikethroughStyle, Styled, UTF16Selection, Window, anchored, canvas, combine_highlights,
-    deferred, div, fill, point, px, size,
+    InteractiveElement, IntoElement, KeyDownEvent, ListAlignment, ListOffset, ListState,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render,
+    ScrollHandle, StatefulInteractiveElement, StrikethroughStyle, Styled, Subscription,
+    UTF16Selection, Window, anchored, canvas, combine_highlights, deferred, div, fill, point, px,
+    size,
 };
 use gpui_component::input::{InputEvent, InputState};
 use gpui_gfm::{
     CodeSyntaxTheme, InteractiveScrollbarAxis, InteractiveScrollbarState, code_syntax_highlights,
-    render_interactive_scrollbar,
+    render_interactive_list_scrollbar, render_interactive_scrollbar,
 };
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
@@ -45,6 +47,15 @@ struct SearchCache {
     revision: u64,
     query: String,
     matches: Vec<Range<usize>>,
+}
+
+/// Caches projected syntax colors that otherwise require processing the whole document per frame.
+struct LargeDocumentHighlightCache {
+    document_revision: u64,
+    inline_revision: u64,
+    projection: Arc<DisplayProjection>,
+    theme: ThemeName,
+    highlights: Arc<Vec<(Range<usize>, HighlightStyle)>>,
 }
 
 /// Owns one native wrapping cell input and the open document edit it controls.
@@ -145,13 +156,13 @@ fn code_block_range_for_source_range(
     blocks: &[FencedCodeBlock],
     source_range: &Range<usize>,
 ) -> Option<Range<usize>> {
-    blocks.iter().find_map(|block| {
+    let candidate = blocks.partition_point(|block| block.source_range.end <= source_range.start);
+    blocks.get(candidate).and_then(|block| {
         let matches = if source_range.is_empty() {
             block.source_range.start <= source_range.start
                 && source_range.start < block.source_range.end
         } else {
             block.source_range.start < source_range.end
-                && source_range.start < block.source_range.end
         };
         matches.then(|| block.source_range.clone())
     })
@@ -201,6 +212,18 @@ pub struct EditorView {
     hovered_code_block_index: Option<usize>,
     /// Native inline editor for the currently active Markdown table cell.
     table_cell_edit: Option<TableCellEdit>,
+    /// Variable-height list used only by the bounded large-document source renderer.
+    large_document_list: ListState,
+    /// Revision and line ranges paired with `large_document_list`.
+    large_document_lines: Option<(u64, f32, bool, Arc<str>, Arc<Vec<Range<usize>>>)>,
+    /// Source-derived metadata keyed only by document revision.
+    large_document_source_snapshot: Option<(u64, Arc<LargeDocumentSourceSnapshot>)>,
+    /// Full projected syntax colors reused while scrolling an unchanged large document.
+    large_document_highlights: Option<LargeDocumentHighlightCache>,
+    /// Last cursor line revealed by the virtual list.
+    large_document_cursor_line: Option<usize>,
+    /// Lets event handlers choose the list scroll API instead of the legacy `ScrollHandle`.
+    large_document_active: bool,
 }
 
 impl EditorView {
@@ -235,7 +258,30 @@ impl EditorView {
             selected_component: None,
             hovered_code_block_index: None,
             table_cell_edit: None,
+            large_document_list: ListState::new(0, ListAlignment::Top, px(800.)),
+            large_document_lines: None,
+            large_document_source_snapshot: None,
+            large_document_highlights: None,
+            large_document_cursor_line: None,
+            large_document_active: false,
         }
+    }
+
+    /// Releases layout and projection caches that are unnecessary while preview mode is visible.
+    pub fn release_large_document_render_cache(&mut self) {
+        if !self.large_document_active {
+            return;
+        }
+        self.large_document_list.reset(0);
+        self.large_document_lines = None;
+        self.large_document_source_snapshot = None;
+        self.large_document_highlights = None;
+        self.large_document_cursor_line = None;
+        self.large_document_active = false;
+        self.input_layout = None;
+        self.input_projection = None;
+        self.cached_projection = None;
+        self.cached_text = None;
     }
 
     fn start_cursor_blink(&mut self, cx: &mut Context<Self>) {
@@ -249,9 +295,8 @@ impl EditorView {
                     .timer(Duration::from_millis(500))
                     .await;
                 let _ = entity.update(cx, |view, cx| {
-                    let should_blink = {
-                        view.document.read(cx).rope.len_bytes() <= HEAVY_DOCUMENT_BYTES
-                    };
+                    let should_blink =
+                        { view.document.read(cx).rope.len_bytes() <= HEAVY_DOCUMENT_BYTES };
 
                     if should_blink {
                         view.caret_visible = !view.caret_visible;
@@ -985,11 +1030,10 @@ impl EntityInputHandler for EditorView {
         let range = utf16_range_to_chars(&doc, &range_utf16);
         let source_byte = doc.char_to_byte(range.end);
         let display_byte = projection.source_to_display_byte(source_byte);
-        let position = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            layout.position_for_index(display_byte)
-        }))
-        .ok()
-        .flatten()?;
+        let position =
+            std::panic::catch_unwind(AssertUnwindSafe(|| layout.position_for_index(display_byte)))
+                .ok()
+                .flatten()?;
         let line_height = std::panic::catch_unwind(AssertUnwindSafe(|| {
             layout.line_height_for_index(display_byte)
         }))
@@ -1012,14 +1056,13 @@ impl EntityInputHandler for EditorView {
     ) -> Option<usize> {
         let layout = self.input_layout.as_ref()?;
         let projection = self.input_projection.as_ref()?;
-        let display_byte = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            layout.index_for_position(point)
-        }))
-        .ok()
-        .map(|result| match result {
-            Ok(index) => index,
-            Err(index) => index,
-        })?;
+        let display_byte =
+            std::panic::catch_unwind(AssertUnwindSafe(|| layout.index_for_position(point)))
+                .ok()
+                .map(|result| match result {
+                    Ok(index) => index,
+                    Err(index) => index,
+                })?;
         let source_byte = projection.display_to_source_byte(display_byte);
         let doc = self.document.read(cx);
         let char_index = doc.byte_to_char(source_byte);
@@ -1128,7 +1171,11 @@ where
         .items_center()
         .rounded(px(5.))
         .text_sm()
-        .text_color(if disabled { Theme::muted() } else { Theme::text() })
+        .text_color(if disabled {
+            Theme::muted()
+        } else {
+            Theme::text()
+        })
         .when(!disabled, |this| {
             this.cursor_pointer()
                 .hover(|style| style.bg(Theme::panel_alt()))
@@ -1151,11 +1198,16 @@ fn build_editor_context_menu(
     editor: Entity<EditorView>,
 ) -> AnyElement {
     let cut_editor = editor.clone();
-    let cut = editor_context_menu_item("editor-context-cut", "Cut", !has_selection, move |_, window, cx| {
-        window.dispatch_action(Box::new(Cut), cx);
-        close_editor_context_menu(&cut_editor, cx);
-        cx.stop_propagation();
-    });
+    let cut = editor_context_menu_item(
+        "editor-context-cut",
+        "Cut",
+        !has_selection,
+        move |_, window, cx| {
+            window.dispatch_action(Box::new(Cut), cx);
+            close_editor_context_menu(&cut_editor, cx);
+            cx.stop_propagation();
+        },
+    );
 
     let copy_editor = editor.clone();
     let copy = editor_context_menu_item(
@@ -1205,13 +1257,7 @@ fn build_editor_context_menu(
         .child(cut)
         .child(copy)
         .child(paste)
-        .child(
-            div()
-                .h(px(1.))
-                .mx(px(6.))
-                .my(px(4.))
-                .bg(Theme::border()),
-        )
+        .child(div().h(px(1.)).mx(px(6.)).my(px(4.)).bg(Theme::border()))
         .child(select_all);
 
     deferred(
@@ -1274,17 +1320,44 @@ impl Render for EditorView {
         if self.cached_text.as_ref().map(|(r, _)| *r) != Some(doc_revision) {
             self.cached_text = Some((doc_revision, text_owned.clone()));
         }
+        let virtualized_document = text_owned.len() > VIRTUALIZED_DOCUMENT_BYTES;
+        let was_large_document = self.large_document_active;
+        self.large_document_active = virtualized_document;
+        if virtualized_document && !was_large_document {
+            // Do not retain the last full live-Markdown projection when the document crosses
+            // into the bounded-memory rendering path.
+            self.cached_projection = None;
+        } else if !virtualized_document && was_large_document {
+            // ListState retains per-item measurements. Release those along with the row-range
+            // cache as soon as the document no longer needs virtualization.
+            self.large_document_list.reset(0);
+            self.large_document_lines = None;
+            self.large_document_cursor_line = None;
+            self.large_document_source_snapshot = None;
+            self.large_document_highlights = None;
+        }
 
         let doc = self.document.read(cx);
         let cursor_source_byte = doc.char_to_byte(doc.cursor);
         let cursor_or_selection_range = doc
             .selection_bytes()
             .unwrap_or(cursor_source_byte..cursor_source_byte);
-        let active_source_range = active_line_range(
-            text_owned.as_ref(),
-            cursor_or_selection_range.clone(),
-        );
-        let code_blocks = fenced_code_blocks(text_owned.as_ref());
+        let active_source_range =
+            active_line_range(text_owned.as_ref(), cursor_or_selection_range.clone());
+        let large_source_snapshot = virtualized_document.then(|| {
+            if let Some((revision, snapshot)) = &self.large_document_source_snapshot
+                && *revision == doc_revision
+            {
+                return snapshot.clone();
+            }
+            let snapshot = Arc::new(LargeDocumentSourceSnapshot::new(text_owned.as_ref()));
+            self.large_document_source_snapshot = Some((doc_revision, snapshot.clone()));
+            snapshot
+        });
+        let code_blocks = large_source_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.code_blocks.clone())
+            .unwrap_or_else(|| Arc::new(fenced_code_blocks(text_owned.as_ref())));
         let editing_code_block =
             code_block_range_for_source_range(&code_blocks, &cursor_or_selection_range);
         let hovered_code_block = self.hovered_code_block_index.and_then(|index| {
@@ -1300,10 +1373,8 @@ impl Render for EditorView {
         );
         let show_caret = doc.selection.is_none();
         let has_selection = doc.selection_range().is_some();
-        let draw_caret = show_caret
-            && is_focused
-            && self.table_cell_edit.is_none()
-            && self.caret_visible;
+        let draw_caret =
+            show_caret && is_focused && self.table_cell_edit.is_none() && self.caret_visible;
         let (inline_spans, complex_components, inline_revision) = {
             let inline = self.inline_markdown.read(cx);
             (
@@ -1321,13 +1392,13 @@ impl Render for EditorView {
         } else {
             &[]
         };
-        let current_cell_components = (self.table_cell_edit.is_some()
-            && !inline_spans_are_current)
+        let current_cell_components = (self.table_cell_edit.is_some() && !inline_spans_are_current)
             .then(|| complex_markdown_components(text_owned.as_ref()));
         let render_components = current_cell_components
             .as_ref()
             .unwrap_or(complex_components.as_ref());
-        let projection_data_is_current = inline_spans_are_current || current_cell_components.is_some();
+        let projection_data_is_current =
+            inline_spans_are_current || current_cell_components.is_some();
         let projection = if let Some((
             cached_doc_revision,
             cached_inline_revision,
@@ -1362,16 +1433,39 @@ impl Render for EditorView {
             projection
         };
         let cursor_display_byte = projection.source_to_display_byte(cursor_source_byte);
-        let syntax_highlights = if inline_spans_are_current {
-            let mut source_highlights = self.inline_syntax_highlights(render_spans, markdown_style);
-            if self.live_markdown {
-                source_highlights.extend(
-                    self.fenced_code_highlights(text_owned.as_ref(), code_blocks.as_slice()),
-                );
-            }
-            project_editor_highlights(projection.as_ref(), source_highlights)
+        let theme_name = Theme::name();
+        let syntax_highlights = if virtualized_document
+            && let Some(cache) = &self.large_document_highlights
+            && cache.document_revision == doc_revision
+            && cache.inline_revision == inline_revision
+            && cache.theme == theme_name
+            && Arc::ptr_eq(&cache.projection, &projection)
+        {
+            cache.highlights.clone()
         } else {
-            Vec::new()
+            let highlights = if inline_spans_are_current {
+                let mut source_highlights =
+                    self.inline_syntax_highlights(render_spans, markdown_style);
+                if self.live_markdown {
+                    source_highlights.extend(
+                        self.fenced_code_highlights(text_owned.as_ref(), code_blocks.as_slice()),
+                    );
+                }
+                project_editor_highlights(projection.as_ref(), source_highlights)
+            } else {
+                Vec::new()
+            };
+            let highlights = Arc::new(sanitize_highlights(&projection.display_text, highlights));
+            if virtualized_document {
+                self.large_document_highlights = Some(LargeDocumentHighlightCache {
+                    document_revision: doc_revision,
+                    inline_revision,
+                    projection: projection.clone(),
+                    theme: theme_name,
+                    highlights: highlights.clone(),
+                });
+            }
+            highlights
         };
         let (search_highlights, search_match_count) =
             self.search_highlights(text_owned.as_ref(), doc_revision);
@@ -1379,19 +1473,24 @@ impl Render for EditorView {
         let selection_highlights =
             project_editor_highlights(projection.as_ref(), self.selection_highlights(&doc));
 
-        let syntax_and_search = if search_highlights.is_empty() {
+        let safe_highlights = if search_highlights.is_empty() && selection_highlights.is_empty() {
             syntax_highlights
         } else {
-            combine_highlights(syntax_highlights, search_highlights).collect()
+            let syntax_and_search = if search_highlights.is_empty() {
+                syntax_highlights.as_ref().clone()
+            } else {
+                combine_highlights(syntax_highlights.as_ref().clone(), search_highlights).collect()
+            };
+            let all_highlights = if selection_highlights.is_empty() {
+                syntax_and_search
+            } else {
+                combine_highlights(syntax_and_search, selection_highlights).collect()
+            };
+            Arc::new(sanitize_highlights(
+                &projection.display_text,
+                all_highlights,
+            ))
         };
-
-        let all_highlights = if selection_highlights.is_empty() {
-            syntax_and_search
-        } else {
-            combine_highlights(syntax_and_search, selection_highlights).collect()
-        };
-
-        let safe_highlights = sanitize_highlights(&projection.display_text, all_highlights);
         let document_directory = doc
             .path
             .as_ref()
@@ -1399,55 +1498,146 @@ impl Render for EditorView {
             .map(|path| path.as_std_path().to_path_buf());
         let component_editor = cx.entity();
         let component_focus_handle = focus_handle.clone();
-        let on_component_click: ComplexComponentClickHandler = Arc::new(
-            move |source_range, repeat_click_edits_source, window, cx| {
+        let on_component_click: ComplexComponentClickHandler =
+            Arc::new(move |source_range, repeat_click_edits_source, window, cx| {
                 component_focus_handle.focus(window);
                 let _ = component_editor.update(cx, |editor, cx| {
-                    editor.activate_complex_component(
-                        source_range,
-                        repeat_click_edits_source,
-                        cx,
-                    );
+                    editor.activate_complex_component(source_range, repeat_click_edits_source, cx);
                 });
-            },
-        );
+            });
         let code_block_editor = cx.entity();
-        let on_code_block_hover: CodeBlockHoverHandler = Arc::new(
-            move |code_block_index, hovered, cx| {
+        let on_code_block_hover: CodeBlockHoverHandler =
+            Arc::new(move |code_block_index, hovered, cx| {
                 let _ = code_block_editor.update(cx, |editor, cx| {
                     editor.set_code_block_hovered(code_block_index, hovered, cx);
                 });
-            },
-        );
+            });
         let table_cell_editor = cx.entity();
-        let on_table_cell_click: TableCellClickHandler = Arc::new(
-            move |cell, window, cx| {
-                let _ = table_cell_editor.update(cx, |editor, cx| {
-                    editor.begin_table_cell_edit(cell, window, cx);
-                });
-            },
-        );
-        let active_table_cell = self.table_cell_edit.as_ref().map(|edit| ActiveTableCellEditor {
-            source_range: edit.source_range.clone(),
-            input: edit.input.clone(),
-            layout_text: edit.layout_text.clone(),
-            input_visible: edit.input_visible,
+        let on_table_cell_click: TableCellClickHandler = Arc::new(move |cell, window, cx| {
+            let _ = table_cell_editor.update(cx, |editor, cx| {
+                editor.begin_table_cell_edit(cell, window, cx);
+            });
         });
-        let editor_text = render_editor_text(
-            &projection.display_text,
-            text_owned.as_ref(),
-            projection.as_ref(),
-            &safe_highlights,
-            settings::get_font_size(),
-            settings::get_line_numbers_visible(),
-            document_directory.as_deref(),
-            code_blocks.as_slice(),
-            on_code_block_hover,
-            self.selected_component.as_ref(),
-            on_component_click,
-            active_table_cell.as_ref(),
-            on_table_cell_click,
-        );
+        let active_table_cell = self
+            .table_cell_edit
+            .as_ref()
+            .map(|edit| ActiveTableCellEditor {
+                source_range: edit.source_range.clone(),
+                input: edit.input.clone(),
+                layout_text: edit.layout_text.clone(),
+                input_visible: edit.input_visible,
+            });
+        let editor_font_size = settings::get_font_size();
+        let show_line_numbers = settings::get_line_numbers_visible();
+        let editor_text = if virtualized_document {
+            let large_style_changed = self.large_document_lines.as_ref().is_some_and(
+                |(_, font_size, line_numbers, _, _)| {
+                    *font_size != editor_font_size || *line_numbers != show_line_numbers
+                },
+            );
+            let large_projection_changed =
+                self.large_document_lines
+                    .as_ref()
+                    .is_some_and(|(_, _, _, display_text, _)| {
+                        !Arc::ptr_eq(display_text, &projection.display_text)
+                    });
+            let cached_lines = self.large_document_lines.as_ref().and_then(
+                |(revision, font_size, line_numbers, display_text, ranges)| {
+                    (*revision == doc_revision
+                        && *font_size == editor_font_size
+                        && *line_numbers == show_line_numbers
+                        && Arc::ptr_eq(display_text, &projection.display_text))
+                    .then(|| ranges.clone())
+                },
+            );
+            let line_ranges = cached_lines.unwrap_or_else(|| {
+                let ranges = Arc::new(virtual_editor_row_ranges(projection.display_text.as_ref()));
+                let old_count = self.large_document_list.item_count();
+                let new_count = ranges.len();
+                if old_count == 0 {
+                    self.large_document_list.reset(new_count);
+                } else if large_style_changed || large_projection_changed {
+                    self.large_document_list.reset(new_count);
+                } else if old_count == new_count {
+                    let changed_lines = self.document.read(cx).last_edit.as_ref().map(|edit| {
+                        let start = line_index_for_byte(ranges.as_slice(), edit.start_byte);
+                        let end = line_index_for_byte(ranges.as_slice(), edit.new_end_byte)
+                            .saturating_add(1)
+                            .min(new_count);
+                        start..end.max(start.saturating_add(1).min(new_count))
+                    });
+                    let changed_lines = changed_lines.unwrap_or(0..new_count.min(1));
+                    let replacement_count = changed_lines.end - changed_lines.start;
+                    self.large_document_list
+                        .splice(changed_lines, replacement_count);
+                } else {
+                    let changed_line = self
+                        .document
+                        .read(cx)
+                        .last_edit
+                        .as_ref()
+                        .map(|edit| line_index_for_byte(ranges.as_slice(), edit.start_byte))
+                        .unwrap_or(0)
+                        .min(old_count);
+                    if new_count > old_count {
+                        let added = new_count - old_count;
+                        let insertion = (changed_line + 1).min(old_count);
+                        self.large_document_list.splice(insertion..insertion, added);
+                    } else {
+                        let removed = old_count - new_count;
+                        let removal_start = (changed_line + 1).min(old_count);
+                        let removal_end = (removal_start + removed).min(old_count);
+                        self.large_document_list
+                            .splice(removal_start..removal_end, 0);
+                    }
+                    if changed_line < self.large_document_list.item_count() {
+                        self.large_document_list
+                            .splice(changed_line..changed_line + 1, 1);
+                    }
+                }
+                self.large_document_lines = Some((
+                    doc_revision,
+                    editor_font_size,
+                    show_line_numbers,
+                    projection.display_text.clone(),
+                    ranges.clone(),
+                ));
+                ranges
+            });
+            render_virtualized_editor_text(
+                projection.display_text.clone(),
+                text_owned.clone(),
+                projection.clone(),
+                line_ranges,
+                safe_highlights,
+                editor_font_size,
+                show_line_numbers,
+                document_directory.clone(),
+                large_source_snapshot.expect("large source snapshot must exist"),
+                on_code_block_hover,
+                self.selected_component.clone(),
+                on_component_click,
+                active_table_cell,
+                on_table_cell_click,
+                self.large_document_list.clone(),
+            )
+        } else {
+            render_editor_text(
+                &projection.display_text,
+                text_owned.as_ref(),
+                projection.as_ref(),
+                safe_highlights.as_slice(),
+                editor_font_size,
+                show_line_numbers,
+                document_directory.as_deref(),
+                code_blocks.as_slice(),
+                on_code_block_hover,
+                self.selected_component.as_ref(),
+                on_component_click,
+                active_table_cell.as_ref(),
+                on_table_cell_click,
+            )
+        };
         let editor_left_padding = editor_text.left_padding;
         let text_layout = editor_text.layout.clone();
         let editor_text_element = editor_text.element;
@@ -1461,6 +1651,37 @@ impl Render for EditorView {
             .take()
             .map(|byte| (byte, true))
             .or_else(|| self.pending_scroll_to_byte.take().map(|byte| (byte, false)));
+        if virtualized_document
+            && let Some((_, _, _, _, line_ranges)) = self.large_document_lines.as_ref()
+        {
+            if let Some((source_byte, _)) = pending_reveal {
+                let line_index = line_index_for_byte(line_ranges.as_slice(), source_byte);
+                self.large_document_list.scroll_to(ListOffset {
+                    item_ix: line_index,
+                    offset_in_item: px(0.),
+                });
+                self.large_document_cursor_line = Some(line_index);
+            } else {
+                let cursor_line = line_index_for_byte(line_ranges.as_slice(), cursor_display_byte);
+                if self.large_document_cursor_line != Some(cursor_line) {
+                    self.large_document_list.scroll_to_reveal_item(cursor_line);
+                    self.large_document_cursor_line = Some(cursor_line);
+                }
+            }
+
+            if let Some(callback) = self.on_outline_viewport_change.clone() {
+                let ranges = line_ranges.clone();
+                self.large_document_list
+                    .set_scroll_handler(move |event, _, cx| {
+                        let source_byte = ranges
+                            .get(event.visible_range.start)
+                            .map(|range| range.start)
+                            .unwrap_or(0);
+                        callback(source_byte, cx);
+                    });
+            }
+        }
+        let pending_reveal = (!virtualized_document).then_some(pending_reveal).flatten();
         let outline_callback = self.on_outline_viewport_change.clone();
         let outline_scroll_handle = self.scroll_handle.clone();
         let outline_projection = projection.clone();
@@ -1501,7 +1722,8 @@ impl Render for EditorView {
                             );
                         }
 
-                        if !had_pending_reveal
+                        if !virtualized_document
+                            && !had_pending_reveal
                             && let Some(callback) = outline_callback.as_ref()
                             && let Some(source_byte) = source_byte_at_viewport_activation_line(
                                 &outline_scroll_handle,
@@ -1590,24 +1812,30 @@ impl Render for EditorView {
             .flex_1()
             .min_w(px(0.))
             .min_h(px(0.))
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                if this.context_menu_position.take().is_some() {
-                    cx.notify();
-                }
-            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.context_menu_position.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .child(
                 editor_scroll_container()
                     .bg(Theme::panel())
                     .pl(px(editor_left_padding))
                     .pr(px(EDITOR_HORIZONTAL_PADDING))
-                    .py(px(24.))
-                    .text_size(px(settings::get_font_size()))
+                    .text_size(px(editor_font_size))
                     .text_color(markdown_style.foreground)
                     .font_family("Menlo")
-                    .overflow_y_scroll()
                     .overflow_x_hidden()
                     .scrollbar_width(px(EDITOR_SCROLLBAR_WIDTH))
-                    .track_scroll(&self.scroll_handle)
+                    .when(!virtualized_document, |this| {
+                        this.py(px(24.))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.scroll_handle)
+                    })
+                    .when(virtualized_document, |this| this.overflow_hidden())
                     .track_focus(&focus_handle)
                     .on_action({
                         let doc_handle = self.document.clone();
@@ -1909,6 +2137,21 @@ impl Render for EditorView {
                             }
 
                             if key == "pageup" || key == "pagedown" {
+                                if this.large_document_active {
+                                    let page =
+                                        this.large_document_list.viewport_bounds().size.height;
+                                    if page > px(0.) {
+                                        let amount = page * 0.9;
+                                        this.large_document_list.scroll_by(if key == "pagedown" {
+                                            amount
+                                        } else {
+                                            -amount
+                                        });
+                                        cx.notify();
+                                        window.refresh();
+                                    }
+                                    return;
+                                }
                                 let max = this.scroll_handle.max_offset();
                                 let offset = this.scroll_handle.offset();
                                 let bounds = this.scroll_handle.bounds();
@@ -2158,15 +2401,29 @@ impl Render for EditorView {
             )
             .child(editor_overlay)
             .children(context_menu)
-            .child(
+            .child(if virtualized_document {
+                render_interactive_list_scrollbar(
+                    editor_scrollbar_state,
+                    self.large_document_list.clone(),
+                    Theme::muted().into(),
+                )
+            } else {
                 render_interactive_scrollbar(
                     InteractiveScrollbarAxis::Vertical,
                     editor_scrollbar_state,
                     editor_scroll_handle,
                     Theme::muted().into(),
-                ),
-            )
+                )
+            })
     }
+}
+
+/// Resolves a byte offset to the virtual source row that owns it.
+fn line_index_for_byte(lines: &[Range<usize>], byte: usize) -> usize {
+    lines
+        .partition_point(|line| line.start <= byte)
+        .saturating_sub(1)
+        .min(lines.len().saturating_sub(1))
 }
 
 /// Converts source-based highlights into ranges visible in the current projection.
@@ -2353,6 +2610,20 @@ fn sanitize_highlights(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::editor_text_layout::editor_line_ranges;
+
+    #[test]
+    fn virtual_line_lookup_handles_boundaries_and_trailing_empty_lines() {
+        let lines = editor_line_ranges("a\n\nb\n");
+
+        assert_eq!(line_index_for_byte(&lines, 0), 0);
+        assert_eq!(line_index_for_byte(&lines, 2), 1);
+        assert_eq!(line_index_for_byte(&lines, 3), 2);
+        assert_eq!(line_index_for_byte(&lines, 5), 3);
+
+        let split_line = vec![0..16_384, 16_384..20_000];
+        assert_eq!(line_index_for_byte(&split_line, 16_384), 1);
+    }
 
     #[test]
     fn editor_scroll_uses_block_layout_to_avoid_intrinsic_height_overflow() {
@@ -2396,14 +2667,14 @@ mod tests {
     fn display_projection_preserves_all_markdown_source() {
         let source = "# Title\n2. **bold** [link](https://example.com)";
         let projection = DisplayProjection::from_source(source);
-        assert_eq!(projection.display_text, source);
+        assert_eq!(projection.display_text.as_ref(), source);
     }
 
     #[test]
     fn display_projection_preserves_heading_marker_and_following_space() {
         let source = "# Hi";
         let projection = DisplayProjection::from_source(source);
-        assert_eq!(projection.display_text, source);
+        assert_eq!(projection.display_text.as_ref(), source);
     }
 
     #[test]
@@ -2411,7 +2682,7 @@ mod tests {
         let source = "![cola-2.png](<assets/cola-2.png>)";
         let projection = DisplayProjection::from_source(source);
 
-        assert_eq!(projection.display_text, source);
+        assert_eq!(projection.display_text.as_ref(), source);
         assert_eq!(
             projection.display_to_source_byte(projection.display_text.len()),
             source.len()
@@ -2433,7 +2704,7 @@ mod tests {
     fn display_projection_keeps_utf8_source_intact() {
         let source = "# 中文😀";
         let projection = DisplayProjection::from_source(source);
-        assert_eq!(projection.display_text, source);
+        assert_eq!(projection.display_text.as_ref(), source);
     }
 
     #[test]
@@ -2497,12 +2768,7 @@ mod tests {
         let hovered_block = 7..42;
 
         assert_eq!(
-            projection_active_source_range(
-                cursor_line,
-                Some(hovered_block.clone()),
-                false,
-                100,
-            ),
+            projection_active_source_range(cursor_line, Some(hovered_block.clone()), false, 100,),
             hovered_block
         );
         assert_eq!(

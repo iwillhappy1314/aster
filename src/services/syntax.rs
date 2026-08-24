@@ -52,6 +52,114 @@ pub enum MarkdownLineKind {
     HorizontalRule,
 }
 
+/// Aggregates source metadata needed by the large-document editor after one line scan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkdownDocumentStructure {
+    pub heading_levels: Vec<Option<u8>>,
+    pub line_kinds: Vec<MarkdownLineKind>,
+    pub line_starts: Vec<usize>,
+    pub code_blocks: Vec<FencedCodeBlock>,
+}
+
+/// Scans headings, block presentation, line starts, and fenced blocks in one pass.
+pub fn markdown_document_structure(source: &str) -> MarkdownDocumentStructure {
+    let estimated_lines = source.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let mut heading_levels = Vec::with_capacity(estimated_lines);
+    let mut line_kinds = Vec::with_capacity(estimated_lines);
+    let mut line_starts = Vec::with_capacity(estimated_lines);
+    let mut code_blocks = Vec::new();
+    let mut active_fence: Option<(u8, usize, Option<String>, usize, usize)> = None;
+    let mut offset = 0usize;
+    line_starts.push(0);
+
+    for raw_line in source.split_inclusive('\n') {
+        let line = raw_line.trim_end_matches('\n').trim_end_matches('\r');
+        let leading = leading_whitespace_bytes(line);
+        let content = &line[leading..];
+        let fence = fence_prefix(content);
+
+        if let Some((marker, marker_len)) = fence {
+            heading_levels.push(None);
+            line_kinds.push(MarkdownLineKind::CodeFence);
+            if let Some((active_marker, active_len, language, source_start, content_start)) =
+                active_fence.take()
+            {
+                if marker == active_marker && marker_len >= active_len {
+                    code_blocks.push(FencedCodeBlock {
+                        source_range: source_start..offset + raw_line.len(),
+                        language,
+                        content_range: content_start..offset,
+                    });
+                } else {
+                    active_fence = Some((
+                        active_marker,
+                        active_len,
+                        language,
+                        source_start,
+                        content_start,
+                    ));
+                }
+            } else {
+                let language = content[marker_len..].trim();
+                active_fence = Some((
+                    marker,
+                    marker_len,
+                    (!language.is_empty()).then(|| language.to_string()),
+                    offset,
+                    offset + raw_line.len(),
+                ));
+            }
+        } else if active_fence.is_some() {
+            heading_levels.push(None);
+            line_kinds.push(MarkdownLineKind::CodeBody);
+        } else {
+            heading_levels.push(heading_prefix(content).map(|(_, hashes)| hashes as u8));
+            line_kinds.push(if horizontal_rule_len(content).is_some() {
+                MarkdownLineKind::HorizontalRule
+            } else if task_marker_len(content).is_some() {
+                MarkdownLineKind::Task { indent: leading }
+            } else if list_marker_len(content).is_some() {
+                MarkdownLineKind::List { indent: leading }
+            } else if content.starts_with('>') {
+                MarkdownLineKind::Quote
+            } else {
+                MarkdownLineKind::Paragraph
+            });
+        }
+
+        offset += raw_line.len();
+        if raw_line.ends_with('\n') {
+            line_starts.push(offset);
+        }
+    }
+
+    if source.is_empty() {
+        heading_levels.push(None);
+        line_kinds.push(MarkdownLineKind::Paragraph);
+    } else if source.ends_with('\n') {
+        heading_levels.push(None);
+        line_kinds.push(if active_fence.is_some() {
+            MarkdownLineKind::CodeBody
+        } else {
+            MarkdownLineKind::Paragraph
+        });
+    }
+    if let Some((_, _, language, source_start, content_start)) = active_fence {
+        code_blocks.push(FencedCodeBlock {
+            source_range: source_start..source.len(),
+            language,
+            content_range: content_start..source.len(),
+        });
+    }
+
+    MarkdownDocumentStructure {
+        heading_levels,
+        line_kinds,
+        line_starts,
+        code_blocks,
+    }
+}
+
 /// Scans Markdown source and returns byte-range spans for syntax highlighting.
 ///
 /// The scanner is intentionally lightweight and single-pass by line to keep
@@ -523,6 +631,38 @@ fn find_emphasis_close(bytes: &[u8], start: usize, marker: u8, marker_len: usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Returns the established line-start representation used by the editor.
+    fn expected_line_starts(source: &str) -> Vec<usize> {
+        let mut starts = vec![0];
+        starts.extend(
+            source
+                .bytes()
+                .enumerate()
+                .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+        );
+        starts
+    }
+
+    #[test]
+    fn combined_document_structure_matches_individual_scanners() {
+        let fixtures = [
+            "",
+            "plain",
+            "# heading\n> quote\n- item\n",
+            "~~~rust\n# code\n~~~\nafter",
+            "~~~rust\ncode\n\u{4e2d}",
+            "~~~rust\n~~~ not-a-close\n~~~\n",
+        ];
+
+        for source in fixtures {
+            let structure = markdown_document_structure(source);
+            assert_eq!(structure.heading_levels, markdown_heading_levels(source));
+            assert_eq!(structure.line_kinds, markdown_line_kinds(source));
+            assert_eq!(structure.line_starts, expected_line_starts(source));
+            assert_eq!(structure.code_blocks, fenced_code_blocks(source));
+        }
+    }
 
     #[test]
     fn spans_are_always_utf8_boundary_aligned() {

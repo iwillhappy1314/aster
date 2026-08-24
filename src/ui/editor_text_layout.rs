@@ -1,16 +1,18 @@
 use crate::services::complex_markdown::{ComplexMarkdownKind, MarkdownTableCell};
 use crate::services::syntax::{
-    FencedCodeBlock, MarkdownLineKind, markdown_heading_levels, markdown_line_kinds,
+    FencedCodeBlock, MarkdownLineKind, markdown_document_structure, markdown_heading_levels,
+    markdown_line_kinds,
 };
 use crate::ui::editor_projection::DisplayProjection;
 use crate::ui::theme::Theme;
 use gpui::{
-    AnyElement, App, Bounds, Entity, HighlightStyle, ImageSource, MouseButton, ObjectFit, Pixels,
-    Point, StyledText, Window, deferred, div, img, prelude::*, px,
+    AnyElement, App, Bounds, Entity, HighlightStyle, ImageSource, ListState, MouseButton,
+    ObjectFit, Pixels, Point, StyledText, Window, deferred, div, img, list, prelude::*, px,
 };
-use gpui_component::input::{Input, InputState};
 use gpui_component::Sizable as _;
+use gpui_component::input::{Input, InputState};
 use gpui_gfm::{heading_font_size, heading_font_weight};
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -29,6 +31,7 @@ const MONOSPACE_DIGIT_WIDTH_RATIO: f32 = 0.6;
 const TABLE_CELL_HORIZONTAL_PADDING: f32 = 10.0;
 const TABLE_CELL_LINE_HEIGHT_RATIO: f32 = 1.618_034;
 const TABLE_CELL_VERTICAL_PADDING: f32 = 7.0;
+const VIRTUAL_EDITOR_ROW_MAX_BYTES: usize = 16 * 1024;
 
 /// Receives source ranges when a rendered complex component is clicked.
 pub type ComplexComponentClickHandler =
@@ -59,10 +62,12 @@ struct EditorLineLayout {
 
 /// Aggregates independently-sized line layouts behind the same byte/position
 /// mapping operations the editor previously performed on one `TextLayout`.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct EditorTextLayout {
-    lines: Vec<EditorLineLayout>,
+    lines: Arc<Mutex<VecDeque<EditorLineLayout>>>,
     display_len: usize,
+    /// Full layouts keep every row; virtual layouts retain only a bounded working set.
+    max_retained_lines: usize,
 }
 
 impl EditorTextLayout {
@@ -102,18 +107,11 @@ impl EditorTextLayout {
             .unwrap_or(px(0.))
     }
 
-    fn line_for_index(&self, index: usize) -> Option<&EditorLineLayout> {
-        let index = index.min(self.display_len);
-        let line_index = self
-            .lines
-            .partition_point(|line| line.display_range.end < index);
-        self.lines.get(line_index).or_else(|| self.lines.last())
-    }
+    fn closest_line(&self, position: Point<Pixels>) -> Option<EditorLineLayout> {
+        let lines = self.lines.lock().ok()?;
+        let mut closest: Option<(EditorLineLayout, Pixels)> = None;
 
-    fn closest_line(&self, position: Point<Pixels>) -> Option<&EditorLineLayout> {
-        let mut closest: Option<(&EditorLineLayout, Pixels)> = None;
-
-        for line in &self.lines {
+        for line in lines.iter() {
             let Some(bounds) = line
                 .prepainted_bounds
                 .lock()
@@ -131,18 +129,69 @@ impl EditorTextLayout {
             };
 
             if distance == px(0.) {
-                return Some(line);
+                return Some(line.clone());
             }
 
             if closest
                 .as_ref()
                 .is_none_or(|(_, closest_distance)| distance < *closest_distance)
             {
-                closest = Some((line, distance));
+                closest = Some((line.clone(), distance));
             }
         }
 
         closest.map(|(line, _)| line)
+    }
+
+    fn line_for_index(&self, index: usize) -> Option<EditorLineLayout> {
+        let index = index.min(self.display_len);
+        let lines = self.lines.lock().ok()?;
+        lines
+            .iter()
+            .find(|line| line.display_range.start <= index && index <= line.display_range.end)
+            .cloned()
+            .or_else(|| {
+                lines
+                    .iter()
+                    .min_by_key(|line| {
+                        if index < line.display_range.start {
+                            line.display_range.start - index
+                        } else {
+                            index.saturating_sub(line.display_range.end)
+                        }
+                    })
+                    .cloned()
+            })
+    }
+
+    fn register_line(&self, line: EditorLineLayout) {
+        let Ok(mut lines) = self.lines.lock() else {
+            return;
+        };
+        lines.retain(|existing| existing.display_range != line.display_range);
+        lines.push_back(line);
+        while lines.len() > self.max_retained_lines {
+            lines.pop_front();
+        }
+    }
+
+    fn virtualized(display_len: usize) -> Self {
+        Self {
+            lines: Default::default(),
+            display_len,
+            // Several viewports of wrapped rows are enough for pointer mapping and IME bounds.
+            max_retained_lines: 1024,
+        }
+    }
+}
+
+impl Default for EditorTextLayout {
+    fn default() -> Self {
+        Self {
+            lines: Default::default(),
+            display_len: 0,
+            max_retained_lines: usize::MAX,
+        }
     }
 }
 
@@ -150,6 +199,28 @@ pub struct EditorTextRender {
     pub element: AnyElement,
     pub layout: EditorTextLayout,
     pub left_padding: f32,
+}
+
+/// Stores source-derived metadata reused by every virtualized render of one document revision.
+#[derive(Clone)]
+pub struct LargeDocumentSourceSnapshot {
+    heading_levels: Arc<Vec<Option<u8>>>,
+    line_kinds: Arc<Vec<MarkdownLineKind>>,
+    source_line_starts: Arc<Vec<usize>>,
+    pub code_blocks: Arc<Vec<FencedCodeBlock>>,
+}
+
+impl LargeDocumentSourceSnapshot {
+    /// Scans the source once and packages immutable line and fenced-code metadata.
+    pub fn new(source: &str) -> Self {
+        let structure = markdown_document_structure(source);
+        Self {
+            heading_levels: Arc::new(structure.heading_levels),
+            line_kinds: Arc::new(structure.line_kinds),
+            source_line_starts: Arc::new(structure.line_starts),
+            code_blocks: Arc::new(structure.code_blocks),
+        }
+    }
 }
 
 /// Builds one `StyledText` per source line so headings can use their canonical
@@ -169,18 +240,15 @@ pub fn render_editor_text(
     active_table_cell: Option<&ActiveTableCellEditor>,
     on_table_cell_click: TableCellClickHandler,
 ) -> EditorTextRender {
-    let display_ranges = display_line_ranges(display_text);
+    let display_ranges = editor_line_ranges(display_text);
     let heading_levels = markdown_heading_levels(source_text);
     let line_kinds = markdown_line_kinds(source_text);
     let source_line_starts = source_line_starts(source_text);
-    let (line_number_gutter_width, left_padding) = line_number_gutter_layout(
-        show_line_numbers,
-        display_ranges.len(),
-        body_font_size,
-    );
+    let (line_number_gutter_width, left_padding) =
+        line_number_gutter_layout(show_line_numbers, display_ranges.len(), body_font_size);
 
     let mut container = div().relative().w_full().min_w_0().flex().flex_col();
-    let mut layouts = Vec::with_capacity(display_ranges.len());
+    let mut layouts = VecDeque::with_capacity(display_ranges.len());
     let mut highlight_start = 0usize;
 
     debug_assert!(
@@ -218,15 +286,9 @@ pub fn render_editor_text(
 
         let layout = styled.layout().clone();
         let source_byte = projection.display_to_source_byte(display_range.start);
-        let source_line_index = source_line_index_for_byte(
-            &source_line_starts,
-            source_text.len(),
-            source_byte,
-        );
-        let heading_level = heading_levels
-            .get(source_line_index)
-            .copied()
-            .flatten();
+        let source_line_index =
+            source_line_index_for_byte(&source_line_starts, source_text.len(), source_byte);
+        let heading_level = heading_levels.get(source_line_index).copied().flatten();
         let line_kind = line_kinds
             .get(source_line_index)
             .copied()
@@ -235,28 +297,16 @@ pub fn render_editor_text(
             .get(source_line_index)
             .copied()
             .unwrap_or(source_byte);
-        let code_block_index = code_blocks
-            .iter()
-            .enumerate()
-            .find(|block| {
-                block.1.source_range.start <= source_byte
-                    && source_byte < block.1.source_range.end
-            })
-            .map(|(index, _)| index);
-        let starts_code_block = code_block_starts_on_source_line(
-            code_blocks,
-            code_block_index,
-            source_line_start,
-        );
+        let code_block_index = code_block_index_for_source_byte(code_blocks, source_byte);
+        let starts_code_block =
+            code_block_starts_on_source_line(code_blocks, code_block_index, source_line_start);
         let complex_component = projection.complex_atom_for_display_line(display_range);
-        let hides_component_label = complex_component
-            .as_ref()
-            .is_some_and(|(_, kind)| {
-                matches!(
-                    kind,
-                    ComplexMarkdownKind::Image { .. } | ComplexMarkdownKind::Table { .. }
-                )
-            });
+        let hides_component_label = complex_component.as_ref().is_some_and(|(_, kind)| {
+            matches!(
+                kind,
+                ComplexMarkdownKind::Image { .. } | ComplexMarkdownKind::Table { .. }
+            )
+        });
 
         let prepainted_bounds = Arc::new(Mutex::new(None));
         let mut line = editor_display_line(line_index, prepainted_bounds.clone());
@@ -308,10 +358,7 @@ pub fn render_editor_text(
                 line.mt(px(4.))
                     .mb(px(8.))
                     .when(uses_panel, |component| {
-                        component
-                            .p(px(10.))
-                            .rounded(px(8.))
-                            .bg(Theme::panel_alt())
+                        component.p(px(10.)).rounded(px(8.)).bg(Theme::panel_alt())
                     })
                     .when(uses_border, |component| {
                         component.border_1().border_color(if is_selected {
@@ -322,12 +369,7 @@ pub fn render_editor_text(
                     })
                     .cursor_pointer()
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                        click_handler(
-                            click_range.clone(),
-                            repeat_click_edits_source,
-                            window,
-                            cx,
-                        );
+                        click_handler(click_range.clone(), repeat_click_edits_source, window, cx);
                         cx.stop_propagation();
                     })
             };
@@ -349,12 +391,7 @@ pub fn render_editor_text(
                             .text_color(Theme::text())
                             .cursor_text()
                             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                                source_click_handler(
-                                    source_click_range.clone(),
-                                    true,
-                                    window,
-                                    cx,
-                                );
+                                source_click_handler(source_click_range.clone(), true, window, cx);
                                 cx.stop_propagation();
                             })
                             .child(
@@ -392,7 +429,7 @@ pub fn render_editor_text(
         }
 
         container = container.child(line);
-        layouts.push(EditorLineLayout {
+        layouts.push_back(EditorLineLayout {
             display_range: display_range.clone(),
             layout,
             prepainted_bounds,
@@ -402,11 +439,247 @@ pub fn render_editor_text(
     EditorTextRender {
         element: container.into_any_element(),
         layout: EditorTextLayout {
-            lines: layouts,
+            lines: Arc::new(Mutex::new(layouts)),
             display_len: display_text.len(),
+            max_retained_lines: usize::MAX,
         },
         left_padding,
     }
+}
+
+/// Builds a visible-only source editor for large documents.
+///
+/// Line ranges are cheap metadata; GPUI text layouts and row elements are created only for the
+/// current viewport and a small overdraw region maintained by `ListState`.
+pub fn render_virtualized_editor_text(
+    display_text: Arc<str>,
+    source_text: Arc<str>,
+    projection: Arc<DisplayProjection>,
+    display_ranges: Arc<Vec<Range<usize>>>,
+    highlights: Arc<Vec<(Range<usize>, HighlightStyle)>>,
+    body_font_size: f32,
+    show_line_numbers: bool,
+    document_directory: Option<PathBuf>,
+    source_snapshot: Arc<LargeDocumentSourceSnapshot>,
+    on_code_block_hover: CodeBlockHoverHandler,
+    selected_component: Option<Range<usize>>,
+    on_component_click: ComplexComponentClickHandler,
+    active_table_cell: Option<ActiveTableCellEditor>,
+    on_table_cell_click: TableCellClickHandler,
+    list_state: ListState,
+) -> EditorTextRender {
+    let (line_number_gutter_width, left_padding) =
+        line_number_gutter_layout(show_line_numbers, display_ranges.len(), body_font_size);
+    let layout = EditorTextLayout::virtualized(display_text.len());
+    let layout_for_rows = layout.clone();
+    let ranges_for_rows = display_ranges.clone();
+    let heading_levels = source_snapshot.heading_levels.clone();
+    let line_kinds = source_snapshot.line_kinds.clone();
+    let source_line_starts = source_snapshot.source_line_starts.clone();
+    let code_blocks = source_snapshot.code_blocks.clone();
+
+    let element = list(list_state, move |line_index, _window, _cx| {
+        let Some(display_range) = ranges_for_rows.get(line_index).cloned() else {
+            return div().into_any_element();
+        };
+        let line_text = &display_text[display_range.clone()];
+        let rendered_text = if line_text.is_empty() {
+            EMPTY_LINE_PLACEHOLDER.to_string()
+        } else {
+            line_text.to_string()
+        };
+        let highlight_start =
+            highlights.partition_point(|(range, _)| range.end <= display_range.start);
+        let line_highlights = if line_text.is_empty() {
+            Vec::new()
+        } else {
+            highlights_for_line(highlights.as_slice(), &display_range, highlight_start)
+        };
+        let mut styled = StyledText::new(rendered_text.clone());
+        if !line_highlights.is_empty() {
+            styled = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                StyledText::new(rendered_text.clone()).with_highlights(line_highlights)
+            }))
+            .unwrap_or_else(|_| StyledText::new(rendered_text));
+        }
+
+        let text_layout = styled.layout().clone();
+        let source_byte = projection.display_to_source_byte(display_range.start);
+        let source_line_index = source_line_index_for_byte(
+            source_line_starts.as_slice(),
+            source_text.len(),
+            source_byte,
+        );
+        let heading_level = heading_levels.get(source_line_index).copied().flatten();
+        let line_kind = line_kinds
+            .get(source_line_index)
+            .copied()
+            .unwrap_or(MarkdownLineKind::Paragraph);
+        let source_line_start = source_line_starts
+            .get(source_line_index)
+            .copied()
+            .unwrap_or(source_byte);
+        let code_block_index =
+            code_block_index_for_source_byte(code_blocks.as_slice(), source_byte);
+        let starts_code_block = code_block_starts_on_source_line(
+            code_blocks.as_slice(),
+            code_block_index,
+            source_line_start,
+        );
+        let complex_component = projection.complex_atom_for_display_line(&display_range);
+        let hides_component_label = complex_component.as_ref().is_some_and(|(_, kind)| {
+            matches!(
+                kind,
+                ComplexMarkdownKind::Image { .. } | ComplexMarkdownKind::Table { .. }
+            )
+        });
+        let prepainted_bounds = Arc::new(Mutex::new(None));
+        layout_for_rows.register_line(EditorLineLayout {
+            display_range: display_range.clone(),
+            layout: text_layout,
+            prepainted_bounds: prepainted_bounds.clone(),
+        });
+
+        let mut line = editor_display_line(line_index, prepainted_bounds).w_full();
+        if let Some(level) = heading_level {
+            line = line
+                .text_size(heading_font_size(level))
+                .font_weight(heading_font_weight(level));
+        } else {
+            line = line
+                .text_size(px(body_font_size))
+                .line_height(px(body_text_line_height(body_font_size)));
+        }
+        line = match line_kind {
+            MarkdownLineKind::Quote => line.border_l_2().border_color(Theme::muted()).pl(px(12.)),
+            MarkdownLineKind::CodeFence | MarkdownLineKind::CodeBody => {
+                style_code_block_line(line, starts_code_block)
+            }
+            MarkdownLineKind::List { indent } | MarkdownLineKind::Task { indent } => {
+                style_list_item_line(line, indent)
+            }
+            MarkdownLineKind::Paragraph | MarkdownLineKind::HorizontalRule => line,
+        };
+        if let Some(code_block_index) = code_block_index {
+            let hover_handler = on_code_block_hover.clone();
+            line = line.on_hover(move |hovered, _window, cx| {
+                hover_handler(code_block_index, *hovered, cx);
+            });
+        }
+        line = if hides_component_label {
+            line.child(hidden_projection_layout_anchor(styled))
+        } else {
+            line.child(styled)
+        };
+        if let Some((source_range, kind)) = complex_component
+            && is_block_component(&kind)
+        {
+            let is_table = matches!(kind, ComplexMarkdownKind::Table { .. });
+            let is_selected = !is_table && selected_component.as_ref() == Some(&source_range);
+            let uses_border = component_uses_border(&kind);
+            let uses_panel = component_uses_panel(&kind);
+            let repeat_click_edits_source = component_repeat_click_edits_source(&kind);
+            let click_range = source_range.clone();
+            let click_handler = on_component_click.clone();
+            let source_click_range = source_range.clone();
+            let source_click_handler = on_component_click.clone();
+            line = if is_table {
+                line.mb(px(8.))
+            } else {
+                line.mt(px(4.))
+                    .mb(px(8.))
+                    .when(uses_panel, |component| {
+                        component.p(px(10.)).rounded(px(8.)).bg(Theme::panel_alt())
+                    })
+                    .when(uses_border, |component| {
+                        component.border_1().border_color(if is_selected {
+                            Theme::accent()
+                        } else {
+                            Theme::border()
+                        })
+                    })
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                        click_handler(click_range.clone(), repeat_click_edits_source, window, cx);
+                        cx.stop_propagation();
+                    })
+            };
+            if let Some(detail) = render_complex_component_detail(
+                &kind,
+                document_directory.as_deref(),
+                active_table_cell.as_ref(),
+                &on_table_cell_click,
+                body_font_size,
+            ) {
+                line = line.child(detail);
+            }
+            if is_selected {
+                line = if component_reveals_source_when_selected(&kind) {
+                    line.child(
+                        div()
+                            .mt(px(8.))
+                            .text_size(px(body_font_size))
+                            .text_color(Theme::text())
+                            .cursor_text()
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                source_click_handler(source_click_range.clone(), true, window, cx);
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                source_text
+                                    .get(source_range.clone())
+                                    .unwrap_or_default()
+                                    .trim_end_matches(['\r', '\n'])
+                                    .to_string(),
+                            ),
+                    )
+                } else {
+                    line.child(
+                        div()
+                            .mt(px(8.))
+                            .text_xs()
+                            .text_color(Theme::accent())
+                            .child("Selected · click again to edit source"),
+                    )
+                };
+            }
+        }
+        if show_line_numbers {
+            line = line.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_full()
+                    .mr(px(LINE_NUMBER_GUTTER_GAP))
+                    .w(px(line_number_gutter_width))
+                    .text_right()
+                    .text_size(px(body_font_size))
+                    .text_color(Theme::muted())
+                    .child((line_index + 1).to_string()),
+            );
+        }
+        line.into_any_element()
+    })
+    .size_full()
+    .py(px(24.))
+    .into_any_element();
+
+    EditorTextRender {
+        element,
+        layout,
+        left_padding,
+    }
+}
+
+/// Finds the fenced code block containing a source byte using document order.
+fn code_block_index_for_source_byte(
+    code_blocks: &[FencedCodeBlock],
+    source_byte: usize,
+) -> Option<usize> {
+    let candidate = code_blocks
+        .partition_point(|block| block.source_range.start <= source_byte)
+        .checked_sub(1)?;
+    (source_byte < code_blocks[candidate].source_range.end).then_some(candidate)
 }
 
 /// Returns whether a rendered component should use the shared outline treatment.
@@ -441,12 +714,7 @@ fn editor_display_line(
 /// needs that label's `TextLayout` to map clicks on every later line, so the anchor participates
 /// in prepaint while absolute positioning prevents it from changing component height.
 fn hidden_projection_layout_anchor(styled: StyledText) -> gpui::Div {
-    div()
-        .absolute()
-        .top_0()
-        .left_0()
-        .invisible()
-        .child(styled)
+    div().absolute().top_0().left_0().invisible().child(styled)
 }
 
 /// Returns whether a rendered component should use shared panel background and padding.
@@ -684,9 +952,8 @@ fn render_complex_component_detail(
                             .is_some_and(|active| active.source_range == cell.source_range)
                         {
                             let input = active_table_cell.expect("active table cell").input.clone();
-                            let input_visible = active_table_cell
-                                .expect("active table cell")
-                                .input_visible;
+                            let input_visible =
+                                active_table_cell.expect("active table cell").input_visible;
                             cell_element = cell_element
                                 // Preserve the cell's normal wrapped-text height while the
                                 // input completes its first width-aware layout behind it.
@@ -745,13 +1012,7 @@ fn render_complex_component_detail(
                     row.border_t_1().border_color(Theme::border())
                 }));
             }
-            Some(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .child(table)
-                    .into_any_element(),
-            )
+            Some(div().w_full().min_w_0().child(table).into_any_element())
         }
         ComplexMarkdownKind::Callout { kind, body, .. } => Some(
             div()
@@ -1088,7 +1349,7 @@ fn line_number_gutter_layout(
     (gutter_width, left_padding)
 }
 
-fn display_line_ranges(text: &str) -> Vec<Range<usize>> {
+pub(crate) fn editor_line_ranges(text: &str) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     let mut start = 0usize;
 
@@ -1101,6 +1362,33 @@ fn display_line_ranges(text: &str) -> Vec<Range<usize>> {
 
     ranges.push(start..text.len());
     ranges
+}
+
+/// Returns bounded virtual rows, splitting a pathological single source line at UTF-8 boundaries.
+pub(crate) fn virtual_editor_row_ranges(text: &str) -> Vec<Range<usize>> {
+    let mut rows = Vec::new();
+    for line in editor_line_ranges(text) {
+        if line.is_empty() {
+            rows.push(line);
+            continue;
+        }
+        let mut start = line.start;
+        while start < line.end {
+            let mut end = (start + VIRTUAL_EDITOR_ROW_MAX_BYTES).min(line.end);
+            while end > start && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end == start {
+                end = text[start..line.end]
+                    .char_indices()
+                    .nth(1)
+                    .map_or(line.end, |(offset, _)| start + offset);
+            }
+            rows.push(start..end);
+            start = end;
+        }
+    }
+    rows
 }
 
 /// Returns the byte offset at which every source line begins.
@@ -1151,9 +1439,50 @@ mod tests {
 
     #[test]
     fn line_ranges_keep_empty_lines_and_trailing_line() {
+        assert_eq!(editor_line_ranges("a\n\nb\n"), vec![0..1, 2..2, 3..4, 5..5]);
+    }
+
+    #[test]
+    fn virtual_rows_bound_a_single_oversized_line() {
+        let text = "中".repeat(VIRTUAL_EDITOR_ROW_MAX_BYTES);
+        let rows = virtual_editor_row_ranges(&text);
+
+        assert!(rows.len() > 1);
+        assert!(
+            rows.iter()
+                .all(|range| range.len() <= VIRTUAL_EDITOR_ROW_MAX_BYTES)
+        );
+        assert_eq!(rows.first().unwrap().start, 0);
+        assert_eq!(rows.last().unwrap().end, text.len());
+    }
+
+    #[test]
+    fn virtual_rows_always_follow_utf8_boundaries_after_projection_changes() {
+        let source = "# 标题\n正文";
+        let projected = "标题\n正文";
+
+        for text in [source, projected] {
+            let rows = virtual_editor_row_ranges(text);
+            assert!(rows.iter().all(|range| {
+                text.is_char_boundary(range.start) && text.is_char_boundary(range.end)
+            }));
+        }
+    }
+
+    #[test]
+    fn code_block_lookup_uses_ordered_ranges_and_excludes_boundaries() {
+        let source = "before\n```rs\none\n```\nmiddle\n```js\ntwo\n```\nafter";
+        let blocks = crate::services::syntax::fenced_code_blocks(source);
+
+        assert_eq!(code_block_index_for_source_byte(&blocks, 0), None);
+        assert_eq!(code_block_index_for_source_byte(&blocks, 8), Some(0));
         assert_eq!(
-            display_line_ranges("a\n\nb\n"),
-            vec![0..1, 2..2, 3..4, 5..5]
+            code_block_index_for_source_byte(&blocks, blocks[0].source_range.end),
+            None
+        );
+        assert_eq!(
+            code_block_index_for_source_byte(&blocks, blocks[1].source_range.start),
+            Some(1)
         );
     }
 
@@ -1189,12 +1518,13 @@ mod tests {
     fn pointer_mapping_skips_lines_that_have_not_been_prepainted() {
         let layout = StyledText::new("offscreen").layout().clone();
         let editor_layout = EditorTextLayout {
-            lines: vec![EditorLineLayout {
+            lines: Arc::new(Mutex::new(VecDeque::from([EditorLineLayout {
                 display_range: 0..9,
                 layout,
                 prepainted_bounds: Arc::new(Mutex::new(None)),
-            }],
+            }]))),
             display_len: 9,
+            max_retained_lines: usize::MAX,
         };
 
         assert!(editor_layout.closest_line(Point::default()).is_none());
@@ -1205,9 +1535,10 @@ mod tests {
     #[test]
     fn collapsed_table_does_not_shift_heading_style_onto_later_code_comments() {
         use crate::services::complex_markdown::complex_markdown_components;
-        use crate::services::syntax::{markdown_spans, markdown_heading_levels};
+        use crate::services::syntax::{markdown_heading_levels, markdown_spans};
 
-        let source = "| A | B |\n| --- | --- |\n| x | y |\n# Real heading\n```python\n# comment\n```\n";
+        let source =
+            "| A | B |\n| --- | --- |\n| x | y |\n# Real heading\n```python\n# comment\n```\n";
         let spans = markdown_spans(source);
         let components = complex_markdown_components(source);
         let projection = DisplayProjection::from_markdown_with_components(
@@ -1222,17 +1553,17 @@ mod tests {
             .filter(|byte| *byte == b'\n')
             .count();
         let source_byte = projection.display_to_source_byte(comment_display_byte);
-        let source_line_index = source_line_index_for_byte(
-            &source_line_starts(source),
-            source.len(),
-            source_byte,
-        );
+        let source_line_index =
+            source_line_index_for_byte(&source_line_starts(source), source.len(), source_byte);
 
         assert_eq!(display_line_index, 3);
         assert_eq!(markdown_heading_levels(source)[display_line_index], Some(1));
         assert_eq!(source_line_index, 5);
         assert_eq!(markdown_heading_levels(source)[source_line_index], None);
-        assert_eq!(markdown_line_kinds(source)[source_line_index], MarkdownLineKind::CodeBody);
+        assert_eq!(
+            markdown_line_kinds(source)[source_line_index],
+            MarkdownLineKind::CodeBody
+        );
     }
 
     #[test]
