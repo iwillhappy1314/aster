@@ -11,8 +11,9 @@ use crate::ui::root::RootView;
 use crate::ui::theme::{Theme as AsterTheme, ThemeName};
 use camino::Utf8PathBuf;
 use gpui::{
-    App, AppContext, Application, Bounds, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, point, px, size,
+    AnyWindowHandle, App, AppContext, Application, Bounds, Entity, KeyBinding, Menu, MenuItem,
+    OsAction, SystemMenuType, TitlebarOptions, Window, WindowBounds, WindowOptions, point, px,
+    size,
 };
 use gpui_component::Root as ComponentRoot;
 use gpui_component::notification::NotificationList;
@@ -145,12 +146,14 @@ pub fn run() {
             let windows = cx.window_stack().unwrap_or_else(|| cx.windows());
 
             for window in windows.iter().copied() {
-                let Some(handle) = window.downcast::<RootView>() else {
+                let Some(root_view) = component_root_view::<RootView>(&window, cx) else {
                     continue;
                 };
 
-                let can_quit = handle
-                    .update(cx, |root, window, cx| root.confirm_before_quit(window, cx))
+                let can_quit = window
+                    .update(cx, |_, window, cx| {
+                        root_view.update(cx, |root, cx| root.confirm_before_quit(window, cx))
+                    })
                     .unwrap_or(true);
                 if !can_quit {
                     return;
@@ -172,9 +175,11 @@ pub fn run() {
 
             if let Some(window) = target_window {
                 cx.defer(move |cx| {
-                    if let Some(handle) = window.downcast::<RootView>() {
-                        let _ = handle.update(cx, |root, window, cx| {
-                            root.action_close_tab(window, cx);
+                    if let Some(root_view) = component_root_view::<RootView>(&window, cx) {
+                        let _ = window.update(cx, |_, window, cx| {
+                            root_view.update(cx, |root, cx| {
+                                root.action_close_tab(window, cx);
+                            });
                         });
                     }
                 });
@@ -357,15 +362,9 @@ fn initial_preview_visible(has_initial_path: bool, remembered_preview_visible: b
     has_initial_path && remembered_preview_visible
 }
 
-fn install_should_close_prompt(
-    window: &mut Window,
-    cx: &mut App,
-    root: gpui::Entity<RootView>,
-) {
+fn install_should_close_prompt(window: &mut Window, cx: &mut App, root: gpui::Entity<RootView>) {
     window.on_window_should_close(cx, {
-        move |window, cx| {
-            root.update(cx, |root, cx| root.confirm_before_quit(window, cx))
-        }
+        move |window, cx| root.update(cx, |root, cx| root.confirm_before_quit(window, cx))
     });
 }
 
@@ -384,9 +383,7 @@ fn parse_open_target(raw: &str) -> Option<Utf8PathBuf> {
 }
 
 /// Drains Finder/open-event URLs and converts supported file URLs into local paths.
-fn drain_pending_open_paths(
-    queue: &Arc<Mutex<VecDeque<String>>>,
-) -> VecDeque<Utf8PathBuf> {
+fn drain_pending_open_paths(queue: &Arc<Mutex<VecDeque<String>>>) -> VecDeque<Utf8PathBuf> {
     let mut queue = queue.lock().expect("open url queue lock poisoned");
     queue
         .drain(..)
@@ -408,6 +405,18 @@ fn take_initial_startup_path(paths: &mut VecDeque<Utf8PathBuf>) -> Option<Utf8Pa
     paths.pop_front()
 }
 
+/// Returns the application view wrapped by a gpui-component window root.
+fn component_root_view<T: 'static>(window: &AnyWindowHandle, cx: &App) -> Option<Entity<T>> {
+    let component_root = window.downcast::<ComponentRoot>()?;
+    component_root
+        .read(cx)
+        .ok()?
+        .view()
+        .clone()
+        .downcast::<T>()
+        .ok()
+}
+
 fn open_path_in_active_window_or_new(cx: &mut App, path: Utf8PathBuf) {
     let candidate_windows = cx
         .active_window()
@@ -415,9 +424,11 @@ fn open_path_in_active_window_or_new(cx: &mut App, path: Utf8PathBuf) {
         .chain(cx.windows())
         .collect::<Vec<_>>();
     for candidate_window in candidate_windows {
-        if let Some(handle) = candidate_window.downcast::<RootView>() {
-            let _ = handle.update(cx, |root, window, cx| {
-                root.action_open_path(path.clone(), window, cx);
+        if let Some(root_view) = component_root_view::<RootView>(&candidate_window, cx) {
+            let _ = candidate_window.update(cx, |_, window, cx| {
+                root_view.update(cx, |root, cx| {
+                    root.action_open_path(path.clone(), window, cx);
+                });
             });
             return;
         }
@@ -428,10 +439,28 @@ fn open_path_in_active_window_or_new(cx: &mut App, path: Utf8PathBuf) {
 
 #[cfg(test)]
 mod tests {
-    use super::{drain_pending_open_paths, initial_preview_visible, take_initial_startup_path};
+    use super::{
+        component_root_view, drain_pending_open_paths, initial_preview_visible,
+        take_initial_startup_path,
+    };
     use camino::Utf8PathBuf;
+    use gpui::{AnyWindowHandle, AppContext, IntoElement, Render, TestAppContext, Window, div};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
+
+    /// Minimal inner view used to exercise the real gpui-component window wrapper.
+    struct WrappedTestView;
+
+    impl Render for WrappedTestView {
+        /// Renders an empty view used to verify component-root unwrapping.
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            div()
+        }
+    }
 
     #[test]
     fn blank_document_always_starts_in_editor_mode() {
@@ -447,15 +476,30 @@ mod tests {
     #[test]
     fn finder_open_event_becomes_the_initial_window_path() {
         let path = Utf8PathBuf::from("/tmp/finder-open.md");
-        let queue = Arc::new(Mutex::new(VecDeque::from([
-            url::Url::from_file_path(path.as_std_path())
-                .unwrap()
-                .to_string(),
-        ])));
+        let queue = Arc::new(Mutex::new(VecDeque::from([url::Url::from_file_path(
+            path.as_std_path(),
+        )
+        .unwrap()
+        .to_string()])));
         let mut paths = drain_pending_open_paths(&queue);
 
         assert_eq!(take_initial_startup_path(&mut paths), Some(path));
         assert!(paths.is_empty());
         assert!(queue.lock().unwrap().is_empty());
+    }
+
+    #[gpui::test]
+    fn component_root_exposes_its_wrapped_application_view(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            let wrapped_view = cx.new(|_| WrappedTestView);
+            gpui_component::Root::new(wrapped_view, window, cx)
+        });
+        let window: AnyWindowHandle = window.into();
+
+        cx.read(|cx| {
+            assert!(window.downcast::<WrappedTestView>().is_none());
+            assert!(component_root_view::<WrappedTestView>(&window, cx).is_some());
+        });
     }
 }
