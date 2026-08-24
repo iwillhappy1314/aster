@@ -44,7 +44,7 @@ pub type CodeBlockHoverHandler = Arc<dyn Fn(usize, bool, &mut App) + Send + Sync
 
 /// Receives a table cell when inline editing should begin.
 pub type TableCellClickHandler =
-    Arc<dyn Fn(MarkdownTableCell, &mut Window, &mut App) + Send + Sync>;
+    Arc<dyn Fn(MarkdownTableCell, bool, &mut Window, &mut App) + Send + Sync>;
 
 /// Identifies the native input currently replacing one rendered table cell.
 #[derive(Clone)]
@@ -1035,8 +1035,7 @@ fn normalized_code_span_text(source: &str) -> String {
 }
 
 /// Builds styled table-cell text using the editor's shared inline-code colors.
-fn render_table_cell_text(source: &str) -> StyledText {
-    let display = table_cell_display(source);
+fn render_table_cell_display(display: TableCellDisplay) -> StyledText {
     let markdown_style = Theme::markdown_style();
     let highlights = display.inline_code_ranges.into_iter().map(|range| {
         (
@@ -1050,6 +1049,13 @@ fn render_table_cell_text(source: &str) -> StyledText {
     });
 
     StyledText::new(display.text).with_highlights(highlights)
+}
+
+/// Returns whether a text-layout hit belongs at or beyond the rendered cell content's end.
+fn table_cell_hit_uses_end_cursor(hit: Result<usize, usize>, display_len: usize) -> bool {
+    match hit {
+        Ok(index) | Err(index) => index >= display_len,
+    }
 }
 
 /// Returns the shared pixel line height used by table display and inline editing.
@@ -1225,13 +1231,25 @@ fn render_complex_component_detail(
                         } else {
                             let handler = on_table_cell_click.clone();
                             let clicked_cell = cell.clone();
+                            let display = table_cell_display(&cell.text);
+                            let display_len = display.text.len();
+                            let rendered_text = render_table_cell_display(display);
+                            let rendered_text_layout = rendered_text.layout().clone();
                             cell_element = cell_element
                                 .cursor_text()
-                                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                                    handler(clicked_cell.clone(), window, cx);
+                                .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                                    let cursor_at_end =
+                                        std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                            rendered_text_layout.index_for_position(event.position)
+                                        }))
+                                        .ok()
+                                        .is_some_and(
+                                            |hit| table_cell_hit_uses_end_cursor(hit, display_len),
+                                        );
+                                    handler(clicked_cell.clone(), cursor_at_end, window, cx);
                                     cx.stop_propagation();
                                 })
-                                .child(div().w_full().child(render_table_cell_text(&cell.text)));
+                                .child(div().w_full().child(rendered_text));
                         }
                     }
                     row_element = row_element.child(cell_element);
@@ -1949,6 +1967,16 @@ mod tests {
 
         assert_eq!(display.text, "`production_en");
         assert!(display.inline_code_ranges.is_empty());
+    }
+
+    #[test]
+    fn table_cell_hit_at_rendered_end_uses_end_cursor() {
+        assert!(table_cell_hit_uses_end_cursor(Err(7), 7));
+    }
+
+    #[test]
+    fn table_cell_hit_inside_rendered_text_keeps_existing_cursor_behavior() {
+        assert!(!table_cell_hit_uses_end_cursor(Ok(3), 7));
     }
 
     #[test]

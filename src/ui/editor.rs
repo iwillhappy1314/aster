@@ -26,7 +26,7 @@ use gpui::{
     UTF16Selection, Window, anchored, canvas, combine_highlights, deferred, div, fill, point, px,
     size,
 };
-use gpui_component::input::{InputEvent, InputState};
+use gpui_component::input::{InputEvent, InputState, RopeExt};
 use gpui_gfm::{
     CodeSyntaxTheme, InteractiveScrollbarAxis, InteractiveScrollbarState, code_syntax_highlights,
     render_interactive_list_scrollbar, render_interactive_scrollbar,
@@ -369,6 +369,7 @@ impl EditorView {
     fn begin_table_cell_edit(
         &mut self,
         cell: MarkdownTableCell,
+        cursor_at_end: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -411,7 +412,13 @@ impl EditorView {
             scroll_restore_task: None,
             _subscription: subscription,
         });
-        input.update(cx, |input, cx| input.focus(window, cx));
+        input.update(cx, |input, cx| {
+            input.focus(window, cx);
+            if cursor_at_end {
+                let end_position = input.text().offset_to_position(input.text().len());
+                input.set_cursor_position(end_position, window, cx);
+            }
+        });
         let entity = cx.entity();
         let reveal_task = cx.spawn(async move |_editor, cx| {
             cx.background_executor()
@@ -1526,11 +1533,12 @@ impl Render for EditorView {
                 });
             });
         let table_cell_editor = cx.entity();
-        let on_table_cell_click: TableCellClickHandler = Arc::new(move |cell, window, cx| {
-            let _ = table_cell_editor.update(cx, |editor, cx| {
-                editor.begin_table_cell_edit(cell, window, cx);
+        let on_table_cell_click: TableCellClickHandler =
+            Arc::new(move |cell, cursor_at_end, window, cx| {
+                let _ = table_cell_editor.update(cx, |editor, cx| {
+                    editor.begin_table_cell_edit(cell, cursor_at_end, window, cx);
+                });
             });
-        });
         let active_table_cell = self
             .table_cell_edit
             .as_ref()
