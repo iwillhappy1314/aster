@@ -2,6 +2,7 @@ pub mod assets;
 pub mod complex_markdown;
 pub mod document_persistence;
 pub mod fs;
+pub mod http_client;
 pub mod inline_markdown;
 pub mod settings;
 pub mod syntax;

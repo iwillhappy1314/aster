@@ -5,6 +5,7 @@ use crate::commands::{
     ThemeAyuMirage, ToggleLineNumbers, ToggleLiveMarkdown, ToggleOutline, TogglePreview, Undo,
 };
 use crate::services::assets::AsterAssetSource;
+use crate::services::http_client::ReqwestHttpClient;
 use crate::services::settings;
 use crate::ui::root::RootView;
 use crate::ui::theme::{Theme as AsterTheme, ThemeName};
@@ -27,7 +28,10 @@ pub fn run() {
     let pending_urls: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
     let pending_urls_for_callback = pending_urls.clone();
 
-    let app = Application::new().with_assets(AsterAssetSource::new());
+    let http_client = ReqwestHttpClient::new().expect("failed to initialize Aster HTTP client");
+    let app = Application::new()
+        .with_assets(AsterAssetSource::new())
+        .with_http_client(http_client);
     app.on_open_urls(move |urls| {
         let mut queue = pending_urls_for_callback
             .lock()

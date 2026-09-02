@@ -280,10 +280,12 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.17",
+ "tokio",
  "toml 0.9.10+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "url",
+ "zed-reqwest",
 ]
 
 [[package]]
