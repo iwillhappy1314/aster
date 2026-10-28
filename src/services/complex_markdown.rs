@@ -145,8 +145,7 @@ pub fn complex_markdown_components(source: &str) -> Vec<ComplexMarkdownComponent
             && is_table_separator(lines[line_index + 1].content)
         {
             let mut end_index = line_index + 1;
-            while end_index + 1 < lines.len()
-                && looks_like_table_row(lines[end_index + 1].content)
+            while end_index + 1 < lines.len() && looks_like_table_row(lines[end_index + 1].content)
             {
                 end_index += 1;
             }
@@ -325,10 +324,11 @@ fn parse_table_cells(line: &str, line_start: usize) -> Vec<MarkdownTableCell> {
 /// Trims cell padding while retaining a source range suitable for local replacement.
 fn table_cell(line: &str, line_start: usize, range: Range<usize>) -> MarkdownTableCell {
     let value = &line[range.clone()];
+    let source_text = value.trim();
     let leading = value.len() - value.trim_start().len();
-    let trailing_end = value.trim_end().len();
-    let source_range = (line_start + range.start + leading)..(line_start + range.start + trailing_end);
-    let source_text = &line[(range.start + leading)..(range.start + trailing_end)];
+    let content_start = range.start + leading;
+    let content_end = content_start + source_text.len();
+    let source_range = (line_start + content_start)..(line_start + content_end);
     MarkdownTableCell {
         text: display_table_cell_value(source_text),
         source_range,
@@ -505,6 +505,25 @@ mod tests {
         assert_eq!(&source[headers[1].source_range.clone()], "值");
         assert_eq!(&source[rows[0][1].source_range.clone()], "a\\|b");
         assert_eq!(rows[0][1].text, "a|b");
+    }
+
+    /// Verifies that a whitespace-only table cell remains editable without panicking.
+    #[test]
+    fn whitespace_only_table_cell_has_empty_content_and_source_range() {
+        let source = "| Name | Value |\n| --- | --- |\n| test |   |\n";
+        let components = complex_markdown_components(source);
+        let ComplexMarkdownKind::Table { rows, .. } = &components[0].kind else {
+            panic!("expected table");
+        };
+        let empty_cell = &rows[0][1];
+
+        assert_eq!(
+            (
+                empty_cell.text.as_str(),
+                &source[empty_cell.source_range.clone()]
+            ),
+            ("", "")
+        );
     }
 
     #[test]
