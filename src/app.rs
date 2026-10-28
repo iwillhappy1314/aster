@@ -45,6 +45,13 @@ pub fn run() {
 
         cx.activate(true);
 
+        cx.on_window_closed(|cx| {
+            if should_quit_after_window_close(cx.windows().len()) {
+                cx.quit();
+            }
+        })
+        .detach();
+
         cx.bind_keys([
             KeyBinding::new("cmd-n", NewFile, None),
             KeyBinding::new("cmd-o", OpenFile, None),
@@ -254,6 +261,11 @@ pub fn run() {
     });
 }
 
+/// Returns whether closing a window left the application without any open windows.
+fn should_quit_after_window_close(open_window_count: usize) -> bool {
+    open_window_count == 0
+}
+
 /// Switches the active theme, syncs the Markdown preview's light/dark mode, and
 /// repaints every open window with the new palette.
 fn apply_theme(name: ThemeName, cx: &mut App) {
@@ -438,7 +450,7 @@ fn open_path_in_active_window_or_new(cx: &mut App, path: Utf8PathBuf) {
 mod tests {
     use super::{
         component_root_view, drain_pending_open_paths, initial_preview_visible,
-        take_initial_startup_path,
+        should_quit_after_window_close, take_initial_startup_path,
     };
     use camino::Utf8PathBuf;
     use gpui::{AnyWindowHandle, AppContext, IntoElement, Render, TestAppContext, Window, div};
@@ -468,6 +480,16 @@ mod tests {
     fn existing_document_uses_remembered_preview_mode() {
         assert!(initial_preview_visible(true, true));
         assert!(!initial_preview_visible(true, false));
+    }
+
+    #[test]
+    fn closing_the_last_window_quits_the_application() {
+        assert!(should_quit_after_window_close(0));
+    }
+
+    #[test]
+    fn closing_one_of_multiple_windows_keeps_the_application_running() {
+        assert!(!should_quit_after_window_close(1));
     }
 
     #[test]
