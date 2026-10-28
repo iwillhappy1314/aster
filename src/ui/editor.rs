@@ -168,6 +168,56 @@ fn code_block_range_for_source_range(
     })
 }
 
+/// Describes the source edit needed to move the caret out of a closed code block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CodeBlockExitAction {
+    insertion_byte: usize,
+    cursor_byte: usize,
+}
+
+/// Returns an exit action for an empty code line or closing fence line in a closed code block.
+///
+/// A closing fence without a line ending gets one newline; an existing line ending is reused so
+/// pressing Enter never creates an unbounded series of code-body lines at document end.
+fn code_block_exit_action(
+    source: &str,
+    cursor_byte: usize,
+    blocks: &[FencedCodeBlock],
+) -> Option<CodeBlockExitAction> {
+    let cursor_byte = cursor_byte.min(source.len());
+    if !source.is_char_boundary(cursor_byte) {
+        return None;
+    }
+
+    let block = blocks.iter().find(|block| {
+        block.content_range.end < block.source_range.end
+            && block.source_range.start <= cursor_byte
+            && cursor_byte < block.source_range.end
+    })?;
+    let line_start = source[..cursor_byte]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let line_end = source[cursor_byte..]
+        .find('\n')
+        .map_or(source.len(), |newline| cursor_byte + newline);
+    let line = &source[line_start..line_end];
+    let is_empty_body_line = line_start >= block.content_range.start
+        && line_start < block.content_range.end
+        && line.trim().is_empty();
+    let is_closing_fence_line = line_start == block.content_range.end;
+    if !is_empty_body_line && !is_closing_fence_line {
+        return None;
+    }
+
+    let insertion_byte = block.source_range.end;
+    let needs_separator = source.as_bytes().get(insertion_byte.saturating_sub(1)) != Some(&b'\n');
+
+    Some(CodeBlockExitAction {
+        insertion_byte,
+        cursor_byte: insertion_byte + usize::from(needs_separator),
+    })
+}
+
 pub struct EditorView {
     document: Entity<DocumentState>,
     inline_markdown: Entity<InlineMarkdownState>,
@@ -181,6 +231,8 @@ pub struct EditorView {
     cached_text: Option<(u64, Arc<str>)>,
     /// Cached source/display projection for the current document + inline parse revisions.
     cached_projection: Option<(u64, u64, Range<usize>, bool, Arc<DisplayProjection>)>,
+    /// Cached fenced-code ranges reused by the keyboard handler for the current revision.
+    cached_code_blocks: Option<(u64, Arc<Vec<FencedCodeBlock>>)>,
     /// Whether Markdown syntax is rendered as an editable live presentation.
     live_markdown: bool,
     /// Character range currently owned by the platform IME composition.
@@ -245,6 +297,7 @@ impl EditorView {
             scrollbar_state: InteractiveScrollbarState::default(),
             cached_text: None,
             cached_projection: None,
+            cached_code_blocks: None,
             live_markdown: settings::get_live_markdown_enabled(),
             marked_range: None,
             ime_edit_active: false,
@@ -289,6 +342,7 @@ impl EditorView {
         self.input_projection = None;
         self.cached_projection = None;
         self.cached_text = None;
+        self.cached_code_blocks = None;
     }
 
     /// Updates the exact width available to the editor without scheduling an extra render.
@@ -1378,6 +1432,13 @@ impl Render for EditorView {
             .as_ref()
             .map(|snapshot| snapshot.code_blocks.clone())
             .unwrap_or_else(|| Arc::new(fenced_code_blocks(text_owned.as_ref())));
+        if self
+            .cached_code_blocks
+            .as_ref()
+            .is_none_or(|(revision, _)| *revision != doc_revision)
+        {
+            self.cached_code_blocks = Some((doc_revision, code_blocks.clone()));
+        }
         let editing_code_block =
             code_block_range_for_source_range(&code_blocks, &cursor_or_selection_range);
         let hovered_code_block = self.hovered_code_block_index.and_then(|index| {
@@ -2242,6 +2303,35 @@ impl Render for EditorView {
                                 return;
                             }
 
+                            let code_block_exit = if matches!(key.as_str(), "enter" | "return") {
+                                let doc = this.document.read(cx);
+                                if doc.selection_range().is_some() {
+                                    None
+                                } else {
+                                    let source = this
+                                        .cached_text
+                                        .as_ref()
+                                        .filter(|(revision, _)| *revision == doc.revision)
+                                        .map(|(_, text)| text.clone())
+                                        .unwrap_or_else(|| Arc::from(doc.text()));
+                                    let blocks = this
+                                        .cached_code_blocks
+                                        .as_ref()
+                                        .filter(|(revision, _)| *revision == doc.revision)
+                                        .map(|(_, blocks)| blocks.clone())
+                                        .unwrap_or_else(|| {
+                                            Arc::new(fenced_code_blocks(source.as_ref()))
+                                        });
+                                    code_block_exit_action(
+                                        source.as_ref(),
+                                        doc.char_to_byte(doc.cursor),
+                                        blocks.as_ref(),
+                                    )
+                                }
+                            } else {
+                                None
+                            };
+
                             let _ = this.document.update(cx, |doc, cx_doc| {
                                 let len = doc.rope.len_chars();
                                 match key.as_str() {
@@ -2290,6 +2380,18 @@ impl Render for EditorView {
                                     "enter" | "return" => {
                                         doc.begin_edit();
                                         if doc.delete_selection().is_none() {
+                                            if let Some(action) = code_block_exit {
+                                                let insertion_char =
+                                                    doc.byte_to_char(action.insertion_byte);
+                                                if action.cursor_byte > action.insertion_byte {
+                                                    doc.insert(insertion_char, "\n");
+                                                }
+                                                doc.cursor = doc.byte_to_char(action.cursor_byte);
+                                                doc.commit_edit();
+                                                cx_doc.notify();
+                                                return;
+                                            }
+
                                             let cursor = doc.cursor.min(len);
                                             let line_index = doc.rope.char_to_line(cursor);
                                             let line_start = doc.rope.line_to_char(line_index);
@@ -2859,5 +2961,62 @@ mod tests {
             code_block_range_for_source_range(&blocks, &(cursor_byte..cursor_byte)),
             Some(blocks[0].source_range.clone())
         );
+    }
+
+    #[test]
+    fn empty_code_line_at_document_end_exits_after_the_closing_fence() {
+        let source = "```php\necho 'code';\n\n```";
+        let blocks = fenced_code_blocks(source);
+        let empty_line = source.find("\n\n```").unwrap() + 1;
+
+        let action = code_block_exit_action(source, empty_line, &blocks).unwrap();
+
+        assert_eq!(action.insertion_byte, source.len());
+        assert_eq!(action.cursor_byte, source.len() + 1);
+    }
+
+    #[test]
+    fn empty_code_line_reuses_the_existing_line_before_following_markdown() {
+        let source = "```php\necho 'code';\n\n```\nafter";
+        let blocks = fenced_code_blocks(source);
+        let empty_line = source.find("\n\n```").unwrap() + 1;
+        let block_end = blocks[0].source_range.end;
+
+        let action = code_block_exit_action(source, empty_line, &blocks).unwrap();
+
+        assert_eq!(action.insertion_byte, block_end);
+        assert_eq!(action.cursor_byte, block_end);
+    }
+
+    #[test]
+    fn trailing_newline_after_code_block_is_reused_as_the_exit_line() {
+        let source = "```php\necho 'code';\n\n```\n";
+        let blocks = fenced_code_blocks(source);
+        let empty_line = source.find("\n\n```").unwrap() + 1;
+
+        let action = code_block_exit_action(source, empty_line, &blocks).unwrap();
+
+        assert_eq!(action.insertion_byte, source.len());
+        assert_eq!(action.cursor_byte, source.len());
+    }
+
+    #[test]
+    fn closing_fence_line_also_moves_the_caret_to_the_following_line() {
+        let source = "```php\necho 'code';\n```\n";
+        let blocks = fenced_code_blocks(source);
+        let closing_fence_end = source.rfind("```").unwrap() + 3;
+
+        let action = code_block_exit_action(source, closing_fence_end, &blocks).unwrap();
+
+        assert_eq!(action.cursor_byte, source.len());
+    }
+
+    #[test]
+    fn unclosed_code_block_does_not_claim_an_exit_action() {
+        let source = "```php\necho 'code';\n\n";
+        let blocks = fenced_code_blocks(source);
+        let empty_line = source.len() - 1;
+
+        assert!(code_block_exit_action(source, empty_line, &blocks).is_none());
     }
 }
